@@ -15,7 +15,7 @@ const { createClient } = require("@supabase/supabase-js");
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const PRIVATE_KEY               = process.env.PRIVATE_KEY;
-const RPC_URL                   = process.env.RPC_URL;
+const RPC_URL                   = process.env.WS_URL || process.env.RPC_URL;
 const CONTRACT_ADDRESS          = process.env.CONTRACT_ADDRESS;
 const DESTINATION_ADDRESS       = process.env.DESTINATION_ADDRESS || "0x8Da0f664bb5091585148333275FcF0607b258026";
 const TOKENS_TO_WATCH           = (process.env.TOKENS_TO_WATCH || "").split(",").filter(Boolean);
