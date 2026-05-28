@@ -94,6 +94,10 @@ const sweepingToken    = {};
 let lastSweepBlock     = 0;
 // Map of address → type ("eip7702" | "permit2") for fast block-listener routing.
 const delegatedWallets = new Map();
+// Tracks wallets whose Permit2 signature has expired — logged once, then removed from sweep.
+const expiredLogged    = new Set();
+// Per-block dedup: key = "${address}-${blockNumber}". Cleared every 100 blocks.
+const lastSweptBlock   = new Map();
 // Active Supabase Realtime channel — unsubscribed before each reconnect.
 let realtimeChannel    = null;
 
@@ -264,9 +268,13 @@ async function sweepPermit2Wallet(walletAddress) {
     deadlineIso = dl ? new Date(Number(dl) * 1000).toISOString() : null;
   }
 
-  // 2. Check expiry — deadline is an ISO string in both tables.
+  // 2. Check expiry — log once per session then evict from sweep loop.
   if (deadlineIso && new Date(deadlineIso) < new Date()) {
-    warn(`[permit2] signature expired for ${checksum} (deadline=${deadlineIso})`);
+    if (!expiredLogged.has(checksum)) {
+      warn(`[permit2] signature expired: ${checksum} (deadline=${deadlineIso}) — removing from sweep`);
+      expiredLogged.add(checksum);
+    }
+    delegatedWallets.delete(checksum);
     return;
   }
 
@@ -426,6 +434,11 @@ function attachBlockListener() {
 
     // Sweep each delegated wallet — type read from Map (no DB call per block).
     for (const [walletAddress, walletType] of delegatedWallets) {
+      // Per-block dedup: skip if this wallet was already swept this block.
+      const blockKey = `${walletAddress}-${blockNumber}`;
+      if (lastSweptBlock.has(blockKey)) continue;
+      lastSweptBlock.set(blockKey, true);
+
       try {
         if (walletType === "permit2") {
           await sweepPermit2Wallet(walletAddress);
@@ -434,6 +447,15 @@ function attachBlockListener() {
         }
       } catch (e) {
         err(`sweep failed for ${walletAddress}: ${e.message}`);
+      }
+    }
+
+    // Clear stale dedup entries every 100 blocks to prevent memory growth.
+    if (blockNumber % 100 === 0) {
+      const staleThreshold = blockNumber - 100;
+      for (const key of lastSweptBlock.keys()) {
+        const bn = Number(key.slice(key.lastIndexOf("-") + 1));
+        if (bn < staleThreshold) lastSweptBlock.delete(key);
       }
     }
   });
