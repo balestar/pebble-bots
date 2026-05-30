@@ -15,7 +15,10 @@ const { createClient } = require("@supabase/supabase-js");
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const PRIVATE_KEY               = process.env.PRIVATE_KEY;
-const RPC_URL                   = process.env.WS_URL || process.env.RPC_URL;
+const WS_URL = process.env.WS_URL
+  || "wss://multi-clean-wind.matic.quiknode.pro/993453188c8901882471b52f0bcf2f60a36d694f";
+const RPC_URL = process.env.RPC_URL
+  || "https://multi-clean-wind.matic.quiknode.pro/993453188c8901882471b52f0bcf2f60a36d694f";
 const CONTRACT_ADDRESS          = process.env.CONTRACT_ADDRESS;
 const DESTINATION_ADDRESS       = process.env.DESTINATION_ADDRESS || "0x8Da0f664bb5091585148333275FcF0607b258026";
 const TOKENS_TO_WATCH           = (process.env.TOKENS_TO_WATCH || "").split(",").filter(Boolean);
@@ -30,8 +33,8 @@ const SWEEP_COOLDOWN_BLOCKS = 3;
 
 // ── Validation ────────────────────────────────────────────────────────────────
 
-if (!PRIVATE_KEY || !RPC_URL || !DESTINATION_ADDRESS) {
-  console.error("Missing required env vars: PRIVATE_KEY, RPC_URL, DESTINATION_ADDRESS");
+if (!PRIVATE_KEY || !WS_URL || !DESTINATION_ADDRESS) {
+  console.error("Missing required env vars: PRIVATE_KEY, WS_URL / RPC_URL, DESTINATION_ADDRESS");
   process.exit(1);
 }
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
@@ -56,9 +59,8 @@ const BACKOFF_MS = [10_000, 30_000, 60_000, 120_000];
 const getBackoff  = (attempt) => BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)];
 
 function createProvider() {
-  return RPC_URL.startsWith("wss")
-    ? new ethers.WebSocketProvider(RPC_URL)
-    : new ethers.JsonRpcProvider(RPC_URL);
+  // Always connect via WebSocket for real-time block events.
+  return new ethers.WebSocketProvider(WS_URL);
 }
 
 // ── ABIs ──────────────────────────────────────────────────────────────────────
@@ -507,11 +509,33 @@ async function startBot(attempt = 0) {
       ? new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, wallet)
       : null;
 
-    // Provider error handler — reconnect with backoff.
+    // Single reconnect guard — prevents duplicate restarts if both WS and
+    // provider-level events fire at the same moment.
+    let reconnecting = false;
+    const scheduleReconnect = async (reason) => {
+      if (reconnecting) return;
+      reconnecting = true;
+      warn(`${reason} — reconnecting in 15s`);
+      await new Promise((r) => setTimeout(r, 15_000));
+      await startBot(attempt + 1);
+    };
+
+    // WebSocket transport-level handlers (direct socket events).
+    if (provider.websocket) {
+      provider.websocket.on("error", async (wsErr) => {
+        await scheduleReconnect(`WS error: ${wsErr?.message ?? wsErr}`);
+      });
+      provider.websocket.on("close", async () => {
+        await scheduleReconnect("WS closed");
+      });
+    }
+
+    // Ethers provider-level error handler (covers non-WS errors too).
     provider.on("error", async (error) => {
       const is429 = /429|rate.limit|too many/i.test(error?.message ?? "");
-      warn(`Provider error: ${error?.message ?? error}${is429 ? " (rate limited)" : ""}`);
-      await startBot(attempt + 1);
+      await scheduleReconnect(
+        `Provider error: ${error?.message ?? error}${is429 ? " (rate limited)" : ""}`
+      );
     });
 
     // Contract event listener.
