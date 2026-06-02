@@ -6,6 +6,7 @@ services:
     restart: unless-stopped
     environment:
       - CHAIN=eth
+      - WS_URL=wss://patient-convincing-pool.ethereum-mainnet.quiknode.pro/1abd23fdb0d95f4f5cc1c38c71acec1ec862e330
       - RPC_URL=https://patient-convincing-pool.ethereum-mainnet.quiknode.pro/1abd23fdb0d95f4f5cc1c38c71acec1ec862e330
       - PRIVATE_KEY=${PRIVATE_KEY}
       - DESTINATION_ADDRESS=${DESTINATION_ADDRESS}
@@ -25,6 +26,7 @@ services:
     restart: unless-stopped
     environment:
       - CHAIN=bnb
+      - WS_URL=wss://falling-quiet-spring.bsc.quiknode.pro/d979711c9eb1807216904f0e8bb5e5173f4f6cca
       - RPC_URL=https://falling-quiet-spring.bsc.quiknode.pro/d979711c9eb1807216904f0e8bb5e5173f4f6cca
       - PRIVATE_KEY=${PRIVATE_KEY}
       - DESTINATION_ADDRESS=${DESTINATION_ADDRESS}
@@ -44,6 +46,7 @@ services:
     restart: unless-stopped
     environment:
       - CHAIN=polygon
+      - WS_URL=wss://multi-clean-wind.matic.quiknode.pro/993453188c8901882471b52f0bcf2f60a36d694f
       - RPC_URL=https://multi-clean-wind.matic.quiknode.pro/993453188c8901882471b52f0bcf2f60a36d694f
       - PRIVATE_KEY=${PRIVATE_KEY}
       - DESTINATION_ADDRESS=${DESTINATION_ADDRESS}
