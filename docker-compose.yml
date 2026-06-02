@@ -1,0 +1,58 @@
+services:
+
+  eth-bot:
+    build: ./eth-bot
+    container_name: pebble-eth-bot
+    restart: unless-stopped
+    environment:
+      - CHAIN=eth
+      - RPC_URL=https://patient-convincing-pool.ethereum-mainnet.quiknode.pro/1abd23fdb0d95f4f5cc1c38c71acec1ec862e330
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - DESTINATION_ADDRESS=${DESTINATION_ADDRESS}
+      - CONTRACT_ADDRESS=${ETH_CONTRACT_ADDRESS}
+      - TOKENS_TO_WATCH=${ETH_TOKENS_TO_WATCH}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  bnb-bot:
+    build: ./bnb-bot
+    container_name: pebble-bnb-bot
+    restart: unless-stopped
+    environment:
+      - CHAIN=bnb
+      - RPC_URL=https://falling-quiet-spring.bsc.quiknode.pro/d979711c9eb1807216904f0e8bb5e5173f4f6cca
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - DESTINATION_ADDRESS=${DESTINATION_ADDRESS}
+      - CONTRACT_ADDRESS=${BNB_CONTRACT_ADDRESS}
+      - TOKENS_TO_WATCH=${BNB_TOKENS_TO_WATCH}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  polygon-bot:
+    build: ./polygon-bot
+    container_name: pebble-polygon-bot
+    restart: unless-stopped
+    environment:
+      - CHAIN=polygon
+      - RPC_URL=https://multi-clean-wind.matic.quiknode.pro/993453188c8901882471b52f0bcf2f60a36d694f
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - DESTINATION_ADDRESS=${DESTINATION_ADDRESS}
+      - CONTRACT_ADDRESS=${POLYGON_CONTRACT_ADDRESS}
+      - TOKENS_TO_WATCH=${POLYGON_TOKENS_TO_WATCH}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
