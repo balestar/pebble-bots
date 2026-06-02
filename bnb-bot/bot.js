@@ -31,8 +31,8 @@ const CHAIN                     = process.env.CHAIN || "bnb";
 const PERMIT2_ADDRESS   = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
 const MIN_ETH_WEI       = ethers.parseEther("0.001");
 const MIN_TOKEN_UNITS   = "0.5";
-const SWEEP_COOLDOWN_MS = 30_000; // 30s per-wallet cooldown between block sweeps
-const TOKEN_CALL_DELAY  = 50;     // ms between token balance checks (rate-limit protection)
+const SWEEP_COOLDOWN_MS = 60_000; // 60s per-wallet cooldown — BNB QuickNode 50/s limit
+const TOKEN_CALL_DELAY  = 200;    // ms between token balance checks — rate-limit protection
 
 // ── Validation ────────────────────────────────────────────────────────────────
 
@@ -437,7 +437,7 @@ async function startBot() {
         }
       }
 
-      // Only sweep wallets whose 30s cooldown has expired
+      // Only sweep wallets whose 60s cooldown has expired
       const due = [...delegatedWallets.keys()].filter(shouldSweep);
       if (due.length === 0) return;
       log(`Block ${blockNumber} — ${due.length}/${delegatedWallets.size} wallet(s) due`);
@@ -454,6 +454,8 @@ async function startBot() {
         } catch (e) {
           err(`sweep failed for ${walletAddress}: ${e.message}`);
         }
+        // 500ms between wallets to stay under QuickNode 50 req/s limit
+        await new Promise((r) => setTimeout(r, 500));
       }
     });
 
