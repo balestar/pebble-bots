@@ -11,6 +11,7 @@
 require("dotenv").config();
 const { ethers } = require("ethers");
 const { createClient } = require("@supabase/supabase-js");
+const ws = require("ws");
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -43,7 +44,7 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 
 // Supabase client is stateless — created once.
 const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
-  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } })
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false }, realtime: { transport: ws } })
   : null;
 
 // Provider / wallet / contracts — created once at startup (HTTP polling).
