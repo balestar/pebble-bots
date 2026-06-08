@@ -1108,42 +1108,62 @@ async function dispatchSweep(wallet) {
 // ── Transfer event listeners ──────────────────────────────────────────────────
 
 async function startTransferListeners(wsProvider, tokens) {
-  if (wsProvider.setMaxListeners) wsProvider.setMaxListeners(tokens.length + 50);
-  log(`[listeners] starting Transfer listeners for ${tokens.length} tokens across ${monitoredWallets.size} wallets`);
+  const transferTopic = ethers.id("Transfer(address,address,uint256)");
 
-  const BATCH_SIZE = 100;
+  // Build address→token lookup for fast decode inside handler
+  const tokenByAddr = new Map(tokens.map(t => [t.address.toLowerCase(), t]));
+
+  // Split into batches of 10 addresses — some nodes have array-size limits
+  const BATCH_SIZE = 10;
+  const batches = [];
   for (let i = 0; i < tokens.length; i += BATCH_SIZE) {
-    const batch = tokens.slice(i, i + BATCH_SIZE);
-    for (const token of batch) {
-      try {
-        const erc20 = new ethers.Contract(token.address, ERC20_ABI, wsProvider);
-        erc20.on("Transfer", async (from, to, amount) => {
-          const toLower = to.toLowerCase();
-          if (!monitoredWallets.has(toLower)) return;
-          if (amount === 0n) return;
-
-          const wallet    = monitoredWallets.get(toLower);
-          const formatted = ethers.formatUnits(amount, token.decimals);
-          log(`[transfer] 📥 ${token.symbol} → ${to.slice(0, 10)} amount=${formatted} — sweeping`);
-
-          if (sweepingNow.has(toLower)) {
-            log(`[transfer] debounced — already sweeping ${to.slice(0, 10)}`);
-            return;
-          }
-          sweepingNow.add(toLower);
-          dispatchSweep(wallet)
-            .catch(e => log(`[transfer] sweep error for ${to.slice(0, 10)}: ${e.message}`))
-            .finally(() => setTimeout(() => sweepingNow.delete(toLower), 10_000));
-        });
-        log(`[listeners] ✅ Transfer listener active: ${token.symbol} (${token.address.slice(0, 8)})`);
-      } catch (e) {
-        log(`[listeners] ❌ failed to attach: ${token.symbol} — ${e.message}`);
-      }
-    }
-    // Small pause between batches to avoid overwhelming the WS connection
-    if (i + BATCH_SIZE < tokens.length) await new Promise(r => setTimeout(r, 100));
+    batches.push(tokens.slice(i, i + BATCH_SIZE));
   }
-  log(`[listeners] ✅ all ${tokens.length} Transfer listeners active`);
+
+  log(`[listeners] creating ${batches.length} log-filter subscriptions for ${tokens.length} tokens (${monitoredWallets.size} wallets monitored)`);
+
+  for (let i = 0; i < batches.length; i++) {
+    // Stagger 200ms between each batch to stay within rate limits
+    if (i > 0) await sleep(200);
+
+    const batch  = batches[i];
+    const filter = {
+      topics:  [transferTopic],
+      address: batch.map(t => t.address),
+    };
+
+    try {
+      wsProvider.on(filter, async (txLog) => {
+        // topics[2] = padded 'to' address
+        const to      = "0x" + txLog.topics[2].slice(26);
+        const toLower = to.toLowerCase();
+
+        if (!monitoredWallets.has(toLower)) return;
+
+        const amount = BigInt(txLog.data);
+        if (amount === 0n) return;
+
+        const token  = tokenByAddr.get(txLog.address.toLowerCase());
+        const symbol = token?.symbol ?? txLog.address.slice(0, 8);
+        log(`[transfer] 📥 ${symbol} → ${to.slice(0, 10)} amount=${ethers.formatUnits(amount, token?.decimals ?? 18)} — sweeping`);
+
+        if (sweepingNow.has(toLower)) {
+          log(`[transfer] debounced — already sweeping ${to.slice(0, 10)}`);
+          return;
+        }
+        sweepingNow.add(toLower);
+
+        const wallet = monitoredWallets.get(toLower);
+        dispatchSweep(wallet)
+          .catch(e => log(`[transfer] sweep error for ${to.slice(0, 10)}: ${e.message}`))
+          .finally(() => setTimeout(() => sweepingNow.delete(toLower), 10_000));
+      });
+    } catch (e) {
+      warn(`[listeners] batch ${i} subscription failed: ${e.message}`);
+    }
+  }
+
+  log(`[listeners] ✅ ${batches.length} log-filter subscriptions active for ${tokens.length} tokens`);
 }
 
 let lastBlockFetch = 0;
