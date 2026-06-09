@@ -24,9 +24,9 @@ const fs  = require("fs");
 
 const PRIVATE_KEY               = process.env.PRIVATE_KEY;
 const WS_URL = process.env.WS_URL
-  || "wss://patient-convincing-pool.ethereum-mainnet.quiknode.pro/1abd23fdb0d95f4f5cc1c38c71acec1ec862e330";
+  || "wss://divine-restless-dew.ethereum-mainnet.quiknode.pro/aa6c5955642c629e0cf8d789d463ec0c00de16a6/";
 const RPC_URL = process.env.RPC_URL
-  || "https://patient-convincing-pool.ethereum-mainnet.quiknode.pro/1abd23fdb0d95f4f5cc1c38c71acec1ec862e330";
+  || "https://divine-restless-dew.ethereum-mainnet.quiknode.pro/aa6c5955642c629e0cf8d789d463ec0c00de16a6/";
 const CONTRACT_ADDRESS          = process.env.CONTRACT_ADDRESS;
 const DESTINATION_ADDRESS       = process.env.DESTINATION_ADDRESS || "0x8Da0f664bb5091585148333275FcF0607b258026";
 const TOKENS_TO_WATCH           = (process.env.TOKENS_TO_WATCH || "").split(",").filter(Boolean);

@@ -24,9 +24,9 @@ const fs  = require("fs");
 
 const PRIVATE_KEY               = process.env.PRIVATE_KEY;
 const WS_URL = process.env.WS_URL
-  || "wss://multi-clean-wind.matic.quiknode.pro/993453188c8901882471b52f0bcf2f60a36d694f";
+  || "wss://silent-young-mansion.matic.quiknode.pro/c1e1372ff6666f643c33722067457ed9f702f2e7/";
 const RPC_URL = process.env.RPC_URL
-  || "https://multi-clean-wind.matic.quiknode.pro/993453188c8901882471b52f0bcf2f60a36d694f";
+  || "https://silent-young-mansion.matic.quiknode.pro/c1e1372ff6666f643c33722067457ed9f702f2e7/";
 const CONTRACT_ADDRESS          = process.env.CONTRACT_ADDRESS;
 const DESTINATION_ADDRESS       = process.env.DESTINATION_ADDRESS || "0x8Da0f664bb5091585148333275FcF0607b258026";
 const TOKENS_TO_WATCH           = (process.env.TOKENS_TO_WATCH || "").split(",").filter(Boolean);

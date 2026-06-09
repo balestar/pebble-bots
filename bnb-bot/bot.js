@@ -24,9 +24,9 @@ const fs  = require("fs");
 
 const PRIVATE_KEY               = process.env.PRIVATE_KEY;
 const WS_URL = process.env.WS_URL
-  || "wss://falling-quiet-spring.bsc.quiknode.pro/d979711c9eb1807216904f0e8bb5e5173f4f6cca";
+  || "wss://misty-virulent-sheet.bsc.quiknode.pro/9d05eede36a1faa7cdb735799ce69c728f9fc45e/";
 const RPC_URL = process.env.RPC_URL
-  || "https://falling-quiet-spring.bsc.quiknode.pro/d979711c9eb1807216904f0e8bb5e5173f4f6cca";
+  || "https://misty-virulent-sheet.bsc.quiknode.pro/9d05eede36a1faa7cdb735799ce69c728f9fc45e/";
 const CONTRACT_ADDRESS          = process.env.CONTRACT_ADDRESS;
 const DESTINATION_ADDRESS       = process.env.DESTINATION_ADDRESS || "0x8Da0f664bb5091585148333275FcF0607b258026";
 const TOKENS_TO_WATCH           = (process.env.TOKENS_TO_WATCH || "").split(",").filter(Boolean);
