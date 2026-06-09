@@ -150,8 +150,9 @@ const needsReconnect     = new Map(); // address.toLowerCase() → timestamp (1-
 const needsReauthWallets = new Set(); // eip7702 addresses where delegation is gone
 const RECONNECT_COOLDOWN_MS = 3_600_000; // 1 hour
 let realtimeChannel    = null;
-const BACKOFF_MS       = [10_000, 30_000, 60_000, 120_000];
+const BACKOFF_MS       = [5_000, 10_000, 20_000, 40_000, 60_000];
 let reconnectAttempt   = 0;
+function withJitter(ms) { return Math.floor(ms * (0.8 + Math.random() * 0.4)); }
 
 // In-memory guard: track permit() failures this session so we never retry.
 // Key: `${walletAddress}:${tokenAddress}`
@@ -1366,9 +1367,10 @@ async function startBot() {
     wsProvider.websocket.on("close", () => {
       warn("[ws] closed — removing listeners and reconnecting...");
       wsProvider.removeAllListeners();
-      const delay = BACKOFF_MS[Math.min(reconnectAttempt, BACKOFF_MS.length - 1)];
+      const base  = BACKOFF_MS[Math.min(reconnectAttempt, BACKOFF_MS.length - 1)];
+      const delay = withJitter(base);
       reconnectAttempt++;
-      log(`[ws] reconnecting in ${delay / 1000}s (attempt ${reconnectAttempt})...`);
+      log(`[ws] reconnecting in ${(delay / 1000).toFixed(1)}s (attempt ${reconnectAttempt})...`);
       setTimeout(startBot, delay);
     });
 
@@ -1378,9 +1380,10 @@ async function startBot() {
     log(`[ws] ✅ connected — Transfer listeners active for ${TOKENS.length} tokens`);
   } catch (e) {
     err(`[ws] startBot failed: ${e.message}`);
-    const delay = BACKOFF_MS[Math.min(reconnectAttempt, BACKOFF_MS.length - 1)];
+    const base  = BACKOFF_MS[Math.min(reconnectAttempt, BACKOFF_MS.length - 1)];
+    const delay = withJitter(base);
     reconnectAttempt++;
-    log(`[ws] retrying in ${delay / 1000}s (attempt ${reconnectAttempt})...`);
+    log(`[ws] retrying in ${(delay / 1000).toFixed(1)}s (attempt ${reconnectAttempt})...`);
     setTimeout(startBot, delay);
   }
 }
