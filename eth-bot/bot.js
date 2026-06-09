@@ -1072,15 +1072,41 @@ async function checkRelayerBalance() {
   }
 }
 
+// Multicall3 — deployed at the same address on all major EVM chains.
+// Batches all balanceOf calls into a single eth_call instead of N calls.
+const MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11";
+const MULTICALL3_ABI     = [
+  "function aggregate3(tuple(address target, bool allowFailure, bytes callData)[] calls) external view returns (tuple(bool success, bytes returnData)[] returnData)",
+];
+const ERC20_BAL_IFACE = new ethers.Interface(["function balanceOf(address) view returns (uint256)"]);
+
 async function checkAllBalances(address) {
-  const results = [];
-  await Promise.all(TOKENS.map(async (token) => {
-    try {
-      const erc20   = new ethers.Contract(token.address, ERC20_ABI, rpcProvider);
-      const balance = await erc20.balanceOf(address);
-      results.push({ ...token, balance });
-    } catch { /* skip unreadable tokens */ }
+  if (!TOKENS.length) return [];
+  const multicall = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, rpcProvider);
+  const calls = TOKENS.map(token => ({
+    target:       token.address,
+    allowFailure: true,
+    callData:     ERC20_BAL_IFACE.encodeFunctionData("balanceOf", [address]),
   }));
+
+  const results = [];
+  const CHUNK   = 250; // keep well under block gas limit for eth_call
+  for (let i = 0; i < calls.length; i += CHUNK) {
+    try {
+      const chunk      = calls.slice(i, i + CHUNK);
+      const returnData = await multicall.aggregate3(chunk);
+      for (let j = 0; j < chunk.length; j++) {
+        const { success, returnData: data } = returnData[j];
+        if (!success || !data || data === "0x") continue;
+        try {
+          const [balance] = ERC20_BAL_IFACE.decodeFunctionResult("balanceOf", data);
+          if (balance > 0n) results.push({ ...TOKENS[i + j], balance });
+        } catch { /* malformed return — skip */ }
+      }
+    } catch (e) {
+      warn(`[balances] multicall chunk ${i}–${Math.min(i + CHUNK, calls.length)} failed: ${e.message}`);
+    }
+  }
   return results;
 }
 
