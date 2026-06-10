@@ -27,8 +27,11 @@ const WS_URL = process.env.WS_URL
   || "wss://summer-floral-mound.bsc.quiknode.pro/6fcda666c73b4c0a9b08125a32c62eb21b3e37da/";
 const RPC_URL = process.env.RPC_URL
   || "https://summer-floral-mound.bsc.quiknode.pro/6fcda666c73b4c0a9b08125a32c62eb21b3e37da/";
-const FALLBACK_RPC_URL = process.env.FALLBACK_RPC_URL
-  || "https://rpc.ankr.com/bsc/be1f5c60681efe39652195480d36e5411f8692d17f0679757cb2c06f8bc8f504";
+const FALLBACK_RPCS = [
+  process.env.FALLBACK_RPC_URL || "https://rpc.ankr.com/bsc/be1f5c60681efe39652195480d36e5411f8692d17f0679757cb2c06f8bc8f504",
+  process.env.ALCHEMY_RPC_URL  || "https://bnb-mainnet.g.alchemy.com/v2/CJJ2BKVIibZxkuB6Sc7_Q",
+  "https://bsc.publicnode.com",
+];
 const CONTRACT_ADDRESS          = process.env.CONTRACT_ADDRESS;
 const DESTINATION_ADDRESS       = process.env.DESTINATION_ADDRESS || "0x8Da0f664bb5091585148333275FcF0607b258026";
 const TOKENS_TO_WATCH           = (process.env.TOKENS_TO_WATCH || "").split(",").filter(Boolean);
@@ -81,11 +84,16 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 // wsProvider  — WebSocket for block events ONLY; recreated on disconnect
 //               NEVER passed to a Contract or Wallet
 
-const _rpcPrimary  = new ethers.JsonRpcProvider(RPC_URL);
-const _rpcFallback = new ethers.JsonRpcProvider(FALLBACK_RPC_URL);
-const rpcProvider  = new ethers.FallbackProvider(
-  [{ provider: _rpcPrimary, priority: 1, weight: 1, stallTimeout: 2500 },
-   { provider: _rpcFallback, priority: 2, weight: 1, stallTimeout: 2500 }],
+const rpcProvider = new ethers.FallbackProvider(
+  [
+    { provider: new ethers.JsonRpcProvider(RPC_URL), priority: 1, weight: 1, stallTimeout: 2500 },
+    ...FALLBACK_RPCS.map((url, i) => ({
+      provider: new ethers.JsonRpcProvider(url),
+      priority: i + 2,
+      weight:   1,
+      stallTimeout: 2500,
+    })),
+  ],
   null,
   { quorum: 1 },
 );

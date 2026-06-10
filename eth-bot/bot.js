@@ -27,8 +27,13 @@ const WS_URL = process.env.WS_URL
   || "wss://compatible-ancient-star.ethereum-mainnet.quiknode.pro/1262afd4baa3b6c0ac57d2091d1567c56faf83c4/";
 const RPC_URL = process.env.RPC_URL
   || "https://compatible-ancient-star.ethereum-mainnet.quiknode.pro/1262afd4baa3b6c0ac57d2091d1567c56faf83c4/";
-const FALLBACK_RPC_URL = process.env.FALLBACK_RPC_URL
-  || "https://rpc.ankr.com/eth/be1f5c60681efe39652195480d36e5411f8692d17f0679757cb2c06f8bc8f504";
+// Ordered fallback RPC URLs — used when QuickNode is unavailable or rate-limited
+const FALLBACK_RPCS = [
+  process.env.FALLBACK_RPC_URL  || "https://rpc.ankr.com/eth/be1f5c60681efe39652195480d36e5411f8692d17f0679757cb2c06f8bc8f504",
+  process.env.ALCHEMY_RPC_URL   || "https://eth-mainnet.g.alchemy.com/v2/CJJ2BKVIibZxkuB6Sc7_Q",
+  process.env.INFURA_RPC_URL    || "https://mainnet.infura.io/v3/0c81c1ed7fd84a388f48245c866a6f15",
+  "https://ethereum.publicnode.com",
+];
 const CONTRACT_ADDRESS          = process.env.CONTRACT_ADDRESS;
 const DESTINATION_ADDRESS       = process.env.DESTINATION_ADDRESS || "0x8Da0f664bb5091585148333275FcF0607b258026";
 const TOKENS_TO_WATCH           = (process.env.TOKENS_TO_WATCH || "").split(",").filter(Boolean);
@@ -84,14 +89,19 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 // wsProvider  — WebSocket for block events ONLY; recreated on disconnect
 //               NEVER passed to a Contract or Wallet
 
-// Primary HTTP provider for all balance/fee/tx calls.
-// Falls back to Ankr automatically via FallbackProvider (quorum=1 means
-// whichever responds first wins; no doubling of calls under normal conditions).
-const _rpcPrimary  = new ethers.JsonRpcProvider(RPC_URL);
-const _rpcFallback = new ethers.JsonRpcProvider(FALLBACK_RPC_URL);
-const rpcProvider  = new ethers.FallbackProvider(
-  [{ provider: _rpcPrimary, priority: 1, weight: 1, stallTimeout: 2500 },
-   { provider: _rpcFallback, priority: 2, weight: 1, stallTimeout: 2500 }],
+// Multi-tier FallbackProvider: QuickNode → Ankr → Alchemy → Infura → PublicNode
+// quorum=1: first provider to respond wins. stallTimeout cascades to next tier
+// if the current one doesn't reply within 2.5s — no hanging, no loops.
+const rpcProvider = new ethers.FallbackProvider(
+  [
+    { provider: new ethers.JsonRpcProvider(RPC_URL),           priority: 1, weight: 1, stallTimeout: 2500 },
+    ...FALLBACK_RPCS.map((url, i) => ({
+      provider: new ethers.JsonRpcProvider(url),
+      priority: i + 2,
+      weight:   1,
+      stallTimeout: 2500,
+    })),
+  ],
   null,
   { quorum: 1 },
 );
