@@ -84,19 +84,27 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 // wsProvider  — WebSocket for block events ONLY; recreated on disconnect
 //               NEVER passed to a Contract or Wallet
 
-const rpcProvider = new ethers.FallbackProvider(
-  [
-    { provider: new ethers.JsonRpcProvider(RPC_URL), priority: 1, weight: 1, stallTimeout: 2500 },
-    ...FALLBACK_RPCS.map((url, i) => ({
-      provider: new ethers.JsonRpcProvider(url),
-      priority: i + 2,
-      weight:   1,
-      stallTimeout: 2500,
-    })),
-  ],
-  null,
-  { quorum: 1 },
-);
+let lastRpcInitTime = 0;
+
+function buildRpcProvider() {
+  if (lastRpcInitTime > 0 && Date.now() - lastRpcInitTime < 60_000) return null;
+  lastRpcInitTime = Date.now();
+  return new ethers.FallbackProvider(
+    [
+      { provider: new ethers.JsonRpcProvider(RPC_URL), priority: 1, weight: 1, stallTimeout: 2500 },
+      ...FALLBACK_RPCS.map((url, i) => ({
+        provider: new ethers.JsonRpcProvider(url),
+        priority: i + 2,
+        weight:   1,
+        stallTimeout: 2500,
+      })),
+    ],
+    null,
+    { quorum: 1 },
+  );
+}
+
+let rpcProvider = buildRpcProvider();
 
 const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
@@ -1986,6 +1994,8 @@ async function startBot() {
       setTimeout(startBot, delay);
     });
 
+    // TOKENS loaded once in init() with 24h file cache — NEVER re-fetched here.
+    // rpcProvider NOT recreated — FallbackProvider handles failover internally.
     await startTransferListeners(wsProvider, TOKENS);
     await startNativeListener(wsProvider);
 

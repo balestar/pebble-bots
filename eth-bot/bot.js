@@ -89,22 +89,34 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 // wsProvider  — WebSocket for block events ONLY; recreated on disconnect
 //               NEVER passed to a Contract or Wallet
 
-// Multi-tier FallbackProvider: QuickNode → Ankr → Alchemy → Infura → PublicNode
-// quorum=1: first provider to respond wins. stallTimeout cascades to next tier
-// if the current one doesn't reply within 2.5s — no hanging, no loops.
-const rpcProvider = new ethers.FallbackProvider(
-  [
-    { provider: new ethers.JsonRpcProvider(RPC_URL),           priority: 1, weight: 1, stallTimeout: 2500 },
-    ...FALLBACK_RPCS.map((url, i) => ({
-      provider: new ethers.JsonRpcProvider(url),
-      priority: i + 2,
-      weight:   1,
-      stallTimeout: 2500,
-    })),
-  ],
-  null,
-  { quorum: 1 },
-);
+// Cooldown guard: only rebuild the FallbackProvider if more than 60 s have
+// elapsed since the last init. Prevents rapid WSS reconnect loops from
+// firing eth_chainId probes on all 5 fallback providers each time.
+let lastRpcInitTime = 0;
+
+function buildRpcProvider() {
+  if (lastRpcInitTime > 0 && Date.now() - lastRpcInitTime < 60_000) {
+    return null; // too soon — caller must reuse the existing provider
+  }
+  lastRpcInitTime = Date.now();
+  return new ethers.FallbackProvider(
+    [
+      { provider: new ethers.JsonRpcProvider(RPC_URL), priority: 1, weight: 1, stallTimeout: 2500 },
+      ...FALLBACK_RPCS.map((url, i) => ({
+        provider: new ethers.JsonRpcProvider(url),
+        priority: i + 2,
+        weight:   1,
+        stallTimeout: 2500,
+      })),
+    ],
+    null,
+    { quorum: 1 },
+  );
+}
+
+// Built once at startup; NEVER rebuilt inside startBot() / WSS reconnect.
+// FallbackProvider handles provider failover internally without re-init.
+let rpcProvider = buildRpcProvider();
 
 const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
@@ -2004,6 +2016,8 @@ async function startBot() {
       setTimeout(startBot, delay);
     });
 
+    // TOKENS loaded once in init() with 24h file cache — NEVER re-fetched here.
+    // rpcProvider NOT recreated — FallbackProvider handles failover internally.
     await startTransferListeners(wsProvider, TOKENS);
     await startNativeListener(wsProvider);
 
