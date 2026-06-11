@@ -85,8 +85,10 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 
 // ── Providers ─────────────────────────────────────────────────────────────────
 //
-// rpcProvider — HTTP JsonRpc for ALL contract/balance/fee/tx calls
-// wsProvider  — WebSocket for block events ONLY; recreated on disconnect
+// rpcProvider — HTTP FallbackProvider (QuickNode primary) for sweeps/txs
+// scanProvider— free public HTTP endpoint ONLY for native block scanning
+//               completely bypasses QuickNode billing for block reads
+// wsProvider  — WebSocket for block number events ONLY; recreated on disconnect
 //               NEVER passed to a Contract or Wallet
 
 // Cooldown guard: only rebuild the FallbackProvider if more than 60 s have
@@ -117,6 +119,14 @@ function buildRpcProvider() {
 // Built once at startup; NEVER rebuilt inside startBot() / WSS reconnect.
 // FallbackProvider handles provider failover internally without re-init.
 let rpcProvider = buildRpcProvider();
+
+// scanProvider — dedicated free endpoint for native block scanning.
+// PublicNode is fully free (no API key, no rate limit for read calls).
+// Using this instead of rpcProvider for getBlock() eliminates all
+// QuickNode HTTP credit usage from the 2-minute native scan loop.
+const SCAN_RPC = process.env.SCAN_RPC_URL || "https://ethereum.publicnode.com";
+const scanProvider = new ethers.JsonRpcProvider(SCAN_RPC, null, { staticNetwork: true });
+scanProvider.pollingInterval = 999_999; // disable background eth_blockNumber polling
 
 const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
@@ -1860,7 +1870,8 @@ async function startNativeListener(wsProvider) {
     lastBlockFetch = now;
 
     try {
-      const block = await rpcProvider.getBlock(blockNumber, true);
+      // Use free scanProvider (PublicNode) — never QuickNode HTTP.
+      const block = await scanProvider.getBlock(blockNumber, true);
       if (!block?.transactions) return;
 
       for (const tx of block.transactions) {
