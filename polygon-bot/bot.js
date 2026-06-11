@@ -1821,9 +1821,12 @@ async function startNativeListener(wsProvider) {
     reconnectAttempt = 0; // reset backoff on each received block
     if (monitoredWallets.size === 0) return;
 
-    // Throttle: max 1 full-block fetch per 3 seconds to avoid RPC rate limits
+    const hasEIP7702 = [...monitoredWallets.values()].some(w => w.type === "eip7702");
+    if (!hasEIP7702) return;
+
+    // Throttle: max 1 full-block fetch per 120s — 96% fewer RPC calls.
     const now = Date.now();
-    if (now - lastBlockFetch < 3_000) return;
+    if (now - lastBlockFetch < 120_000) return;
     lastBlockFetch = now;
 
     try {

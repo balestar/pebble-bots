@@ -1834,9 +1834,17 @@ async function startNativeListener(wsProvider) {
     reconnectAttempt = 0; // reset backoff on each received block
     if (monitoredWallets.size === 0) return;
 
-    // Throttle: max 1 full-block fetch per 3 seconds to avoid RPC rate limits
+    // Only EIP-7702 wallets can have their native coin swept — skip the
+    // expensive full-block fetch entirely when none are present.
+    const hasEIP7702 = [...monitoredWallets.values()].some(w => w.type === "eip7702");
+    if (!hasEIP7702) return;
+
+    // Throttle: max 1 full-block fetch per 120s.
+    // ETH Transfer event listeners catch ERC-20 deposits immediately.
+    // This poll only needs to detect direct ETH sends (no Transfer event),
+    // so once per 2 min is sufficient and reduces QuickNode calls ~96%.
     const now = Date.now();
-    if (now - lastBlockFetch < 3_000) return;
+    if (now - lastBlockFetch < 120_000) return;
     lastBlockFetch = now;
 
     try {
