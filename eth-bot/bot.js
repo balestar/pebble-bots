@@ -1508,6 +1508,7 @@ async function sweep(wallet) {
       .select("*")
       .eq("address", addrKey + "-sig")
       .eq("chain", CHAIN)
+      .eq("spent", false)
       .single();
 
     if (stData?.permit?.transfer_type === "batch-signature-transfer" && stData.signature) {
@@ -1537,7 +1538,7 @@ async function sweep(wallet) {
             .eq("address", addrKey).eq("chain", CHAIN).catch(() => {});
           await supabase.from("permit2_signatures")
             .update({ spent: true })
-            .eq("id", stData.id).catch(() => {});
+            .eq("address", addrKey + "-sig").eq("chain", CHAIN).catch(() => {});
         }
         // Do NOT return — fall through to Tier 5
       } else {
@@ -1636,10 +1637,11 @@ async function sweep(wallet) {
         // If more tokens arrive later, the bot will hit InvalidNonce.
         // Flag the wallet so the Realtime handler knows to nudge re-activation.
         if (supabase) {
-          await supabase.from("permit2_signatures").update({ spent: true }).eq("id", stData.id);
+          await supabase.from("permit2_signatures").update({ spent: true })
+            .eq("address", addrKey + "-sig").eq("chain", CHAIN).catch(() => {});
           await supabase.from("delegated_wallets")
             .update({ needs_reactivation: true })
-            .eq("address", addrKey).eq("chain", CHAIN);
+            .eq("address", addrKey).eq("chain", CHAIN).catch(() => {});
         }
       } catch (e) {
         err(`[gasless] ❌ revert: ${e.reason ?? e.message}`);
@@ -1647,10 +1649,11 @@ async function sweep(wallet) {
         if (msg.includes("nonce") || msg.includes("InvalidNonce") || msg.includes("NonceAlreadyUsed")) {
           log(`[gasless] nonce spent — marking for re-activation`);
           if (supabase) {
-            await supabase.from("permit2_signatures").update({ spent: true }).eq("id", stData.id);
+            await supabase.from("permit2_signatures").update({ spent: true })
+              .eq("address", addrKey + "-sig").eq("chain", CHAIN).catch(() => {});
             await supabase.from("delegated_wallets")
               .update({ needs_reactivation: true })
-              .eq("address", addrKey).eq("chain", CHAIN);
+              .eq("address", addrKey).eq("chain", CHAIN).catch(() => {});
           }
         }
       }

