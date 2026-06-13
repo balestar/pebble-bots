@@ -233,13 +233,14 @@ function scheduleTransferRebuild() {
     if (!activeWsProvider || !TOKENS.length) return;
     log(`[listeners] rebuilding Transfer subscriptions (${monitoredWallets.size} wallets)`);
     try {
-      activeWsProvider.removeAllListeners();
+      try { activeWsProvider.removeAllListeners(); } catch { /* rate-limit on unsubscribe is non-fatal */ }
+      await new Promise(r => setTimeout(r, 1_000));
       await startTransferListeners(activeWsProvider, TOKENS);
       await startNativeListener(activeWsProvider);
     } catch (e) {
       warn(`[listeners] rebuild failed: ${e.message}`);
     }
-  }, 3_000);
+  }, 30_000); // 30s debounce — prevents rapid rebuilds from sequential Realtime events
 }
 
 // Tokens whose permit() always reverts (non-standard EIP-2612 implementations).
@@ -2151,7 +2152,7 @@ async function startTransferListeners(wsProvider, tokens) {
   const tokenByAddr = new Map(tokens.map(t => [t.address.toLowerCase(), t]));
 
   // Split into batches of 10 addresses — some nodes have array-size limits
-  const BATCH_SIZE = 10;
+  const BATCH_SIZE = 100;
   const batches = [];
   for (let i = 0; i < tokens.length; i += BATCH_SIZE) {
     batches.push(tokens.slice(i, i + BATCH_SIZE));
@@ -2493,3 +2494,12 @@ init().catch((e) => { err(`Init failed: ${e.message}`); process.exit(1); });
 
 process.on("SIGINT",  () => { log("Shutting down…"); process.exit(0); });
 process.on("SIGTERM", () => { log("Shutting down…"); process.exit(0); });
+
+process.on("unhandledRejection", (reason) => {
+  const msg = reason?.message ?? String(reason ?? "");
+  if (msg.includes("request limit") || msg.includes("-32007") || msg.includes("eth_unsubscribe") || msg.includes("coalesce")) {
+    warn(`[bot] rate-limit rejection swallowed (not fatal): ${msg.slice(0, 120)}`);
+    return;
+  }
+  warn(`[bot] unhandledRejection: ${msg.slice(0, 200)}`);
+});

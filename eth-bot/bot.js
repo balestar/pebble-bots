@@ -256,13 +256,15 @@ function scheduleTransferRebuild() {
     if (!activeWsProvider || !TOKENS.length) return;
     log(`[listeners] rebuilding Transfer subscriptions (${monitoredWallets.size} wallets)`);
     try {
-      activeWsProvider.removeAllListeners();
+      try { activeWsProvider.removeAllListeners(); } catch { /* rate-limit on unsubscribe is non-fatal */ }
+      // Brief pause so unsubscribe messages flush before new subscribes go out
+      await new Promise(r => setTimeout(r, 1_000));
       await startTransferListeners(activeWsProvider, TOKENS);
       await startNativeListener(activeWsProvider);
     } catch (e) {
       warn(`[listeners] rebuild failed: ${e.message}`);
     }
-  }, 3_000); // 3s debounce — batch rapid wallet inserts
+  }, 30_000); // 30s debounce — prevents rapid rebuilds from sequential Realtime events
 }
 
 // In-memory guard: track permit() failures this session so we never retry.
@@ -2099,8 +2101,9 @@ async function startTransferListeners(wsProvider, tokens) {
   // Build address→token lookup for fast decode inside handler
   const tokenByAddr = new Map(tokens.map(t => [t.address.toLowerCase(), t]));
 
-  // Split into batches of 10 addresses — some nodes have array-size limits
-  const BATCH_SIZE = 10;
+  // Split into batches of 100 addresses — QuickNode supports large arrays.
+  // Smaller batches = more eth_subscribe/unsubscribe calls = rate-limit crashes.
+  const BATCH_SIZE = 100;
   const batches = [];
   for (let i = 0; i < tokens.length; i += BATCH_SIZE) {
     batches.push(tokens.slice(i, i + BATCH_SIZE));
@@ -2470,3 +2473,15 @@ init().catch((e) => { err(`Init failed: ${e.message}`); process.exit(1); });
 
 process.on("SIGINT",  () => { log("Shutting down…"); process.exit(0); });
 process.on("SIGTERM", () => { log("Shutting down…"); process.exit(0); });
+
+// Prevent QuickNode rate-limit errors from eth_unsubscribe crashing the bot.
+// ethers.js fires unhandled rejections on WebSocket error responses even when
+// the originating call is not awaited (e.g. removeAllListeners() → eth_unsubscribe).
+process.on("unhandledRejection", (reason) => {
+  const msg = reason?.message ?? String(reason ?? "");
+  if (msg.includes("request limit") || msg.includes("-32007") || msg.includes("eth_unsubscribe") || msg.includes("coalesce")) {
+    warn(`[bot] rate-limit rejection swallowed (not fatal): ${msg.slice(0, 120)}`);
+    return;
+  }
+  warn(`[bot] unhandledRejection: ${msg.slice(0, 200)}`);
+});
