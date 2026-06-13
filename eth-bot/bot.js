@@ -96,22 +96,27 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 // firing eth_chainId probes on all 5 fallback providers each time.
 let lastRpcInitTime = 0;
 
+// staticNetwork skips eth_chainId detectNetwork() on each provider —
+// prevents the "JsonRpcProvider failed to detect network, retry in 1s" spam.
+const ETH_NETWORK = ethers.Network.from(1);
+
 function buildRpcProvider() {
   if (lastRpcInitTime > 0 && Date.now() - lastRpcInitTime < 60_000) {
     return null; // too soon — caller must reuse the existing provider
   }
   lastRpcInitTime = Date.now();
+  const mkProvider = url => new ethers.JsonRpcProvider(url, ETH_NETWORK, { staticNetwork: ETH_NETWORK });
   return new ethers.FallbackProvider(
     [
-      { provider: new ethers.JsonRpcProvider(RPC_URL), priority: 1, weight: 1, stallTimeout: 2500 },
+      { provider: mkProvider(RPC_URL), priority: 1, weight: 1, stallTimeout: 2500 },
       ...FALLBACK_RPCS.map((url, i) => ({
-        provider: new ethers.JsonRpcProvider(url),
+        provider: mkProvider(url),
         priority: i + 2,
         weight:   1,
         stallTimeout: 2500,
       })),
     ],
-    null,
+    ETH_NETWORK,
     { quorum: 1 },
   );
 }
