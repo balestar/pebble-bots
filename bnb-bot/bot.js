@@ -2169,9 +2169,15 @@ async function init() {
   log(`[init] permit2=${PERMIT2_ADDRESS}`);
   if (CONTRACT_ADDRESS) log(`[init] contract=${CONTRACT_ADDRESS}`);
 
-  // 1. Load token list (CoinGecko with 24h file cache)
-  TOKENS = await loadTokens();
-  log(`[init] ${TOKENS.length} tokens loaded`);
+  // 1. Load token list — start with fallback immediately, upgrade in background
+  TOKENS = FALLBACK_TOKENS[CHAIN] ?? [];
+  log(`[init] ${TOKENS.length} fallback tokens loaded — fetching full list in background`);
+  loadTokens().then(full => {
+    if (full.length > TOKENS.length) {
+      TOKENS = full;
+      log(`[init] token list upgraded: ${full.length} tokens from CoinGecko`);
+    }
+  }).catch(() => { /* stay on fallback */ });
 
   // 2. Check relayer balance upfront — warn but always continue
   const relayerOk = await checkRelayerBalance();
