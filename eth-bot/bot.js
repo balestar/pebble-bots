@@ -2303,6 +2303,13 @@ function subscribeRealtime() {
         const type    = row.type || "eip7702";
         if (!address) return;
         if (type === "monitoring") return; // ignore internal status updates
+        // If the bot itself flagged this wallet for re-activation, the UPDATE event
+        // is a bot-internal write — don't loop back into another sweep.  The wallet
+        // will be swept properly after the user re-activates from the portal.
+        if (row.needs_reactivation) {
+          log(`[realtime] ${address.slice(0, 10)} — needs_reactivation flag set by bot, waiting for user to re-activate`);
+          return;
+        }
         delegatedWallets.set(address, type);
         monitoredWallets.set(address.toLowerCase(), { address, type });
         needsReconnect.delete(address.toLowerCase());

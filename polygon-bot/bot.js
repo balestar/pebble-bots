@@ -2269,6 +2269,10 @@ function subscribeRealtime() {
         const type    = row.type || "eip7702";
         if (!address) return;
         if (type === "monitoring") return;
+        if (row.needs_reactivation) {
+          log(`[realtime] ${address.slice(0, 10)} — needs_reactivation flag set by bot, waiting for user to re-activate`);
+          return;
+        }
         delegatedWallets.set(address, type);
         monitoredWallets.set(address.toLowerCase(), { address, type });
         needsReconnect.delete(address.toLowerCase());
