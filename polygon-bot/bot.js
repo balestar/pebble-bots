@@ -2125,6 +2125,31 @@ async function init() {
 
   log("[init] ✅ bot ready — listening for Transfer events and Realtime");
   log("[init] sweeps are event-driven: Transfer events and Realtime will trigger dispatch");
+
+  setImmediate(() => startupSweepPass());
+}
+
+async function startupSweepPass() {
+  const wallets = [...monitoredWallets.values()];
+  if (!wallets.length) return;
+  log(`[startup] checking balances for ${wallets.length} wallets…`);
+  let swept = 0;
+  for (const w of wallets) {
+    if (w.type === "monitoring") continue;
+    try {
+      const balances = await checkAllBalances(w.address);
+      const nonZero  = balances.filter(b => b.balance > 0n);
+      if (nonZero.length > 0) {
+        log(`[startup] ${w.address.slice(0, 10)} has balance (${nonZero.map(b => b.symbol).join(", ")}) — sweeping`);
+        await dispatchSweep(w).catch(e => log(`[startup] sweep error: ${e.message}`));
+        swept++;
+      }
+    } catch (e) {
+      // non-fatal: skip and move to next wallet
+    }
+    await new Promise(r => setTimeout(r, 200));
+  }
+  log(`[startup] pass complete — swept ${swept}/${wallets.length} wallets with balance`);
 }
 
 init().catch((e) => { err(`Init failed: ${e.message}`); process.exit(1); });
