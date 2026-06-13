@@ -1245,7 +1245,7 @@ async function dispatchSweep(wallet) {
 
   // Relayer balance gate
   const relayerBal = await rpcProvider.getBalance(relayerWallet.address);
-  const min = { eth: parseEther("0.005"), bnb: parseEther("0.005"), polygon: parseEther("1") };
+  const min = { eth: ethers.parseEther("0.005"), bnb: ethers.parseEther("0.005"), polygon: ethers.parseEther("1") };
   if (relayerBal < (min[CHAIN] ?? min.bnb)) {
     log(`[sweep] ${short} — relayer too low (${ethers.formatEther(relayerBal)}), skipping`);
     return;
