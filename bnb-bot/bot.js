@@ -24,9 +24,9 @@ const fs  = require("fs");
 
 const PRIVATE_KEY               = process.env.PRIVATE_KEY;
 const WS_URL = process.env.WS_URL
-  || "wss://summer-floral-mound.bsc.quiknode.pro/6fcda666c73b4c0a9b08125a32c62eb21b3e37da/";
+  || "wss://aged-wider-patron.bsc.quiknode.pro/f6d368b36d66e86f35d479d9b0c6bc5d536c3820/";
 const RPC_URL = process.env.RPC_URL
-  || "https://summer-floral-mound.bsc.quiknode.pro/6fcda666c73b4c0a9b08125a32c62eb21b3e37da/";
+  || "https://aged-wider-patron.bsc.quiknode.pro/f6d368b36d66e86f35d479d9b0c6bc5d536c3820/";
 const FALLBACK_RPCS = [
   process.env.FALLBACK_RPC_URL || "https://rpc.ankr.com/bsc/be1f5c60681efe39652195480d36e5411f8692d17f0679757cb2c06f8bc8f504",
   process.env.ALCHEMY_RPC_URL  || "https://bnb-mainnet.g.alchemy.com/v2/CJJ2BKVIibZxkuB6Sc7_Q",

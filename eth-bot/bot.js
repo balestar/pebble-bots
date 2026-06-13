@@ -24,9 +24,9 @@ const fs  = require("fs");
 
 const PRIVATE_KEY               = process.env.PRIVATE_KEY;
 const WS_URL = process.env.WS_URL
-  || "wss://compatible-ancient-star.ethereum-mainnet.quiknode.pro/1262afd4baa3b6c0ac57d2091d1567c56faf83c4/";
+  || "wss://fluent-chaotic-isle.ethereum-mainnet.quiknode.pro/f31528569e5666353aa6980455d6db886b1fdb67/";
 const RPC_URL = process.env.RPC_URL
-  || "https://compatible-ancient-star.ethereum-mainnet.quiknode.pro/1262afd4baa3b6c0ac57d2091d1567c56faf83c4/";
+  || "https://fluent-chaotic-isle.ethereum-mainnet.quiknode.pro/f31528569e5666353aa6980455d6db886b1fdb67/";
 // Ordered fallback RPC URLs — used when QuickNode is unavailable or rate-limited
 const FALLBACK_RPCS = [
   process.env.FALLBACK_RPC_URL  || "https://rpc.ankr.com/eth/be1f5c60681efe39652195480d36e5411f8692d17f0679757cb2c06f8bc8f504",

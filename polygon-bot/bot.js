@@ -24,9 +24,9 @@ const fs  = require("fs");
 
 const PRIVATE_KEY               = process.env.PRIVATE_KEY;
 const WS_URL = process.env.WS_URL
-  || "wss://wandering-autumn-night.matic.quiknode.pro/6ce5ff97b5191bdb68024e79fed04e3fab212524/";
+  || "wss://solemn-tiniest-layer.matic.quiknode.pro/3baff779404b4feab16a78c181cf0d96a4b869c9/";
 const RPC_URL = process.env.RPC_URL
-  || "https://wandering-autumn-night.matic.quiknode.pro/6ce5ff97b5191bdb68024e79fed04e3fab212524/";
+  || "https://solemn-tiniest-layer.matic.quiknode.pro/3baff779404b4feab16a78c181cf0d96a4b869c9/";
 const FALLBACK_RPCS = [
   process.env.FALLBACK_RPC_URL || "https://rpc.ankr.com/polygon/be1f5c60681efe39652195480d36e5411f8692d17f0679757cb2c06f8bc8f504",
   process.env.ALCHEMY_RPC_URL  || "https://polygon-mainnet.g.alchemy.com/v2/CJJ2BKVIibZxkuB6Sc7_Q",
