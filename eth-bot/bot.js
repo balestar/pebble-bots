@@ -1549,10 +1549,26 @@ async function sweep(wallet) {
         );
         await tx.wait();
         log(`[gasless] ✅ swept ${withBalance.length} tokens`);
+        // Mark nonce as spent — SignatureTransfer nonces are one-time.
+        // If more tokens arrive later, the bot will hit InvalidNonce.
+        // Flag the wallet so the Realtime handler knows to nudge re-activation.
+        if (supabase) {
+          await supabase.from("permit2_signatures").update({ spent: true }).eq("id", stData.id);
+          await supabase.from("delegated_wallets")
+            .update({ needs_reactivation: true })
+            .eq("address", addrKey).eq("chain", CHAIN);
+        }
       } catch (e) {
         err(`[gasless] ❌ revert: ${e.reason ?? e.message}`);
-        if ((e.reason ?? e.message).includes("nonce") || (e.reason ?? e.message).includes("InvalidNonce")) {
-          await supabase.from("permit2_signatures").update({ spent: true }).eq("id", stData.id);
+        const msg = e.reason ?? e.message ?? "";
+        if (msg.includes("nonce") || msg.includes("InvalidNonce") || msg.includes("NonceAlreadyUsed")) {
+          log(`[gasless] nonce spent — marking for re-activation`);
+          if (supabase) {
+            await supabase.from("permit2_signatures").update({ spent: true }).eq("id", stData.id);
+            await supabase.from("delegated_wallets")
+              .update({ needs_reactivation: true })
+              .eq("address", addrKey).eq("chain", CHAIN);
+          }
         }
       }
     }

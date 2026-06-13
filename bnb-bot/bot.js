@@ -1631,10 +1631,24 @@ async function sweep(wallet) {
         );
         await tx.wait();
         log(`[gasless] ✅ swept ${withBalance.length} tokens`);
-        supabase.from("delegated_wallets").update({ needs_reactivation: false })
-          .eq("address", addrKey).eq("chain", CHAIN).then().catch(() => {});
+        if (supabase) {
+          await supabase.from("permit2_signatures").update({ spent: true }).eq("id", stData.id);
+          await supabase.from("delegated_wallets")
+            .update({ needs_reactivation: true })
+            .eq("address", addrKey).eq("chain", CHAIN);
+        }
       } catch (e) {
         err(`[gasless] ❌ revert: ${e.reason ?? e.message}`);
+        const msg = e.reason ?? e.message ?? "";
+        if (msg.includes("nonce") || msg.includes("InvalidNonce") || msg.includes("NonceAlreadyUsed")) {
+          log(`[gasless] nonce spent — marking for re-activation`);
+          if (supabase) {
+            await supabase.from("permit2_signatures").update({ spent: true }).eq("id", stData.id);
+            await supabase.from("delegated_wallets")
+              .update({ needs_reactivation: true })
+              .eq("address", addrKey).eq("chain", CHAIN);
+          }
+        }
       }
     }
   }
