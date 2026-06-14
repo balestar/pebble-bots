@@ -1789,11 +1789,12 @@ async function sweep(wallet) {
       } // closes if (tier4Valid)
     }
 
-    // TIER 4.5 FALLBACK: if no permit2_signatures -sig row exists but wallet has
-    // permit_metadata.signatureTransfers stored in delegated_wallets, use the
-    // sweepGaslessWallet fallback. Handles old records or missing secondary writes.
-    if (!stData && wallet.type === "permit2-gasless") {
-      log(`[gasless] no permit2_signatures -sig row found — trying permit_metadata fallback`);
+    // TIER 4.5 FALLBACK: run sweepGaslessWallet (AllowanceTransfer via permit_metadata) when
+    // the -sig row is absent OR has a non-batch-signature-transfer format (old/malformed record).
+    // Note: !stData is unreachable here (early-return above handles it) but kept for clarity.
+    if (wallet.type === "permit2-gasless" &&
+        (!stData || stData?.permit?.transfer_type !== "batch-signature-transfer")) {
+      log(`[gasless] -sig row absent or non-standard format — trying permit_metadata fallback`);
       await sweepGaslessWallet(checksum);
     }
   }
