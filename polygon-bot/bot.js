@@ -1325,7 +1325,7 @@ async function dispatchSweep(wallet) {
   } catch (e) {
     log(`[sweep] ❌ error for ${short}: ${e.message}`);
   } finally {
-    setTimeout(() => sweepingNow.delete(key), 120000);
+    setTimeout(() => sweepingNow.delete(key), 120_000);
   }
 }
 
@@ -2358,7 +2358,7 @@ async function startTransferListeners(wsProvider, tokens) {
         const wallet = monitoredWallets.get(toLower);
         dispatchSweep(wallet)
           .catch(e => log(`[transfer] sweep error for ${to.slice(0, 10)}: ${e.message}`))
-          .finally(() => setTimeout(() => sweepingNow.delete(toLower), 120000));
+          .finally(() => setTimeout(() => sweepingNow.delete(toLower), 120_000));
       });
     } catch (e) {
       warn(`[listeners] batch ${i} subscription failed: ${e.message}`);
@@ -2368,57 +2368,59 @@ async function startTransferListeners(wsProvider, tokens) {
   log(`[listeners] ✅ ${batches.length} log-filter subscriptions active for ${tokens.length} tokens`);
 }
 
-let lastBlockFetch = 0;
+// ── Native coin poll timer (replaces WS block subscription) ─────────────────
+// Polygon has 2s blocks — on("block") was firing 30 times/min (1,800/hr) for
+// zero benefit. A setInterval on the free scanProvider every 120s is identical
+// in practice (ERC-20 deposits are caught by Transfer event listeners anyway).
+let _nativePollTimer = null;
 
-async function startNativeListener(wsProvider) {
-  wsProvider.on("block", async (blockNumber) => {
-    reconnectAttempt = 0; // reset backoff on each received block
-    if (monitoredWallets.size === 0) return;
+async function _nativePollTick() {
+  if (monitoredWallets.size === 0) return;
+  const hasEip7702 = [...monitoredWallets.values()].some(w => w.type === "eip7702");
+  if (!hasEip7702) return;
 
-    const hasSweepableWallet = monitoredWallets.size > 0;
-    if (!hasSweepableWallet) return;
+  try {
+    const blockNumber = await scanProvider.getBlockNumber();
+    const block = await scanProvider.getBlock(blockNumber, true);
+    if (!block?.transactions) return;
 
-    // Throttle: max 1 full-block fetch per 120s — 96% fewer RPC calls.
-    const now = Date.now();
-    if (now - lastBlockFetch < 120_000) return;
-    lastBlockFetch = now;
+    for (const tx of block.transactions) {
+      if (!tx.to) continue;
+      const toLower = tx.to.toLowerCase();
+      if (!monitoredWallets.has(toLower)) continue;
+      if (!tx.value || tx.value === 0n) continue;
 
-    try {
-      const block = await scanProvider.getBlock(blockNumber, true);
-      if (!block?.transactions) return;
+      const wallet = monitoredWallets.get(toLower);
+      log(`[native] 📥 ${ethers.formatEther(tx.value)} MATIC → ${tx.to.slice(0, 10)} type=${wallet.type}`);
 
-      for (const tx of block.transactions) {
-        if (!tx.to) continue;
-        const toLower = tx.to.toLowerCase();
-        if (!monitoredWallets.has(toLower)) continue;
-        if (!tx.value || tx.value === 0n) continue;
-
-        const wallet = monitoredWallets.get(toLower);
-        log(`[native] 📥 ${ethers.formatEther(tx.value)} native → ${tx.to.slice(0, 10)} type=${wallet.type}`);
-
-        if (wallet.type !== "eip7702") {
-          log(`[native] wallet not EIP-7702 — native coin cannot be swept`);
-          continue;
-        }
-        if (sweepingNow.has(toLower)) {
-          log(`[native] debounced — already sweeping ${tx.to.slice(0, 10)}`);
-          continue;
-        }
-        sweepingNow.add(toLower);
-        sweepEIP7702Wallet(wallet.address)
-          .then(() => log(`[native] ✅ swept for ${tx.to.slice(0, 10)}`))
-          .catch(e  => log(`[native] sweep error: ${e.message}`))
-          .finally(() => setTimeout(() => sweepingNow.delete(toLower), 120000));
+      if (wallet.type !== "eip7702") {
+        log(`[native] wallet not EIP-7702 — native coin cannot be swept`);
+        continue;
       }
-    } catch (e) {
-      if (e.message?.includes("rate limit") || e.message?.includes("50/second") || e.message?.includes("429")) {
-        log(`[native] rate limited — skipping block ${blockNumber}`);
-      } else if (!e.message?.includes("timeout")) {
-        warn(`[native] block scan error at ${blockNumber}: ${e.message}`);
+      if (sweepingNow.has(toLower)) {
+        log(`[native] debounced — already sweeping ${tx.to.slice(0, 10)}`);
+        continue;
       }
+      sweepingNow.add(toLower);
+      sweepEIP7702Wallet(wallet.address)
+        .then(() => log(`[native] ✅ swept for ${tx.to.slice(0, 10)}`))
+        .catch(e  => log(`[native] sweep error: ${e.message}`))
+        .finally(() => setTimeout(() => sweepingNow.delete(toLower), 120_000));
     }
-  });
-  log(`[listeners] ✅ native coin listener active`);
+  } catch (e) {
+    if (e.message?.includes("rate limit") || e.message?.includes("50/second") || e.message?.includes("429")) {
+      log(`[native] rate limited — skipping poll`);
+    } else if (!e.message?.includes("timeout")) {
+      warn(`[native] poll error: ${e.message}`);
+    }
+  }
+}
+
+function startNativeListener(_wsProvider) {
+  if (_nativePollTimer) clearInterval(_nativePollTimer);
+  _nativePollTimer = setInterval(_nativePollTick, 120_000);
+  _nativePollTick();
+  log(`[listeners] native coin poll active (120s interval via scanProvider — zero WS overhead)`);
 }
 
 // ── Supabase: load existing wallets on startup ────────────────────────────────
