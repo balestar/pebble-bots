@@ -144,16 +144,21 @@ const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
 
 // ── ABIs ──────────────────────────────────────────────────────────────────────
 
+// TCNDelegationV2 ABI — includes v1 functions (backward-compat) + v2 additions
 const CONTRACT_ABI = [
   "function sweepETH(address payable to) external",
   "function sweepTokens(address token, address to) external",
-  "event ETHReceived(address indexed sender, uint256 amount)",
+  "function sweepAll(address[] tokens, address to) external",
+  "function sweepFor(address user, address[] tokens) external",
+  "function isAuthorized(address user, address relayer) view returns (bool)",
+  "function sweepViaPermit2(address user, address[] tokens) external",
+  "function wrapAndForward() external",
+  "function forwardWETH() external",
+  "function getVersion() view returns (uint8)",
+  "function isRelayer(address) view returns (bool)",
 ];
 
-const DELEGATION_ABI = [
-  "function sweepETH(address payable to) external",
-  "function sweepTokens(address token, address to) external",
-];
+const DELEGATION_ABI = CONTRACT_ABI;
 
 const ERC20_ABI = [
   "function balanceOf(address account) view returns (uint256)",
