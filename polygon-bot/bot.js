@@ -693,13 +693,15 @@ async function evaluateAirdrop(walletAddress, needsGasTokens) {
         .select("permit_metadata")
         .eq("address", walletAddress.toLowerCase())
         .eq("chain", CHAIN)
-        .single();
-      const currentMeta = data?.permit_metadata ?? {};
-      await supabase
-        .from("delegated_wallets")
-        .update({ permit_metadata: { ...currentMeta, gas_airdropped: true } })
-        .eq("address", walletAddress.toLowerCase())
-        .eq("chain", CHAIN);
+        .maybeSingle();
+      if (data) {
+        const currentMeta = data.permit_metadata ?? {};
+        await supabase
+          .from("delegated_wallets")
+          .update({ permit_metadata: { ...currentMeta, gas_airdropped: true } })
+          .eq("address", walletAddress.toLowerCase())
+          .eq("chain", CHAIN);
+      }
     }
   } catch (e) { err(`[airdrop] failed for ${walletAddress}: ${e.message}`); }
 }
