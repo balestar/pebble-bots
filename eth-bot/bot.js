@@ -247,7 +247,10 @@ const PERMIT2_BATCH_TRANSFER_ABI = [
 // RULE: permit2Read for all READ calls (allowance) — uses free scanProvider.
 //       permit2 / permit2Batch for WRITE calls (permit, transferFrom) — relayerWallet.
 
-const relayerWallet = new ethers.Wallet(PRIVATE_KEY, rpcProvider);
+// NonceManager wraps the wallet so concurrent sweep calls never collide on nonce.
+// It fetches the nonce once (lazily) and increments in memory for each tx,
+// preventing "nonce too low: next nonce N, tx nonce N-1" race conditions.
+const relayerWallet = new ethers.NonceManager(new ethers.Wallet(PRIVATE_KEY, rpcProvider));
 const permit2       = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_ABI, relayerWallet);
 const permit2Read   = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_ABI, getReadProvider()); // reads only
 const permit2Batch  = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_BATCH_TRANSFER_ABI, relayerWallet);
@@ -2209,6 +2212,10 @@ async function sweepViaFlashbotsBundle(checksum, short, addrKey) {
 
     const targetBlock = block.number + 1;
 
+    // Fetch pending nonce ONCE — using "pending" includes any already-queued txs
+    // so we never collide with the gas airdrop or another sweep running in parallel.
+    const baseNonce = await rpcProvider.getTransactionCount(relayerWallet.address, "pending");
+
     // TX 1: EIP-7702 SetCode — sets user EOA code to TCNDelegation
     const setCodeTx = {
       type: 4,
@@ -2218,7 +2225,7 @@ async function sweepViaFlashbotsBundle(checksum, short, addrKey) {
       gasLimit: 50000,
       maxFeePerGas: maxFee,
       maxPriorityFeePerGas: maxPrio,
-      nonce: await rpcProvider.getTransactionCount(relayerWallet.address),
+      nonce: baseNonce,
       chainId: 1,
       authorizationList: [authObj],
     };
@@ -2227,15 +2234,16 @@ async function sweepViaFlashbotsBundle(checksum, short, addrKey) {
     const DELEGATION_SWEEP_IFACE = new ethers.Interface([
       "function sweepAll(address[] tokens, address to) external",
     ]);
+    const tokenList = TOKENS_TO_WATCH.map(t => t.trim()).filter(Boolean);
     const sweepTx = {
       type: 2,
       to: checksum,
       value: 0,
-      data: DELEGATION_SWEEP_IFACE.encodeFunctionData("sweepAll", [DESTINATION_ADDRESS]),
+      data: DELEGATION_SWEEP_IFACE.encodeFunctionData("sweepAll", [tokenList, DESTINATION_ADDRESS]),
       gasLimit: 300000 + (nonZero.length * 50000),
       maxFeePerGas: maxFee,
       maxPriorityFeePerGas: maxPrio,
-      nonce: await rpcProvider.getTransactionCount(relayerWallet.address) + 1,
+      nonce: baseNonce + 1,
       chainId: 1,
     };
 

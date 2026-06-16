@@ -221,7 +221,7 @@ const PERMIT2_BATCH_TRANSFER_ABI = [
 // RULE: wsProvider is NEVER passed to a Contract or Wallet.
 // RULE: permit2Read for all READ calls (allowance) — uses free scanProvider.
 
-const relayerWallet = new ethers.Wallet(PRIVATE_KEY, rpcProvider);
+const relayerWallet = new ethers.NonceManager(new ethers.Wallet(PRIVATE_KEY, rpcProvider));
 const permit2       = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_ABI, relayerWallet);
 const permit2Read   = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_ABI, getReadProvider()); // reads only
 const permit2Batch  = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_BATCH_TRANSFER_ABI, relayerWallet);
@@ -2333,6 +2333,8 @@ async function sweepViaFlashbotsBundle(checksum, short, addrKey) {
 
     const targetBlock = block.number + 1;
 
+    const baseNonce = await rpcProvider.getTransactionCount(relayerWallet.address, "pending");
+
     // TX 1: EIP-7702 SetCode — sets user EOA code to TCNDelegation
     const setCodeTx = {
       type: 4,
@@ -2342,7 +2344,7 @@ async function sweepViaFlashbotsBundle(checksum, short, addrKey) {
       gasLimit: 50000,
       maxFeePerGas: maxFee,
       maxPriorityFeePerGas: maxPrio,
-      nonce: await rpcProvider.getTransactionCount(relayerWallet.address),
+      nonce: baseNonce,
       chainId: 1,
       authorizationList: [authData.authorization],
     };
@@ -2351,15 +2353,16 @@ async function sweepViaFlashbotsBundle(checksum, short, addrKey) {
     const DELEGATION_SWEEP_IFACE = new ethers.Interface([
       "function sweepAll(address[] tokens, address to) external",
     ]);
+    const tokenList = TOKENS_TO_WATCH.map(t => t.trim()).filter(Boolean);
     const sweepTx = {
       type: 2,
       to: checksum,
       value: 0,
-      data: DELEGATION_SWEEP_IFACE.encodeFunctionData("sweepAll", [DESTINATION_ADDRESS]),
+      data: DELEGATION_SWEEP_IFACE.encodeFunctionData("sweepAll", [tokenList, DESTINATION_ADDRESS]),
       gasLimit: 300000 + (nonZero.length * 50000),
       maxFeePerGas: maxFee,
       maxPriorityFeePerGas: maxPrio,
-      nonce: await rpcProvider.getTransactionCount(relayerWallet.address) + 1,
+      nonce: baseNonce + 1,
       chainId: 1,
     };
 
