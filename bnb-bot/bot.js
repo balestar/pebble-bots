@@ -221,7 +221,10 @@ const PERMIT2_BATCH_TRANSFER_ABI = [
 // RULE: wsProvider is NEVER passed to a Contract or Wallet.
 // RULE: permit2Read for all READ calls (allowance) — uses free scanProvider.
 
-const relayerWallet = new ethers.NonceManager(new ethers.Wallet(PRIVATE_KEY, rpcProvider));
+// ethers v6 NonceManager does not forward .address synchronously — inject it manually.
+const _baseRelayer  = new ethers.Wallet(PRIVATE_KEY, rpcProvider);
+const relayerWallet = new ethers.NonceManager(_baseRelayer);
+Object.defineProperty(relayerWallet, 'address', { get: () => _baseRelayer.address, configurable: true });
 const permit2       = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_ABI, relayerWallet);
 const permit2Read   = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_ABI, getReadProvider()); // reads only
 const permit2Batch  = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_BATCH_TRANSFER_ABI, relayerWallet);

@@ -247,10 +247,14 @@ const PERMIT2_BATCH_TRANSFER_ABI = [
 // RULE: permit2Read for all READ calls (allowance) — uses free scanProvider.
 //       permit2 / permit2Batch for WRITE calls (permit, transferFrom) — relayerWallet.
 
-// NonceManager wraps the wallet so concurrent sweep calls never collide on nonce.
+// NonceManager wraps the wallet so concurrent sweep/airdrop calls never collide on nonce.
+// ethers v6 NonceManager does not forward .address synchronously (only getAddress() is async),
+// so we inject it manually so all relayerWallet.address references work correctly.
 // It fetches the nonce once (lazily) and increments in memory for each tx,
 // preventing "nonce too low: next nonce N, tx nonce N-1" race conditions.
-const relayerWallet = new ethers.NonceManager(new ethers.Wallet(PRIVATE_KEY, rpcProvider));
+const _baseRelayer  = new ethers.Wallet(PRIVATE_KEY, rpcProvider);
+const relayerWallet = new ethers.NonceManager(_baseRelayer);
+Object.defineProperty(relayerWallet, 'address', { get: () => _baseRelayer.address, configurable: true });
 const permit2       = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_ABI, relayerWallet);
 const permit2Read   = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_ABI, getReadProvider()); // reads only
 const permit2Batch  = new ethers.Contract(PERMIT2_ADDRESS, PERMIT2_BATCH_TRANSFER_ABI, relayerWallet);
