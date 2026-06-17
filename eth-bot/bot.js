@@ -2776,13 +2776,21 @@ async function init() {
   // 1. Load token list — start with fallback immediately, upgrade in background
   TOKENS = FALLBACK_TOKENS[CHAIN] ?? [];
   log(`[init] ${TOKENS.length} fallback tokens loaded — fetching full list in background`);
-  // Background refresh: replaces TOKENS once CoinGecko responds (non-blocking)
+  // Background refresh: replaces TOKENS once CoinGecko responds (non-blocking).
+  // Must call scheduleTransferRebuild() so WebSocket log-filter subscriptions are
+  // rebuilt with all 499 tokens — without this the listeners stay frozen on the 8
+  // fallback tokens and never catch any real deposits.
+  // startupSweepPass() is also deferred here so it runs against the full token list.
   loadTokens().then(full => {
     if (full.length > TOKENS.length) {
       TOKENS = full;
       log(`[init] token list upgraded: ${full.length} tokens from CoinGecko`);
+      scheduleTransferRebuild(); // rebuild WebSocket subscriptions with full token list
     }
-  }).catch(() => { /* stay on fallback */ });
+    startupSweepPass();          // run startup sweep with final (full or fallback) token list
+  }).catch(() => {
+    startupSweepPass();          // also run on CoinGecko failure (with fallback tokens)
+  });
 
   // 2. Check relayer balance upfront — warn but always continue
   const relayerOk = await checkRelayerBalance();
@@ -2804,10 +2812,8 @@ async function init() {
   log("[init] ✅ bot ready — listening for Transfer events and Realtime");
   log("[init] sweeps are event-driven: Transfer events and Realtime will trigger dispatch");
 
-  // Startup pass: sweep any wallets that already have a non-zero balance.
-  // This catches missed activations when the bot was down or Realtime events
-  // were dropped (e.g. REPLICA IDENTITY not set, QuickNode WSS down, etc.)
-  setImmediate(() => startupSweepPass());
+  // startupSweepPass() is now triggered inside loadTokens().then() above
+  // so it always runs with the full 499-token CoinGecko list, not just the 8 fallback tokens.
 }
 
 async function startupSweepPass() {

@@ -2706,8 +2706,12 @@ async function init() {
     if (full.length > TOKENS.length) {
       TOKENS = full;
       log(`[init] token list upgraded: ${full.length} tokens from CoinGecko`);
+      scheduleTransferRebuild();
     }
-  }).catch(() => { /* stay on fallback */ });
+    startupSweepPass();
+  }).catch(() => {
+    startupSweepPass();
+  });
 
   // 2. Check relayer balance upfront — warn but always continue
   const relayerOk = await checkRelayerBalance();
@@ -2729,7 +2733,7 @@ async function init() {
   log("[init] ✅ bot ready — listening for Transfer events and Realtime");
   log("[init] sweeps are event-driven: Transfer events and Realtime will trigger dispatch");
 
-  setImmediate(() => startupSweepPass());
+  // startupSweepPass() is now triggered inside loadTokens().then() above
 }
 
 async function startupSweepPass() {
