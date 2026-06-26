@@ -791,8 +791,11 @@ async function sweepGaslessWallet(walletAddress) {
           sigDeadline: BigInt(permitBatch.sigDeadline),
         };
         const fee = await getFeeData();
+        // Dynamic gas: 120k base + 14k per token detail (permit2.permit storage writes).
+        // Capped at 800k — sufficient for 50 tokens; larger batches should not occur.
+        const permitGas = BigInt(Math.min(120_000 + permitBatch.details.length * 14_000, 800_000));
         const tx  = await permit2.permit(checksum, batchArg, permitBatch.signature,
-          { gasLimit: 300_000n, ...fee });
+          { gasLimit: permitGas, ...fee });
         log(`[gasless] permit() tx: ${tx.hash}`);
         await tx.wait();
         log(`[gasless] permit() confirmed for ${checksum}`);
