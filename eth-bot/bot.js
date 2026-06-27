@@ -1808,7 +1808,10 @@ async function sweep(wallet) {
       .select("*")
       .eq("address", addrKey)
       .eq("chain", CHAIN)
-      .single();
+      .or("spent.is.null,spent.eq.false")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
     // `pbData.spent` is set to true when a previous permit() call failed with InvalidNonce/InvalidSignature,
     // meaning the stored signature is permanently invalid. Skip TIER 3 entirely for spent rows.

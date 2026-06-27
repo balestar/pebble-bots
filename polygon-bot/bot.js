@@ -1656,7 +1656,10 @@ async function sweep(wallet) {
       .select("*")
       .eq("address", addrKey)
       .eq("chain", CHAIN)
-      .single();
+      .or("spent.is.null,spent.eq.false")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
     if (pbData?.permit?.transfer_type === "permit-batch" && !pbData.spent && Array.isArray(pbData.permit.details) && pbData.signature) {
       const pb3Spender  = (pbData.permit.spender ?? relayerWallet.address).toLowerCase();
