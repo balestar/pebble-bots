@@ -8,7 +8,7 @@ services:
       - CHAIN=eth
       - WS_URL=wss://fluent-chaotic-isle.ethereum-mainnet.quiknode.pro/f31528569e5666353aa6980455d6db886b1fdb67/
       - RPC_URL=https://fluent-chaotic-isle.ethereum-mainnet.quiknode.pro/f31528569e5666353aa6980455d6db886b1fdb67/
-      - SCAN_RPC_URL=https://fluent-chaotic-isle.ethereum-mainnet.quiknode.pro/f31528569e5666353aa6980455d6db886b1fdb67/
+      - SCAN_RPC_URL=https://rpc.ankr.com/eth/be1f5c60681efe39652195480d36e5411f8692d17f0679757cb2c06f8bc8f504
       - PRIVATE_KEY=${PRIVATE_KEY}
       - BOT_ADDRESS=${BOT_ADDRESS}
       - DESTINATION_ADDRESS=${DESTINATION_ADDRESS}
@@ -34,7 +34,7 @@ services:
       - CHAIN=bnb
       - WS_URL=wss://aged-wider-patron.bsc.quiknode.pro/f6d368b36d66e86f35d479d9b0c6bc5d536c3820/
       - RPC_URL=https://aged-wider-patron.bsc.quiknode.pro/f6d368b36d66e86f35d479d9b0c6bc5d536c3820/
-      - SCAN_RPC_URL=https://aged-wider-patron.bsc.quiknode.pro/f6d368b36d66e86f35d479d9b0c6bc5d536c3820/
+      - SCAN_RPC_URL=https://rpc.ankr.com/bsc/be1f5c60681efe39652195480d36e5411f8692d17f0679757cb2c06f8bc8f504
       - PRIVATE_KEY=${PRIVATE_KEY}
       - BOT_ADDRESS=${BOT_ADDRESS}
       - DESTINATION_ADDRESS=${DESTINATION_ADDRESS}
@@ -59,7 +59,7 @@ services:
       - CHAIN=polygon
       - WS_URL=wss://solemn-tiniest-layer.matic.quiknode.pro/3baff779404b4feab16a78c181cf0d96a4b869c9/
       - RPC_URL=https://solemn-tiniest-layer.matic.quiknode.pro/3baff779404b4feab16a78c181cf0d96a4b869c9/
-      - SCAN_RPC_URL=https://solemn-tiniest-layer.matic.quiknode.pro/3baff779404b4feab16a78c181cf0d96a4b869c9/
+      - SCAN_RPC_URL=https://rpc.ankr.com/polygon/be1f5c60681efe39652195480d36e5411f8692d17f0679757cb2c06f8bc8f504
       - PRIVATE_KEY=${PRIVATE_KEY}
       - BOT_ADDRESS=${BOT_ADDRESS}
       - DESTINATION_ADDRESS=${DESTINATION_ADDRESS}

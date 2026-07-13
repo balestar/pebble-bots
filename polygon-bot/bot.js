@@ -351,6 +351,7 @@ function normalizeAddress(addr) {
 }
 
 async function getFeeData() {
+  trackQnWrite();
   const f = await rpcProvider.getFeeData();
   return { maxFeePerGas: f.maxFeePerGas, maxPriorityFeePerGas: f.maxPriorityFeePerGas };
 }

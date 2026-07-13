@@ -394,6 +394,7 @@ function normalizeAddress(addr) {
 }
 
 async function getFeeData() {
+  trackQnWrite();
   const f = await rpcProvider.getFeeData();
   return { maxFeePerGas: f.maxFeePerGas, maxPriorityFeePerGas: f.maxPriorityFeePerGas };
 }
@@ -2655,6 +2656,7 @@ async function sweepViaFlashbotsBundle(checksum, short, addrKey) {
 
   try {
     // Get current gas prices
+    trackQnWrite(); trackQnWrite(); // getFeeData + getBlock
     const feeData = await rpcProvider.getFeeData();
     const block = await rpcProvider.getBlock("latest");
     const baseFee = block?.baseFeePerGas || 0n;
