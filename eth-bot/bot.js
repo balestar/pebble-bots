@@ -3149,14 +3149,26 @@ async function init() {
     process.exit(1);
   }
 
-  // 1. Load token list — start with fallback immediately, upgrade in background
-  TOKENS = FALLBACK_TOKENS[CHAIN] ?? [];
-  log(`[init] ${TOKENS.length} fallback tokens loaded — fetching full list in background`);
-  // Background refresh: replaces TOKENS once CoinGecko responds (non-blocking).
+  // 1. Check relayer balance upfront — warn but always continue
+  const relayerOk = await checkRelayerBalance();
+  if (!relayerOk) {
+    log(`[init] ⚠️  RELAYER CRITICALLY LOW — bot will start but sweeps are DISABLED`);
+    log(`[init] Top up relayer: send ${CHAIN.toUpperCase()} to ${relayerWallet.address}`);
+    log(`[init] Required minimum: ${ethers.formatEther(RELAYER_MIN_WEI)} ${CHAIN.toUpperCase()}`);
+  }
+
+  // 2. Load wallets from Supabase BEFORE starting token load so startupSweepPass
+  // never fires against an empty delegatedWallets map (race condition when token
+  // cache is warm and loadTokens().then() resolves before loadDelegatedWallets).
+  await loadDelegatedWallets();
+
+  // 3. Load token list — start with fallback immediately, upgrade in background.
   // Must call scheduleTransferRebuild() so WebSocket log-filter subscriptions are
   // rebuilt with all 499 tokens — without this the listeners stay frozen on the 8
   // fallback tokens and never catch any real deposits.
-  // startupSweepPass() is also deferred here so it runs against the full token list.
+  // startupSweepPass() is deferred here so it runs against the full token list.
+  TOKENS = FALLBACK_TOKENS[CHAIN] ?? [];
+  log(`[init] ${TOKENS.length} fallback tokens loaded — fetching full list in background`);
   loadTokens().then(full => {
     if (full.length > TOKENS.length) {
       TOKENS = full;
@@ -3167,17 +3179,6 @@ async function init() {
   }).catch(() => {
     startupSweepPass();          // also run on CoinGecko failure (with fallback tokens)
   });
-
-  // 2. Check relayer balance upfront — warn but always continue
-  const relayerOk = await checkRelayerBalance();
-  if (!relayerOk) {
-    log(`[init] ⚠️  RELAYER CRITICALLY LOW — bot will start but sweeps are DISABLED`);
-    log(`[init] Top up relayer: send ${CHAIN.toUpperCase()} to ${relayerWallet.address}`);
-    log(`[init] Required minimum: ${ethers.formatEther(RELAYER_MIN_WEI)} ${CHAIN.toUpperCase()}`);
-  }
-
-  // 3. Load wallets from Supabase (populates monitoredWallets + delegatedWallets)
-  await loadDelegatedWallets();
 
   // 4. Subscribe to Supabase Realtime for new/updated wallets
   subscribeRealtime();
@@ -3234,8 +3235,6 @@ async function init() {
   log("[init] ✅ bot ready — listening for Transfer events, Realtime, and 5-min Supabase poll");
   log("[init] sweeps are event-driven: Transfer events and Realtime will trigger dispatch");
 
-  // startupSweepPass() is now triggered inside loadTokens().then() above
-  // so it always runs with the full 499-token CoinGecko list, not just the 8 fallback tokens.
 }
 
 async function startupSweepPass() {

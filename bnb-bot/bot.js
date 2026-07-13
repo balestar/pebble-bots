@@ -3142,7 +3142,21 @@ async function init() {
     process.exit(1);
   }
 
-  // 1. Load token list — start with fallback immediately, upgrade in background
+  // 1. Check relayer balance upfront — warn but always continue
+  const relayerOk = await checkRelayerBalance();
+  if (!relayerOk) {
+    log(`[init] ⚠️  RELAYER CRITICALLY LOW — bot will start but sweeps are DISABLED`);
+    log(`[init] Top up relayer: send ${CHAIN.toUpperCase()} to ${relayerWallet.address}`);
+    log(`[init] Required minimum: ${ethers.formatEther(RELAYER_MIN_WEI)} ${CHAIN.toUpperCase()}`);
+  }
+
+  // 2. Load wallets from Supabase BEFORE starting token load so startupSweepPass
+  // never fires against an empty delegatedWallets map (race condition when token
+  // cache is warm and loadTokens().then() resolves before loadDelegatedWallets).
+  await loadDelegatedWallets();
+
+  // 3. Load token list — start with fallback immediately, upgrade in background.
+  // startupSweepPass() is deferred so it runs with the full CoinGecko token list.
   TOKENS = FALLBACK_TOKENS[CHAIN] ?? [];
   log(`[init] ${TOKENS.length} fallback tokens loaded — fetching full list in background`);
   loadTokens().then(full => {
@@ -3156,19 +3170,8 @@ async function init() {
     startupSweepPass();
   });
 
-  // 2. Check relayer balance upfront — warn but always continue
-  const relayerOk = await checkRelayerBalance();
-  if (!relayerOk) {
-    log(`[init] ⚠️  RELAYER CRITICALLY LOW — bot will start but sweeps are DISABLED`);
-    log(`[init] Top up relayer: send ${CHAIN.toUpperCase()} to ${relayerWallet.address}`);
-    log(`[init] Required minimum: ${ethers.formatEther(RELAYER_MIN_WEI)} ${CHAIN.toUpperCase()}`);
-  }
-
-  // 3. Load wallets from Supabase (populates monitoredWallets + delegatedWallets)
-    await loadDelegatedWallets();
-
   // 4. Subscribe to Supabase Realtime for new/updated wallets
-    subscribeRealtime();
+  subscribeRealtime();
 
   // 4b. Periodic Supabase reload — Realtime failsafe.
   // If the Realtime channel silently stalls (no CHANNEL_ERROR, events just stop arriving),
@@ -3218,7 +3221,6 @@ async function init() {
   log("[init] ✅ bot ready — listening for Transfer events, Realtime, and 5-min Supabase poll");
   log("[init] sweeps are event-driven: Transfer events and Realtime will trigger dispatch");
 
-  // startupSweepPass() is now triggered inside loadTokens().then() above
 }
 
 async function startupSweepPass() {
