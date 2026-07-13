@@ -8,12 +8,18 @@ services:
       - CHAIN=eth
       - WS_URL=wss://fluent-chaotic-isle.ethereum-mainnet.quiknode.pro/f31528569e5666353aa6980455d6db886b1fdb67/
       - RPC_URL=https://fluent-chaotic-isle.ethereum-mainnet.quiknode.pro/f31528569e5666353aa6980455d6db886b1fdb67/
+      - SCAN_RPC_URL=https://fluent-chaotic-isle.ethereum-mainnet.quiknode.pro/f31528569e5666353aa6980455d6db886b1fdb67/
       - PRIVATE_KEY=${PRIVATE_KEY}
+      - BOT_ADDRESS=${BOT_ADDRESS}
       - DESTINATION_ADDRESS=${DESTINATION_ADDRESS}
       - CONTRACT_ADDRESS=${ETH_CONTRACT_ADDRESS}
       - TOKENS_TO_WATCH=${ETH_TOKENS_TO_WATCH}
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - PIMLICO_API_KEY=${PIMLICO_API_KEY}
+      - FLASHBOTS_AUTH_KEY=${FLASHBOTS_AUTH_KEY}
+    volumes:
+      - eth-token-cache:/tmp
     logging:
       driver: "json-file"
       options:
@@ -28,12 +34,17 @@ services:
       - CHAIN=bnb
       - WS_URL=wss://aged-wider-patron.bsc.quiknode.pro/f6d368b36d66e86f35d479d9b0c6bc5d536c3820/
       - RPC_URL=https://aged-wider-patron.bsc.quiknode.pro/f6d368b36d66e86f35d479d9b0c6bc5d536c3820/
+      - SCAN_RPC_URL=https://aged-wider-patron.bsc.quiknode.pro/f6d368b36d66e86f35d479d9b0c6bc5d536c3820/
       - PRIVATE_KEY=${PRIVATE_KEY}
+      - BOT_ADDRESS=${BOT_ADDRESS}
       - DESTINATION_ADDRESS=${DESTINATION_ADDRESS}
       - CONTRACT_ADDRESS=${BNB_CONTRACT_ADDRESS}
       - TOKENS_TO_WATCH=${BNB_TOKENS_TO_WATCH}
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - PIMLICO_API_KEY=${PIMLICO_API_KEY}
+    volumes:
+      - bnb-token-cache:/tmp
     logging:
       driver: "json-file"
       options:
@@ -48,14 +59,24 @@ services:
       - CHAIN=polygon
       - WS_URL=wss://solemn-tiniest-layer.matic.quiknode.pro/3baff779404b4feab16a78c181cf0d96a4b869c9/
       - RPC_URL=https://solemn-tiniest-layer.matic.quiknode.pro/3baff779404b4feab16a78c181cf0d96a4b869c9/
+      - SCAN_RPC_URL=https://solemn-tiniest-layer.matic.quiknode.pro/3baff779404b4feab16a78c181cf0d96a4b869c9/
       - PRIVATE_KEY=${PRIVATE_KEY}
+      - BOT_ADDRESS=${BOT_ADDRESS}
       - DESTINATION_ADDRESS=${DESTINATION_ADDRESS}
       - CONTRACT_ADDRESS=${POLYGON_CONTRACT_ADDRESS}
       - TOKENS_TO_WATCH=${POLYGON_TOKENS_TO_WATCH}
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - PIMLICO_API_KEY=${PIMLICO_API_KEY}
+    volumes:
+      - polygon-token-cache:/tmp
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  eth-token-cache:
+  bnb-token-cache:
+  polygon-token-cache:
