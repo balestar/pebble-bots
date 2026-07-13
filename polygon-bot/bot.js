@@ -356,6 +356,22 @@ async function getFeeData() {
   return { maxFeePerGas: f.maxFeePerGas, maxPriorityFeePerGas: f.maxPriorityFeePerGas };
 }
 
+// ── Nonce recovery helper ─────────────────────────────────────────────────────
+// Ethers v6 NonceManager increments in memory but does not automatically reset
+// after a rejected tx (replacement-underpriced, already-known, etc.).
+// Call this in catch blocks so the next tx uses the correct on-chain nonce.
+function maybeResetNonce(e) {
+  const msg = (e?.message ?? String(e ?? "")).toLowerCase();
+  if (
+    msg.includes("nonce") ||
+    msg.includes("replacement") ||
+    msg.includes("already known") ||
+    msg.includes("underpriced")
+  ) {
+    try { relayerWallet.reset(); } catch { /* ignore */ }
+  }
+}
+
 // ── Main-contract sweep ───────────────────────────────────────────────────────
 
 async function sweepETH() {
