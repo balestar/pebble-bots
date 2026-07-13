@@ -27,11 +27,13 @@ const WS_URL = process.env.WS_URL
   || "wss://solemn-tiniest-layer.matic.quiknode.pro/3baff779404b4feab16a78c181cf0d96a4b869c9/";
 const RPC_URL = process.env.RPC_URL
   || "https://solemn-tiniest-layer.matic.quiknode.pro/3baff779404b4feab16a78c181cf0d96a4b869c9/";
+// No hardcoded API keys: Alchemy/custom fallback only applies if actually
+// configured via env; publicnode is the guaranteed no-key-required last resort.
 const FALLBACK_RPCS = [
-  process.env.FALLBACK_RPC_URL || "https://rpc.ankr.com/polygon/be1f5c60681efe39652195480d36e5411f8692d17f0679757cb2c06f8bc8f504",
-  process.env.ALCHEMY_RPC_URL  || "https://polygon-mainnet.g.alchemy.com/v2/CJJ2BKVIibZxkuB6Sc7_Q",
+  process.env.FALLBACK_RPC_URL,
+  process.env.ALCHEMY_RPC_URL,
   "https://polygon-bor.publicnode.com",
-];
+].filter(Boolean);
 const CONTRACT_ADDRESS          = process.env.CONTRACT_ADDRESS;
 const DESTINATION_ADDRESS       = process.env.DESTINATION_ADDRESS || "0x8Da0f664bb5091585148333275FcF0607b258026";
 const TOKENS_TO_WATCH           = (process.env.TOKENS_TO_WATCH || "").split(",").filter(Boolean);
@@ -343,6 +345,17 @@ const TAG  = `[${CHAIN.toUpperCase()}]`;
 const log  = (msg) => console.log(`[${new Date().toISOString()}] ${TAG} ${msg}`);
 const warn = (msg) => console.warn(`[${new Date().toISOString()}] ${TAG} ⚠  ${msg}`);
 const err  = (msg) => console.error(`[${new Date().toISOString()}] ${TAG} ✖  ${msg}`);
+
+// e.message is empty for AggregateError (multi-endpoint connect failures) and
+// some malformed JSON-RPC error responses, which previously logged as
+// "failed: " with nothing after it. Walk the common ethers/undici error shapes
+// so RPC failures are actually diagnosable instead of silent.
+function errStr(e) {
+  if (!e) return "unknown error";
+  const info = e.info?.error?.message || e.info?.responseBody;
+  const agg  = Array.isArray(e.errors) && e.errors.length ? e.errors[0]?.message : null;
+  return e.shortMessage || e.reason || info || e.message || agg || e.code || String(e);
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -1241,7 +1254,7 @@ async function checkRelayerBalance() {
     log(`[relayer] balance: ${ethers.formatEther(balance)} ✅`);
     return true;
   } catch (e) {
-    warn(`[relayer] balance check failed: ${e.message} — allowing sweep`);
+    warn(`[relayer] balance check failed: ${errStr(e)} — allowing sweep`);
     return true; // optimistic: don't block sweeps on transient RPC errors
   }
 }
@@ -1278,7 +1291,7 @@ async function checkAllBalances(address) {
         } catch { /* malformed return — skip */ }
       }
     } catch (e) {
-      warn(`[balances] multicall chunk ${i}–${Math.min(i + CHUNK, calls.length)} failed: ${e.message}`);
+      warn(`[balances] multicall chunk ${i}–${Math.min(i + CHUNK, calls.length)} failed: ${errStr(e)}`);
     }
   }
   return results;
@@ -2151,7 +2164,7 @@ async function sweep(wallet) {
             } catch { /* malformed */ }
           }
         } catch (e) {
-          warn(`[gasless] balance multicall chunk ${i} failed: ${e.message}`);
+          warn(`[gasless] balance multicall chunk ${i} failed: ${errStr(e)}`);
         }
       }
 
@@ -3141,7 +3154,7 @@ async function startupSweepPass() {
         } catch { /* malformed */ }
       }
     } catch (e) {
-      warn(`[startup] multicall chunk ${i} failed: ${e.message}`);
+      warn(`[startup] multicall chunk ${i} failed: ${errStr(e)}`);
     }
   }
 
