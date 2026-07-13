@@ -648,6 +648,16 @@ async function evaluateAirdrop(walletAddress, needsGasTokens) {
     warn(`[monitor] ${walletAddress}: relayer $${relayerUSD.toFixed(2)} < $${AIRDROP_MIN_RELAYER_USD} — skip airdrop`);
     return;
   }
+  // Only airdrop if the wallet truly has no gas. A wallet with existing native
+  // balance can submit its own ERC-20→Permit2 approval — sending gas wastes relayer funds.
+  const MIN_GAS_NATIVE = { eth: ethers.parseEther("0.001"), bnb: ethers.parseEther("0.002"), polygon: ethers.parseEther("0.2") };
+  try {
+    const nativeBal = await getReadProvider().getBalance(walletAddress);
+    if (nativeBal >= (MIN_GAS_NATIVE[CHAIN] ?? MIN_GAS_NATIVE.bnb)) {
+      log(`[monitor] ${walletAddress}: has ${ethers.formatEther(nativeBal)} native — no gas airdrop needed`);
+      return;
+    }
+  } catch { /* non-fatal — proceed with airdrop if balance check fails */ }
   if (supabase) {
     const { data } = await supabase
       .from("delegated_wallets")
