@@ -122,8 +122,20 @@ function buildRpcProvider() {
 
 let rpcProvider = buildRpcProvider();
 
-const SCAN_RPC = process.env.SCAN_RPC_URL || "https://bsc.publicnode.com";
-const scanProvider = new ethers.JsonRpcProvider(SCAN_RPC, null, { staticNetwork: true });
+const SCAN_RPC          = process.env.SCAN_RPC_URL || "https://bsc.publicnode.com";
+// Only used if SCAN_RPC (PublicNode) stalls/errors — verified working, no
+// Origin restriction (unlike the old default-fallback Ankr key this replaced).
+const SCAN_FALLBACK_RPC = process.env.SCAN_FALLBACK_RPC_URL;
+const scanProvider = SCAN_FALLBACK_RPC
+  ? new ethers.FallbackProvider(
+      [
+        { provider: new ethers.JsonRpcProvider(SCAN_RPC, BNB_NETWORK, { staticNetwork: BNB_NETWORK }), priority: 1, weight: 1, stallTimeout: 2500 },
+        { provider: new ethers.JsonRpcProvider(SCAN_FALLBACK_RPC, BNB_NETWORK, { staticNetwork: BNB_NETWORK }), priority: 2, weight: 1, stallTimeout: 2500 },
+      ],
+      BNB_NETWORK,
+      { quorum: 1 },
+    )
+  : new ethers.JsonRpcProvider(SCAN_RPC, null, { staticNetwork: true });
 scanProvider.pollingInterval = 999_999;
 
 // ── RPC Rate Limiter + Read Router ───────────────────────────────────────────

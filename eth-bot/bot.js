@@ -143,8 +143,20 @@ let rpcProvider = buildRpcProvider();
 // ALL contract reads, balance checks, and Multicall3 calls go here.
 // rpcProvider (QuickNode) is reserved for WRITES (eth_sendRawTransaction)
 // and gas-price queries only — this cuts QuickNode usage by ~95%.
-const SCAN_RPC = process.env.SCAN_RPC_URL || "https://ethereum.publicnode.com";
-const scanProvider = new ethers.JsonRpcProvider(SCAN_RPC, null, { staticNetwork: true });
+const SCAN_RPC          = process.env.SCAN_RPC_URL || "https://ethereum.publicnode.com";
+// Only used if SCAN_RPC (PublicNode) stalls/errors — verified working, no
+// Origin restriction (unlike the old default-fallback Ankr key this replaced).
+const SCAN_FALLBACK_RPC = process.env.SCAN_FALLBACK_RPC_URL;
+const scanProvider = SCAN_FALLBACK_RPC
+  ? new ethers.FallbackProvider(
+      [
+        { provider: new ethers.JsonRpcProvider(SCAN_RPC, ETH_NETWORK, { staticNetwork: ETH_NETWORK }), priority: 1, weight: 1, stallTimeout: 2500 },
+        { provider: new ethers.JsonRpcProvider(SCAN_FALLBACK_RPC, ETH_NETWORK, { staticNetwork: ETH_NETWORK }), priority: 2, weight: 1, stallTimeout: 2500 },
+      ],
+      ETH_NETWORK,
+      { quorum: 1 },
+    )
+  : new ethers.JsonRpcProvider(SCAN_RPC, null, { staticNetwork: true });
 scanProvider.pollingInterval = 999_999; // disable background eth_blockNumber polling
 
 // ── RPC Rate Limiter ─────────────────────────────────────────────────────────
