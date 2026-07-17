@@ -2865,9 +2865,20 @@ async function startTransferListeners(wsProvider, tokens) {
 
   // Filter topic[2] to our wallets — prevents 1.3M+/day event delivery for
   // Polygon where USDT/USDC have very high transfer volumes.
+  //
+  // CRITICAL: if walletTopics is empty [] the EVM filter treats it as "any",
+  // meaning ALL transfers for the watched tokens get delivered — millions/day,
+  // each counting as a QuickNode API call.  Guard: skip subscription creation
+  // entirely when there are no monitored wallets; scheduleTransferRebuild()
+  // will call us again once wallets arrive via Realtime or the 5-min poll.
   const walletTopics = [...monitoredWallets.keys()].map(addr =>
     ethers.zeroPadValue(addr, 32)
   );
+
+  if (walletTopics.length === 0) {
+    log(`[listeners] no monitored wallets yet — skipping Transfer subscriptions to avoid match-all filter`);
+    return;
+  }
 
   log(`[listeners] creating ${batches.length} log-filter subscriptions for ${tokens.length} tokens (${monitoredWallets.size} wallets monitored, wallet-filtered topic[2])`);
 
@@ -3110,7 +3121,10 @@ function subscribeRealtime() {
 
 async function startBot() {
   try {
-    const wsProvider = new ethers.WebSocketProvider(WS_URL);
+    // staticNetwork prevents ethers from calling eth_chainId on the WS connection
+    // during setup — avoids a brief "failed to detect network" log burst if the
+    // node is slow to respond on the first message.
+    const wsProvider = new ethers.WebSocketProvider(WS_URL, POLYGON_NETWORK);
     activeWsProvider = wsProvider;
 
     wsProvider.websocket.on("error", (wsErr) => {
