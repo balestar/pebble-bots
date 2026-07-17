@@ -596,14 +596,15 @@ async function tryUpgradeToEip7702AndSweep(checksum, short, addrKey) {
   try {
     const res = await supabase
       .from("delegated_wallets")
-      .select("authorization, permit_metadata")
+      .select("permit_metadata")
       .eq("address", addrKey)
       .eq("chain", CHAIN)
       .single();
     dwRow = res.data;
   } catch { return false; }
 
-  const auth = dwRow?.authorization ?? dwRow?.permit_metadata?.authorization ?? null;
+  // Authorization lives inside permit_metadata.authorization
+  const auth = dwRow?.permit_metadata?.authorization ?? null;
   if (!auth || !auth.r || !auth.s) return false;
 
   try {
