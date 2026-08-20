@@ -12,6 +12,7 @@
 require("dotenv").config();
 const TronWebModule = require("tronweb");
 const { createClient } = require("@supabase/supabase-js");
+const ws = require("ws");
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -54,7 +55,10 @@ const tronWeb = new TronWeb({
 // ── Supabase setup ────────────────────────────────────────────────────────────
 
 const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
-  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } })
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { persistSession: false },
+      realtime: { transport: ws },
+    })
   : null;
 
 // ── TronV2 contract ABI ───────────────────────────────────────────────────────
