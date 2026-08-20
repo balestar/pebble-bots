@@ -88,6 +88,23 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  tron-bot:
+    build: ./tron-bot
+    container_name: pebble-tron-bot
+    restart: unless-stopped
+    environment:
+      - TRON_PRIVATE_KEY=${TRON_PRIVATE_KEY}
+      - TRON_CONTRACT_ADDRESS=${TRON_CONTRACT_ADDRESS}
+      - TRON_DESTINATION_ADDRESS=${TRON_DESTINATION_ADDRESS}
+      - TRON_FULL_HOST=${TRON_FULL_HOST}
+      - TRON_SUPABASE_URL=${TRON_SUPABASE_URL}
+      - TRON_SUPABASE_SERVICE_ROLE_KEY=${TRON_SUPABASE_SERVICE_ROLE_KEY}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   eth-token-cache:
   bnb-token-cache:
