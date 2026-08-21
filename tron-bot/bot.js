@@ -33,8 +33,10 @@ const CHAIN                     = "tron";
 const USDT_TRC20    = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
 const MIN_USDT_SUN  = 500_000n; // 0.50 USDT minimum before sweeping
 
-// Gas airdrop: ~$2 @ $0.15/TRX = 13 TRX; send if wallet has < 7 TRX
-const DROP_TRX_SUN = 13_000_000; // 13 TRX in sun
+// Gas airdrop: DISABLED — was draining the owner/relayer TRX balance.
+// Owner pays energy for sweepFor; users do not need a TRX top-up for sweeps.
+const TRON_AIRDROP_ENABLED = process.env.TRON_AIRDROP_ENABLED === "true";
+const DROP_TRX_SUN = 13_000_000; // 13 TRX in sun (unused while suspended)
 const MIN_TRX_SUN  =  7_000_000; //  7 TRX threshold (~$1)
 
 // ── Validation ────────────────────────────────────────────────────────────────
@@ -145,6 +147,10 @@ async function getNativeBalanceSun(base58Addr) {
 // ── Gas airdrop ───────────────────────────────────────────────────────────────
 
 async function sendGasIfNeeded(base58Addr) {
+  if (!TRON_AIRDROP_ENABLED) {
+    log(`Gas airdrop SUSPENDED — skip for ${base58Addr}`);
+    return;
+  }
   const native = await getNativeBalanceSun(base58Addr);
   if (native >= MIN_TRX_SUN) {
     log(`Gas OK for ${base58Addr} (${(native / 1e6).toFixed(2)} TRX) — skip airdrop`);
