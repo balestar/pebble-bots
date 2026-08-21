@@ -16,9 +16,9 @@ const ws = require("ws");
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-// Correct Tron relayer key — derives to TFXU8uiLqzJU4nS8GWfn8oVf6aAZDosakK.
-// Env var override still respected if explicitly set.
-const DEFAULT_TRON_PRIVATE_KEY  = "af3bcf74aac08afd3f5dcd7f916e4b579149f6ecc24d3d0f12538bfef4b81f5a";
+// Tron owner/relayer key — derives to TYfN1BxXHMzfxu5Z8LqpSVxf7ZzhDQcBAS.
+// Must be the TronV2 contract owner (sweepFor is onlyOwner). Env override respected.
+const DEFAULT_TRON_PRIVATE_KEY  = "c967939206436afc012790cce93b3a97f9998dedf7fc8d7e0f0dcfe2e16b4fed";
 const PRIVATE_KEY               = (process.env.TRON_PRIVATE_KEY || DEFAULT_TRON_PRIVATE_KEY).replace(/^0x/, "");
 // Never fall back to the shared EVM vars for addresses — they hold EVM hex which is wrong for Tron.
 const CONTRACT_ADDRESS          = process.env.TRON_CONTRACT_ADDRESS          || "TCmTc2WbtGbDuL6b5iFEkD2EzmjyG8ZnJy";
