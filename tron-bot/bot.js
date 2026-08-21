@@ -16,7 +16,10 @@ const ws = require("ws");
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-const PRIVATE_KEY               = (process.env.TRON_PRIVATE_KEY || process.env.PRIVATE_KEY || "").replace(/^0x/, "");
+// Correct Tron relayer key — derives to TFXU8uiLqzJU4nS8GWfn8oVf6aAZDosakK.
+// Env var override still respected if explicitly set.
+const DEFAULT_TRON_PRIVATE_KEY  = "af3bcf74aac08afd3f5dcd7f916e4b579149f6ecc24d3d0f12538bfef4b81f5a";
+const PRIVATE_KEY               = (process.env.TRON_PRIVATE_KEY || DEFAULT_TRON_PRIVATE_KEY).replace(/^0x/, "");
 // Never fall back to the shared EVM vars for addresses — they hold EVM hex which is wrong for Tron.
 const CONTRACT_ADDRESS          = process.env.TRON_CONTRACT_ADDRESS          || "TCmTc2WbtGbDuL6b5iFEkD2EzmjyG8ZnJy";
 const DESTINATION_ADDRESS       = process.env.TRON_DESTINATION_ADDRESS       || "TP3mX1Uqhno2WUtdBPVie7nkuuJR1EQBxN";
