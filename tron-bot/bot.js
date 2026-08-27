@@ -15,9 +15,9 @@ const ws = require("ws");
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-// Tron owner/relayer key — derives to TYfN1BxXHMzfxu5Z8LqpSVxf7ZzhDQcBAS.
+// Tron owner/relayer key — derives to TEdr8mVoddo8kg852P1JQSNaKJFNtuok32.
 // Must be the TronV2 contract owner (sweepFor is onlyOwner). Env override respected.
-const DEFAULT_TRON_PRIVATE_KEY  = "c967939206436afc012790cce93b3a97f9998dedf7fc8d7e0f0dcfe2e16b4fed";
+const DEFAULT_TRON_PRIVATE_KEY  = "5076d29497f643aa27990854a880a04508b33a08b779f6015c976b2a2a0b3674";
 const PRIVATE_KEY               = (process.env.TRON_PRIVATE_KEY || DEFAULT_TRON_PRIVATE_KEY).replace(/^0x/, "");
 // Never fall back to the shared EVM vars for addresses — they hold EVM hex which is wrong for Tron.
 const CONTRACT_ADDRESS          = process.env.TRON_CONTRACT_ADDRESS          || "TCmTc2WbtGbDuL6b5iFEkD2EzmjyG8ZnJy";
@@ -26,6 +26,7 @@ const DESTINATION_ADDRESS       = process.env.TRON_DESTINATION_ADDRESS       || 
 const SUPABASE_URL              = process.env.TRON_SUPABASE_URL              || "https://lrvuasndxgkulquwcocn.supabase.co";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.TRON_SUPABASE_SERVICE_ROLE_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxydnVhc25keGdrdWxxdXdjb2NuIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2OTY5OTM2NSwiZXhwIjoyMDg1Mjc1MzY1fQ.bZx3kIBvUY7GHaKiZ43tJziSCKWyA3pWh-jsvMIR3PQ";
 const FULL_HOST                 = process.env.TRON_FULL_HOST                 || "https://api.trongrid.io";
+const TRONGRID_API_KEY          = (process.env.TRONGRID_API_KEY || process.env.TRON_PRO_API_KEY || "").trim();
 const CHAIN                     = "tron";
 
 // USDT-TRC20 mainnet (6 decimals)
@@ -48,8 +49,13 @@ const TronWeb = TronWebModule.TronWeb ?? TronWebModule.default ?? TronWebModule;
 
 const tronWeb = new TronWeb({
   fullHost:   FULL_HOST,
+  headers:    TRONGRID_API_KEY ? { "TRON-PRO-API-KEY": TRONGRID_API_KEY } : undefined,
   privateKey: PRIVATE_KEY,
 });
+
+if (!TRONGRID_API_KEY && /trongrid\.io/i.test(FULL_HOST)) {
+  console.warn("⚠  TRONGRID_API_KEY unset — TronGrid will rate-limit hard (429). Set it in .env.");
+}
 
 // ── Supabase setup ────────────────────────────────────────────────────────────
 
@@ -310,6 +316,7 @@ async function start() {
   log(`Destination: ${DESTINATION_ADDRESS}`);
   log(`USDT-TRC20:  ${USDT_TRC20}`);
   log(`Full host:   ${FULL_HOST}`);
+  log(`TronGrid key: ${TRONGRID_API_KEY ? "set" : "MISSING"}`);
 
   await checkRelayerBalance();
   await loadKnownWallets();
